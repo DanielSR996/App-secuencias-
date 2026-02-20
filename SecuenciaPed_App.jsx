@@ -113,6 +113,68 @@ function tryMatch(candidates, sumCant, sumVCUSD, tolCant = 1, tolVCUSD = 2) {
   return null;
 }
 
+/**
+ * E6 — Busca un subconjunto de 2 o 3 candidatos cuya suma ≈ (sumCant, sumVCUSD).
+ * Detecta el caso donde el mismo material entró en varios lotes del mismo pedimento.
+ * Limita el pool a 12 para evitar explosión combinatoria (12C3 = 220 iteraciones máx.).
+ */
+function tryMatchCombination(candidates, sumCant, sumVCUSD, tolPct = 0.02) {
+  const pool = candidates
+    .filter((r) => (parseFloat(r["CantidadUMComercial"]) || 0) > 0)
+    .slice(0, 12);
+  const n    = pool.length;
+  const tolC = Math.max(2, sumCant  * tolPct);
+  const tolV = Math.max(5, sumVCUSD * tolPct);
+
+  // Pares
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const c = (parseFloat(pool[i]["CantidadUMComercial"]) || 0)
+              + (parseFloat(pool[j]["CantidadUMComercial"]) || 0);
+      const v = (parseFloat(pool[i]["ValorDolares"]) || 0)
+              + (parseFloat(pool[j]["ValorDolares"]) || 0);
+      if (Math.abs(c - sumCant) <= tolC && Math.abs(v - sumVCUSD) <= tolV)
+        return [pool[i], pool[j]];
+    }
+  }
+  // Tríos
+  for (let i = 0; i < n - 2; i++) {
+    for (let j = i + 1; j < n - 1; j++) {
+      for (let k = j + 1; k < n; k++) {
+        const c = (parseFloat(pool[i]["CantidadUMComercial"]) || 0)
+                + (parseFloat(pool[j]["CantidadUMComercial"]) || 0)
+                + (parseFloat(pool[k]["CantidadUMComercial"]) || 0);
+        const v = (parseFloat(pool[i]["ValorDolares"]) || 0)
+                + (parseFloat(pool[j]["ValorDolares"]) || 0)
+                + (parseFloat(pool[k]["ValorDolares"]) || 0);
+        if (Math.abs(c - sumCant) <= tolC && Math.abs(v - sumVCUSD) <= tolV)
+          return [pool[i], pool[j], pool[k]];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * E7 — Precio unitario (ValorDolares / CantidadUMComercial) como discriminador.
+ * Busca el candidato cuyo $/pieza sea más cercano al del Layout, con tolerancia ±tolPct.
+ */
+function tryMatchUnitPrice(candidates, sumCant, sumVCUSD, tolPct = 0.15) {
+  if (sumCant <= 0) return null;
+  const layoutUP = sumVCUSD / sumCant;
+  let best = null, bestDiff = Infinity;
+  for (const r of candidates) {
+    const c = parseFloat(r["CantidadUMComercial"]) || 0;
+    const v = parseFloat(r["ValorDolares"]) || 0;
+    if (c <= 0) continue;
+    const candUP = v / c;
+    const ref    = Math.max(Math.abs(layoutUP), 0.0001);
+    const diff   = Math.abs(candUP - layoutUP) / ref;
+    if (diff <= tolPct && diff < bestDiff) { bestDiff = diff; best = r; }
+  }
+  return best ? { seq: best["SecuenciaFraccion"], r551: best } : null;
+}
+
 function runCascade(layoutRows, s551Rows) {
   // ── Columnas del Layout (ya vienen normalizadas por readLayoutSheet) ─────
   const L_PED   = "Pedimento";
@@ -171,7 +233,7 @@ function runCascade(layoutRows, s551Rows) {
   const assignment    = new Map();
   const assigned      = new Set();
   const used551       = new Set(); // índices (_551idx) de filas del 551 usadas en algún match
-  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0 };
+  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0 };
 
   // Almacena también el registro 551 que generó el match (para hoja de cruce)
   const assignRows = (rows, seq, strategy, r551 = null) => {
@@ -230,6 +292,70 @@ function runCascade(layoutRows, s551Rows) {
     const tolVCUSD = Math.max(5, vcusd * 0.05);
     const match = tryMatch(cands, cant, vcusd, tolCant, tolVCUSD);
     if (match) assignRows(g.rows, match.seq, "E5", match.r551);
+  }
+
+  // ── E6: Suma de combinaciones (2 o 3 secuencias del 551) ──────────────────
+  // Resuelve cuando el mismo material ingresó en múltiples lotes del mismo pedimento
+  // y la suma de 2 o 3 entradas del 551 iguala la suma del grupo Layout (±2%).
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+    const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
+    const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
+    // Preferir candidatos con país coincidente; si no hay suficientes, usar sin país
+    const pfpCands = lookupPFP.get(kPFP) || [];
+    const cands    = pfpCands.length >= 2 ? pfpCands : (lookupPF.get(kPF) || []);
+    if (cands.length < 2) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const combo = tryMatchCombination(cands, cant, vcusd);
+    if (!combo) continue;
+
+    // Particionar filas del Layout entre los candidatos: greedy por quota restante
+    const sorted  = [...g.rows].sort((a, b) => (parseFloat(b[L_CANT]) || 0) - (parseFloat(a[L_CANT]) || 0));
+    const targets = combo.map((r) => ({
+      r551:      r,
+      remaining: parseFloat(r["CantidadUMComercial"]) || 0,
+      rows:      [],
+    }));
+    for (const row of sorted) {
+      const rowCant = parseFloat(row[L_CANT]) || 0;
+      // Asignar a la partición con mayor quota restante
+      let bestTi = 0;
+      for (let ti = 1; ti < targets.length; ti++) {
+        if (targets[ti].remaining > targets[bestTi].remaining) bestTi = ti;
+      }
+      targets[bestTi].rows.push(row);
+      targets[bestTi].remaining -= rowCant;
+    }
+    for (const t of targets) {
+      if (t.rows.length > 0) assignRows(t.rows, t.r551[S_SEQ], "E6", t.r551);
+    }
+  }
+
+  // ── E7: Precio unitario ($/pieza) como discriminador ──────────────────────
+  // Cuando los totales no coinciden, el precio por unidad identifica el material.
+  // Tolerancia ±15%. Agrupa por SecuenciaPed existente para sub-grupos más finos.
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+    const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
+    const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
+    const cands = (lookupPFP.get(kPFP) || []).length > 0
+      ? lookupPFP.get(kPFP)
+      : (lookupPF.get(kPF) || []);
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const match = tryMatchUnitPrice(cands, cant, vcusd, 0.15);
+    if (match) assignRows(g.rows, match.seq, "E7", match.r551);
+  }
+
+  // ── E8: Asignación por eliminación ────────────────────────────────────────
+  // Último recurso: filtra candidatos del 551 ya usados y asigna el único restante
+  // (o el de precio unitario más cercano con tolerancia ampliada ±30%).
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac"])) {
+    const k     = `${g.keyVals[0]}|||${g.keyVals[1]}`;
+    const cands = (lookupPF.get(k) || []).filter((r) => !used551.has(r._551idx));
+    if (cands.length === 0) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const match = cands.length === 1
+      ? { seq: cands[0][S_SEQ], r551: cands[0] }
+      : tryMatchUnitPrice(cands, cant, vcusd, 0.30);
+    if (match) assignRows(g.rows, match.seq, "E8", match.r551);
   }
 
   // ── Layout lookup por Ped+Frac (para diagnóstico de orphans del 551) ─────
@@ -790,11 +916,14 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     [],
     ["DESGLOSE POR ESTRATEGIA"],
     ["Estrategia", "Filas Asignadas", "Descripción"],
-    ["E1 - Ped+Fracción+País exacto",    stats.E1, "Agrupa Layout por Pedimento+FraccionNico+País. Suma CantidadSaldo y VCUSD; busca en 551 con tolerancia ±1 ud / ±2 USD."],
-    ["E2 - Sub-grupo por SecuenciaPed", stats.E2, "Misma clave E1 pero sub-divide por SecuenciaPed existente. Resuelve cuando la misma fracción+país tiene múltiples entradas en el 551."],
+    ["E1 - Ped+Fracción+País exacto",      stats.E1, "Agrupa Layout por Pedimento+FraccionNico+País. Suma CantidadSaldo y VCUSD; busca en 551 con tolerancia ±1 ud / ±2 USD."],
+    ["E2 - Sub-grupo por SecuenciaPed",   stats.E2, "Misma clave E1 pero sub-divide por SecuenciaPed existente. Resuelve cuando la misma fracción+país tiene múltiples entradas en el 551."],
     ["E3 - Sin País (solo Ped+Fracción)", stats.E3, "Ignora PaisOrigen para manejar diferencias de código de país entre Layout y 551. Cantidades y valores exactos."],
     ["E4 - Sin País + Sub-SecuenciaPed",  stats.E4, "Combina E3 y E2: sin País + sub-agrupación por SecuenciaPed. Captura casos con variación de código país Y múltiples secuencias."],
-    ["E5 - Tolerancia Ampliada ±5%",     stats.E5, "Último recurso con tolerancia ±5% en cantidad y valor. Resuelve diferencias de redondeo o conversión de unidades entre sistemas."],
+    ["E5 - Tolerancia Ampliada ±5%",      stats.E5, "Tolerancia ±5% en cantidad y valor. Resuelve diferencias de redondeo o conversión de unidades entre sistemas."],
+    ["E6 - Suma de combinaciones (2+3)",  stats.E6, "Evalúa si la suma de 2 o 3 secuencias del 551 iguala el total del grupo Layout (±2%). Detecta materiales importados en múltiples lotes del mismo pedimento y particiona las filas del Layout por cuota."],
+    ["E7 - Precio unitario ±15%",         stats.E7, "Usa el precio por unidad ($/pieza) como discriminador con tolerancia ±15%. Resuelve casos donde las cantidades totales no coinciden pero el precio unitario confirma la correspondencia correcta."],
+    ["E8 - Eliminación por descarte",     stats.E8, "Filtra candidatos del 551 ya usados y asigna el único remanente (o el más cercano en precio unitario ±30%). Válido cuando el material no tiene otra posible correspondencia."],
     [],
   ];
 
@@ -864,8 +993,29 @@ const STRATEGIES = [
   {
     id: "E5",
     name: "Tolerancia Ampliada (±5%)",
-    desc: "Último recurso: tolerancia ±5% en cantidad (mín 2 unidades) y ±5% en valor (mín 5 USD). Resuelve diferencias de redondeo, conversión de unidades UMC/UMT o tipos de cambio entre sistemas.",
+    desc: "Tolerancia ±5% en cantidad (mín 2 unidades) y ±5% en valor (mín 5 USD). Resuelve diferencias de redondeo, conversión de unidades UMC/UMT o tipos de cambio entre sistemas.",
     color: "#ef4444",
+    icon: "⬛",
+  },
+  {
+    id: "E6",
+    name: "Suma de combinaciones (2 + 3 lotes)",
+    desc: "Cuando el Layout suma más que cualquier secuencia individual del 551, evalúa si la combinación de 2 o 3 secuencias suma al total del grupo Layout (±2%). Detecta materiales importados en múltiples lotes dentro del mismo pedimento. Particiona las filas del Layout entre los lotes por cuota restante.",
+    color: "#06b6d4",
+    icon: "⬛",
+  },
+  {
+    id: "E7",
+    name: "Precio unitario ($/pieza ±15%)",
+    desc: "Usa el precio por unidad (ValorDolares / CantidadUMComercial) como discriminador con tolerancia ±15%. Resuelve casos donde los totales no coinciden pero el precio unitario confirma el material correcto (saldo acumulado de pedimentos anteriores, diferencias de conversión UMC/UMT).",
+    color: "#f97316",
+    icon: "⬛",
+  },
+  {
+    id: "E8",
+    name: "Eliminación por descarte",
+    desc: "Último recurso: filtra candidatos del 551 ya usados por estrategias anteriores y asigna el único remanente para esa Fracción+Pedimento. Si quedan varios sin usar, selecciona el de precio unitario más cercano (tolerancia ±30%). Válido cuando el material no tiene otra posible correspondencia.",
+    color: "#8b5cf6",
     icon: "⬛",
   },
 ];
@@ -1241,7 +1391,7 @@ export default function App() {
                 <StatCard label="Filas asignadas" value={matched} sub="SecuenciaPed actualizada" accent="#22c55e" />
                 <StatCard label="Sin match (Layout)" value={results.unmatchedFinal.length} sub="Requieren revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
                 <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout en Excel" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
-                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 5 disponibles" accent="#a855f7" />
+                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 8 disponibles" accent="#a855f7" />
               </div>
             </div>
 
