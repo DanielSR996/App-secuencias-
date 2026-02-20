@@ -144,9 +144,10 @@ function runCascade(layoutRows, s551Rows) {
     _sec:  nSec(r[L_SEC]),
   }));
 
-  const s551 = s551Rows.map((r) => ({
+  const s551 = s551Rows.map((r, i) => ({
     ...r,
-    _frac: nFrac(r[S_FRAC]),
+    _frac:    nFrac(r[S_FRAC]),
+    _551idx:  i,
   }));
 
   // ── Set de todas las fracciones en el 551 (para diagnóstico) ────────────
@@ -169,6 +170,7 @@ function runCascade(layoutRows, s551Rows) {
   // ── Tracking ──────────────────────────────────────────────────────────────
   const assignment    = new Map();
   const assigned      = new Set();
+  const used551       = new Set(); // índices (_551idx) de filas del 551 usadas en algún match
   const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0 };
 
   // Almacena también el registro 551 que generó el match (para hoja de cruce)
@@ -178,6 +180,7 @@ function runCascade(layoutRows, s551Rows) {
         assignment.set(r._idx, { seq, strategy, r551 });
         assigned.add(r._idx);
         strategyStats[strategy]++;
+        if (r551?._551idx !== undefined) used551.add(r551._551idx);
       }
     }
   };
@@ -228,6 +231,46 @@ function runCascade(layoutRows, s551Rows) {
     const match = tryMatch(cands, cant, vcusd, tolCant, tolVCUSD);
     if (match) assignRows(g.rows, match.seq, "E5", match.r551);
   }
+
+  // ── Layout lookup por Ped+Frac (para diagnóstico de orphans del 551) ─────
+  const layoutPF = new Map();
+  for (const r of layout) {
+    const k = `${r[L_PED]}|||${r._frac}`;
+    if (!layoutPF.has(k)) layoutPF.set(k, []);
+    layoutPF.get(k).push(r);
+  }
+
+  // ── Secuencias del 551 que NO se usaron en ningún match (orphans) ─────────
+  const getOrphanReason = (r) => {
+    const cant = parseFloat(r["CantidadUMComercial"]);
+    const val  = parseFloat(r["ValorDolares"]);
+    const cantZero = isNaN(cant) || cant === 0;
+    const valZero  = isNaN(val)  || val  === 0;
+    const seq  = r["SecuenciaFraccion"] ?? "?";
+    const frac = r._frac ?? r[S_FRAC] ?? "?";
+    const ped  = r[S_PED] ?? "?";
+
+    if (cantZero && valZero)
+      return `Sec.${seq} — Sin cantidad ni valor: CantidadUMComercial=0 y ValorDolares=0`;
+    if (cantZero)
+      return `Sec.${seq} — CantidadUMComercial=0 (sin cantidad registrada en el 551)`;
+    if (valZero)
+      return `Sec.${seq} — ValorDolares=0 (sin valor en dólares registrado en el 551)`;
+
+    const kPF = `${ped}|||${frac}`;
+    if (!layoutPF.has(kPF))
+      return `Sec.${seq} — Pedimento ${ped} / Fracción ${frac} no tiene partidas en Layout`;
+
+    // Layout sí tiene esa combinación pero no cuadran cantidades
+    const layoutCands = layoutPF.get(kPF);
+    const sumCant = layoutCands.reduce((a, lr) => a + (parseFloat(lr[L_CANT]) || 0), 0);
+    const sumVal  = layoutCands.reduce((a, lr) => a + (parseFloat(lr[L_VCUSD]) || 0), 0);
+    return `Sec.${seq} — Cantidad/Valor no coinciden: Layout(${sumCant.toFixed(0)} ud / $${sumVal.toFixed(2)}) vs 551(${cant.toFixed(0)} ud / $${val.toFixed(2)})`;
+  };
+
+  const orphan551Rows = s551
+    .filter((r) => !used551.has(r._551idx))
+    .map((r)  => ({ ...r, _orphanReason: getOrphanReason(r) }));
 
   // ── Diagnóstico por grupo sin match ──────────────────────────────────────
   const computeGroupNote = (ped, frac, pais, cant, vcusd) => {
@@ -389,11 +432,11 @@ function runCascade(layoutRows, s551Rows) {
     return (a.estrategia || "").localeCompare(b.estrategia || "");
   });
 
-  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData };
+  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows };
 }
 
 // ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
-function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData) {
+function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows) {
   const wb = XLSX.utils.book_new();
 
   // ── Datos originales del Layout ─────────────────────────────────────────
@@ -456,6 +499,38 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       changeMap.set(rowIdx, { tipo: "sinmatch" });
     }
     updatedRows.push(row);
+  }
+
+  // ── Filas extra al final: secuencias del 551 que no se asignaron al Layout ─
+  const orphan551StartRow = updatedRows.length; // índice de fila en la hoja (0-based)
+
+  if (orphan551Rows && orphan551Rows.length > 0) {
+    // Fila separadora vacía
+    updatedRows.push(Array(headers.length).fill(""));
+
+    // Encabezado de sección
+    const sectionHdr = Array(headers.length).fill("");
+    sectionHdr[0] = `▼ SECUENCIAS DEL 551 NO ASIGNADAS AL LAYOUT  (${orphan551Rows.length} registros)`;
+    updatedRows.push(sectionHdr);
+
+    // Localizar índices de columnas del Layout para mapear los datos del 551
+    const pedIdxL   = rawHeaders.findIndex((h) => String(h ?? "").trim() === "Pedimento");
+    const fracIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "FraccionNico");
+    const paisIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "PaisOrigen");
+    const cantIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "CantidadSaldo");
+    const vcusdIdxL = rawHeaders.findIndex((h) => String(h ?? "").trim() === "VCUSD");
+
+    for (const r551 of orphan551Rows) {
+      const row = Array(headers.length).fill("");
+      if (secIdx   >= 0) row[secIdx]   = r551["SecuenciaFraccion"] ?? "";
+      if (pedIdxL  >= 0) row[pedIdxL]  = r551["Pedimento"] ?? "";
+      if (fracIdxL >= 0) row[fracIdxL] = r551["Fraccion"]  ?? "";
+      if (paisIdxL >= 0) row[paisIdxL] = r551["PaisOrigenDestino"] ?? "";
+      if (cantIdxL >= 0) row[cantIdxL] = parseFloat(r551["CantidadUMComercial"]) || 0;
+      if (vcusdIdxL >= 0) row[vcusdIdxL] = parseFloat(r551["ValorDolares"])      || 0;
+      row[notasIdx] = r551._orphanReason || "";
+      updatedRows.push(row);
+    }
   }
 
   // ── Crear worksheet y aplicar estilos ────────────────────────────────────
@@ -531,6 +606,49 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       wsLayout[addrN].s = S_NOTA_CAMBIO;
     } else if (info.tipo === "sinmatch" && updatedRows[rowI][notasIdx]) {
       wsLayout[addrN].s = S_NOTA_SINMATCH;
+    }
+  }
+
+  // ── Estilos para filas de orphan 551 ────────────────────────────────────
+  if (orphan551Rows && orphan551Rows.length > 0) {
+    const S_ORPHAN_HDR = {
+      font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } },
+      fill: { patternType: "solid", fgColor: { rgb: "1A5276" } },
+      alignment: { wrapText: true },
+    };
+    const S_ORPHAN_SEQ = {
+      font: { bold: true, color: { rgb: "0D3349" } },
+      fill: { patternType: "solid", fgColor: { rgb: "AED6F1" } },
+      alignment: { horizontal: "center" },
+    };
+    const S_ORPHAN_DATA = {
+      font: { color: { rgb: "1A5276" } },
+      fill: { patternType: "solid", fgColor: { rgb: "EBF5FB" } },
+    };
+    const S_ORPHAN_NOTA = {
+      font: { italic: true, sz: 10, color: { rgb: "0D3349" } },
+      fill: { patternType: "solid", fgColor: { rgb: "AED6F1" } },
+      alignment: { wrapText: true },
+    };
+
+    // Fila encabezado de sección (orphan551StartRow + 1)
+    const sectionSheetRow = orphan551StartRow + 1;
+    for (let c = 0; c < headers.length; c++) {
+      const addr = XLSX.utils.encode_cell({ r: sectionSheetRow, c });
+      if (!wsLayout[addr]) wsLayout[addr] = { t: "s", v: "" };
+      wsLayout[addr].s = S_ORPHAN_HDR;
+    }
+
+    // Filas de datos orphan (orphan551StartRow + 2 en adelante)
+    for (let o = 0; o < orphan551Rows.length; o++) {
+      const shRowI = orphan551StartRow + 2 + o;
+      for (let c = 0; c < headers.length; c++) {
+        const addr = XLSX.utils.encode_cell({ r: shRowI, c });
+        if (!wsLayout[addr]) wsLayout[addr] = { t: "s", v: "" };
+        wsLayout[addr].s = c === secIdx ? S_ORPHAN_SEQ
+                         : c === notasIdx ? S_ORPHAN_NOTA
+                         : S_ORPHAN_DATA;
+      }
     }
   }
 
@@ -688,6 +806,23 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     }
   } else {
     reportRows.push(["✓ TODOS LOS GRUPOS TUVIERON MATCH EXITOSO"]);
+  }
+
+  if (orphan551Rows && orphan551Rows.length > 0) {
+    reportRows.push([]);
+    reportRows.push([`SECUENCIAS DEL 551 NO ASIGNADAS AL LAYOUT  (${orphan551Rows.length} registros)`]);
+    reportRows.push(["SecuenciaFraccion", "Pedimento", "Fraccion", "PaisOrigenDestino", "CantidadUMComercial", "ValorDolares", "Motivo / Razón"]);
+    for (const r of orphan551Rows) {
+      reportRows.push([
+        r["SecuenciaFraccion"] ?? "",
+        r["Pedimento"] ?? "",
+        r["Fraccion"]  ?? "",
+        r["PaisOrigenDestino"] ?? "",
+        parseFloat(r["CantidadUMComercial"]) || 0,
+        parseFloat(r["ValorDolares"])        || 0,
+        r._orphanReason || "",
+      ]);
+    }
   }
 
   const wsReport = XLSX.utils.aoa_to_sheet(reportRows);
@@ -877,13 +1012,13 @@ export default function App() {
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
-      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData } = runCascade(layoutRows, s551Rows);
+      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
-      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData);
+      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows);
       setProgress(100);
 
-      setResults({ strategyStats, unmatchedFinal, total });
+      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length });
       setOutputWb(newWb);
 
       setTimeout(() => setPhase("results"), 400);
@@ -1101,11 +1236,12 @@ export default function App() {
               <div style={{ color: "#475569", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 12 }}>
                 {fileName} · {results.total} filas procesadas
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12 }}>
                 <StatCard label="Éxito global" value={`${pct}%`} sub={`${matched} de ${results.total} filas`} accent="#f59e0b" />
                 <StatCard label="Filas asignadas" value={matched} sub="SecuenciaPed actualizada" accent="#22c55e" />
-                <StatCard label="Sin match" value={results.unmatchedFinal.length} sub="Requieren revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
-                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 5 disponibles" accent="#3b82f6" />
+                <StatCard label="Sin match (Layout)" value={results.unmatchedFinal.length} sub="Requieren revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
+                <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout en Excel" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
+                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 5 disponibles" accent="#a855f7" />
               </div>
             </div>
 
