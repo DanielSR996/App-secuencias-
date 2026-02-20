@@ -216,8 +216,10 @@ function runCascade(layoutRows, s551Rows) {
   const fracSet551 = new Set(s551.map((r) => r._frac));
 
   // ── Lookups del 551 ───────────────────────────────────────────────────────
-  const lookupPFP = new Map();  // Pedimento + Fraccion + Pais
-  const lookupPF  = new Map();  // Pedimento + Fraccion (sin país)
+  const lookupPFP   = new Map();  // Pedimento + Fraccion + Pais
+  const lookupPF    = new Map();  // Pedimento + Fraccion (sin país)
+  const lookupP     = new Map();  // Solo Pedimento
+  const lookupPChap = new Map();  // Pedimento + capítulo (primeros 4 dígitos de fracción)
 
   for (const r of s551) {
     const k1 = `${r[S_PED]}|||${r._frac}|||${String(r[S_PAIS] ?? "").trim()}`;
@@ -227,22 +229,43 @@ function runCascade(layoutRows, s551Rows) {
     const k2 = `${r[S_PED]}|||${r._frac}`;
     if (!lookupPF.has(k2)) lookupPF.set(k2, []);
     lookupPF.get(k2).push(r);
+
+    const kP = String(r[S_PED] ?? "");
+    if (!lookupP.has(kP)) lookupP.set(kP, []);
+    lookupP.get(kP).push(r);
+
+    const chap = r._frac.slice(0, 4);
+    const kPC  = `${r[S_PED]}|||${chap}`;
+    if (!lookupPChap.has(kPC)) lookupPChap.set(kPC, []);
+    lookupPChap.get(kPC).push(r);
   }
 
   // ── Tracking ──────────────────────────────────────────────────────────────
   const assignment    = new Map();
   const assigned      = new Set();
-  const used551       = new Set(); // índices (_551idx) de filas del 551 usadas en algún match
-  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0 };
+  const used551       = new Set();
+  const correctionMap = new Map(); // rowIdx → [{field, original, corrected}]
+  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0 };
 
-  // Almacena también el registro 551 que generó el match (para hoja de cruce)
-  const assignRows = (rows, seq, strategy, r551 = null) => {
+  // Almacena el registro 551 que generó el match; auto-detecta correcciones de País/Fracción.
+  const assignRows = (rows, seq, strategy, r551 = null, extraCorrections = []) => {
     for (const r of rows) {
       if (!assigned.has(r._idx)) {
         assignment.set(r._idx, { seq, strategy, r551 });
         assigned.add(r._idx);
         strategyStats[strategy]++;
         if (r551?._551idx !== undefined) used551.add(r551._551idx);
+
+        const corrs = [...extraCorrections];
+        if (r551) {
+          // Corrección automática de país cuando E3/E4/E5 ignoraron el país
+          const pais551 = String(r551[S_PAIS] ?? "").trim();
+          const paisL   = String(r[L_PAIS]   ?? "").trim();
+          if (paisL && pais551 && paisL !== pais551) {
+            corrs.push({ field: "PaisOrigen", original: paisL, corrected: pais551 });
+          }
+        }
+        if (corrs.length > 0) correctionMap.set(r._idx, corrs);
       }
     }
   };
@@ -356,6 +379,82 @@ function runCascade(layoutRows, s551Rows) {
       ? { seq: cands[0][S_SEQ], r551: cands[0] }
       : tryMatchUnitPrice(cands, cant, vcusd, 0.30);
     if (match) assignRows(g.rows, match.seq, "E8", match.r551);
+  }
+
+  // ── E9: Mismo capítulo arancelario (4 dígitos) — corrige FraccionNico ─────
+  // El 551 es la fuente oficial: si el material encaja por pedimento + mismos 4 dígitos
+  // de fracción + precio unitario, la fracción del Layout se corrige por la del 551.
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+    const chap  = String(g.keyVals[1]).slice(0, 4);
+    const kPC   = `${g.keyVals[0]}|||${chap}`;
+    const cands = (lookupPChap.get(kPC) || []).filter((r) => !used551.has(r._551idx));
+    if (!cands.length) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const match = tryMatch(cands, cant, vcusd, 2, 5) || tryMatchUnitPrice(cands, cant, vcusd, 0.20);
+    if (!match) continue;
+    const corrFrac = String(g.keyVals[1]) !== match.r551._frac
+      ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: match.r551._frac }]
+      : [];
+    assignRows(g.rows, match.seq, "E9", match.r551, corrFrac);
+  }
+
+  // ── E10: Solo Pedimento + precio unitario — corrige Fracción y País ────────
+  // Último fallback por pedimento completo. Usa precio por pieza como discriminador
+  // con tolerancia ±25%. Si solo queda 1 candidato sin usar, lo asigna directamente.
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+    const kP    = String(g.keyVals[0]);
+    const cands = (lookupP.get(kP) || []).filter((r) => !used551.has(r._551idx));
+    if (!cands.length) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const matchUP = tryMatchUnitPrice(cands, cant, vcusd, 0.25);
+    const match   = matchUP || (cands.length === 1 ? { seq: cands[0][S_SEQ], r551: cands[0] } : null);
+    if (!match) continue;
+    const corrFrac = String(g.keyVals[1]) !== match.r551._frac
+      ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: match.r551._frac }]
+      : [];
+    assignRows(g.rows, match.seq, "E10", match.r551, corrFrac);
+  }
+
+  // ── E11: Fuerza 1:1 greedy por precio unitario dentro del pedimento ────────
+  // Para los que quedan: empareja grupos Layout con secuencias 551 no usadas
+  // del mismo pedimento, ordenando por precio unitario más cercano (±sin límite).
+  // Marca todas las correcciones de fracción/país que sean necesarias.
+  {
+    const pendGrps = groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS]);
+    const pedMap   = new Map();
+    for (const g of pendGrps) {
+      const ped = String(g.keyVals[0]);
+      if (!pedMap.has(ped)) pedMap.set(ped, []);
+      const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+      pedMap.get(ped).push({ rows: g.rows, keyVals: g.keyVals,
+        up: vcusd / Math.max(cant, 0.0001) });
+    }
+    for (const [ped, grps] of pedMap) {
+      const avail = (lookupP.get(ped) || [])
+        .filter((r) => !used551.has(r._551idx))
+        .map((r) => ({ r551: r,
+          up: (parseFloat(r["ValorDolares"]) || 0) /
+              Math.max(parseFloat(r["CantidadUMComercial"]) || 1, 0.0001) }));
+      if (!avail.length) continue;
+      const usedInE11 = new Set();
+      for (const grp of grps) {
+        const unassigned = grp.rows.filter((r) => !assigned.has(r._idx));
+        if (!unassigned.length) continue;
+        let best = null, bestDiff = Infinity;
+        for (let si = 0; si < avail.length; si++) {
+          if (usedInE11.has(si)) continue;
+          const diff = Math.abs(avail[si].up - grp.up) / Math.max(grp.up, 0.0001);
+          if (diff < bestDiff) { bestDiff = diff; best = si; }
+        }
+        if (best === null) continue;
+        usedInE11.add(best);
+        const r551m    = avail[best].r551;
+        const corrFrac = String(grp.keyVals[1]) !== r551m._frac
+          ? [{ field: "FraccionNico", original: String(grp.keyVals[1]), corrected: r551m._frac }]
+          : [];
+        assignRows(unassigned, r551m[S_SEQ], "E11", r551m, corrFrac);
+      }
+    }
   }
 
   // ── Layout lookup por Ped+Frac (para diagnóstico de orphans del 551) ─────
@@ -558,19 +657,21 @@ function runCascade(layoutRows, s551Rows) {
     return (a.estrategia || "").localeCompare(b.estrategia || "");
   });
 
-  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows };
+  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap };
 }
 
 // ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
-function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows) {
+function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap) {
   const wb = XLSX.utils.book_new();
 
   // ── Datos originales del Layout ─────────────────────────────────────────
   const layoutData = XLSX.utils.sheet_to_json(layoutSheet, { header: 1 });
   const rawHeaders  = layoutData[0] || [];
 
-  // Buscar SecuenciaPed con trim (tolerante a espacios en el Excel)
-  const secIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "SecuenciaPed");
+  // Buscar columnas clave (tolerante a espacios)
+  const secIdx   = rawHeaders.findIndex((h) => String(h ?? "").trim() === "SecuenciaPed");
+  const paisIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "PaisOrigen");
+  const fracIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "FraccionNico");
   const notasIdx = rawHeaders.length;  // nueva columna al final
   const headers  = [...rawHeaders, "Notas"];
 
@@ -597,6 +698,19 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     const originalRaw = secIdx >= 0 ? (layoutData[i][secIdx] ?? "") : "";
     const originalStr = normSeq(originalRaw);
 
+    // ── Aplicar correcciones de campo (País, Fracción) basadas en el 551 ───
+    const corrections = correctionMap ? (correctionMap.get(rowIdx) || []) : [];
+    for (const corr of corrections) {
+      const colIdx = corr.field === "PaisOrigen"   ? paisIdx
+                   : corr.field === "FraccionNico" ? fracIdx : -1;
+      if (colIdx >= 0) row[colIdx] = corr.corrected;
+    }
+    const corrNote = corrections.length > 0
+      ? corrections.map((c) =>
+          `[CORRECCIÓN ${c.field}] '${c.original}' → '${c.corrected}' (fuente: 551)`
+        ).join(" | ")
+      : "";
+
     if (assignment.has(rowIdx)) {
       const rawSeq  = assignment.get(rowIdx).seq;
       const newSeq  = parseFloat(rawSeq) || rawSeq;
@@ -605,21 +719,23 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       row[secIdx] = newSeq;
 
       if (newStr !== originalStr) {
-        // Hubo cambio real: ¿era vacío/texto antes o era otro número?
         const wasEmpty = (originalStr === "" || isNaN(parseFloat(originalRaw)));
-        const tipo     = wasEmpty ? "nuevo" : "cambio";
-        const nota     = wasEmpty
-          ? `Secuencia asignada por la app: ${newStr}`
+        const tipo = corrections.length > 0
+          ? (wasEmpty ? "nuevo_corr" : "cambio_corr")
+          : (wasEmpty ? "nuevo" : "cambio");
+        let nota = wasEmpty
+          ? `Secuencia asignada: ${newStr}`
           : `Secuencia modificada: ${originalStr} → ${newStr}`;
+        if (corrNote) nota += `. ${corrNote}`;
         row[notasIdx] = nota;
-        changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, nota });
+        changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, nota, corrections });
       } else {
-        // Mismo valor que el original — sin nota, sin color
-        row[notasIdx] = "";
-        changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo: "igual" });
+        // Secuencia no cambió, pero puede haber correcciones de campo
+        row[notasIdx] = corrNote || "";
+        const tipo = corrections.length > 0 ? "igual_corr" : "igual";
+        changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, corrections });
       }
     } else {
-      // Sin match: limpiar SecuenciaPed + nota diagnóstico
       row[secIdx]   = "";
       row[notasIdx] = rowNotes ? (rowNotes.get(rowIdx) || "") : "";
       changeMap.set(rowIdx, { tipo: "sinmatch" });
@@ -706,6 +822,16 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     fill: { patternType: "solid", fgColor: { rgb: "FEF9E7" } },
     alignment: { wrapText: true },
   };
+  const S_CORRECTED_CELL = {   // celda de campo corregido (País/Fracción): rojo-naranja
+    font: { bold: true, color: { rgb: "C0392B" } },
+    fill: { patternType: "solid", fgColor: { rgb: "FDEBD0" } },
+    alignment: { horizontal: "center" },
+  };
+  const S_NOTA_CORRECCION = {  // nota de corrección: fondo naranja claro
+    font: { bold: true, sz: 10, color: { rgb: "784212" } },
+    fill: { patternType: "solid", fgColor: { rgb: "FDEBD0" } },
+    alignment: { wrapText: true },
+  };
 
   for (let rowI = 1; rowI < updatedRows.length; rowI++) {
     const rowIdx = rowI - 1;
@@ -716,22 +842,38 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     if (secIdx >= 0) {
       const addr = XLSX.utils.encode_cell({ r: rowI, c: secIdx });
       if (!wsLayout[addr]) wsLayout[addr] = { t: "s", v: "" };
-      if (info.tipo === "nuevo" || info.tipo === "cambio") {
-        wsLayout[addr].s = S_CHANGED;      // rojo negrita
-      } else if (info.tipo === "igual") {
-        wsLayout[addr].s = S_EQUAL;        // negro sin resaltar
+      if (info.tipo === "nuevo"  || info.tipo === "cambio" ||
+          info.tipo === "nuevo_corr" || info.tipo === "cambio_corr") {
+        wsLayout[addr].s = S_CHANGED;
+      } else if (info.tipo === "igual" || info.tipo === "igual_corr") {
+        wsLayout[addr].s = S_EQUAL;
       } else {
-        wsLayout[addr].s = S_EMPTY;        // gris (vacío)
+        wsLayout[addr].s = S_EMPTY;
       }
     }
 
     // Estilo Notas
     const addrN = XLSX.utils.encode_cell({ r: rowI, c: notasIdx });
     if (!wsLayout[addrN]) wsLayout[addrN] = { t: "s", v: "" };
-    if (info.tipo === "nuevo" || info.tipo === "cambio") {
+    if (info.tipo === "nuevo"  || info.tipo === "cambio" ||
+        info.tipo === "nuevo_corr" || info.tipo === "cambio_corr") {
       wsLayout[addrN].s = S_NOTA_CAMBIO;
+    } else if (info.tipo === "igual_corr") {
+      wsLayout[addrN].s = S_NOTA_CORRECCION;
     } else if (info.tipo === "sinmatch" && updatedRows[rowI][notasIdx]) {
       wsLayout[addrN].s = S_NOTA_SINMATCH;
+    }
+
+    // Pintar en rojo las celdas de campos corregidos (PaisOrigen, FraccionNico)
+    if (info.corrections && info.corrections.length > 0) {
+      for (const corr of info.corrections) {
+        const colIdx = corr.field === "PaisOrigen"   ? paisIdx
+                     : corr.field === "FraccionNico" ? fracIdx : -1;
+        if (colIdx < 0) continue;
+        const addrCorr = XLSX.utils.encode_cell({ r: rowI, c: colIdx });
+        if (!wsLayout[addrCorr]) wsLayout[addrCorr] = { t: "s", v: corr.corrected };
+        wsLayout[addrCorr].s = S_CORRECTED_CELL;
+      }
     }
   }
 
@@ -924,6 +1066,9 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     ["E6 - Suma de combinaciones (2+3)",  stats.E6, "Evalúa si la suma de 2 o 3 secuencias del 551 iguala el total del grupo Layout (±2%). Detecta materiales importados en múltiples lotes del mismo pedimento y particiona las filas del Layout por cuota."],
     ["E7 - Precio unitario ±15%",         stats.E7, "Usa el precio por unidad ($/pieza) como discriminador con tolerancia ±15%. Resuelve casos donde las cantidades totales no coinciden pero el precio unitario confirma la correspondencia correcta."],
     ["E8 - Eliminación por descarte",     stats.E8, "Filtra candidatos del 551 ya usados y asigna el único remanente (o el más cercano en precio unitario ±30%). Válido cuando el material no tiene otra posible correspondencia."],
+    ["E9 - Corrección de Fracción (capítulo)", stats.E9, "Si la fracción del Layout no existe en el 551 para ese pedimento pero sí existe otra del mismo capítulo (4 dígitos), corrige FraccionNico con el valor del 551. La celda corregida aparece en ROJO en el Excel."],
+    ["E10 - Solo Pedimento + precio unitario", stats.E10, "Búsqueda en todo el pedimento ignorando fracción y país. Precio unitario ±25% o único candidato disponible. Corrige FraccionNico y/o PaisOrigen según el 551. Celdas corregidas en ROJO."],
+    ["E11 - Fuerza 1:1 greedy",           stats.E11, "Empareja grupos Layout pendientes con secuencias 551 no usadas del mismo pedimento, ordenando por precio unitario (sin límite de tolerancia). Aplica todas las correcciones necesarias. Celdas corregidas en ROJO."],
     [],
   ];
 
@@ -1014,8 +1159,29 @@ const STRATEGIES = [
   {
     id: "E8",
     name: "Eliminación por descarte",
-    desc: "Último recurso: filtra candidatos del 551 ya usados por estrategias anteriores y asigna el único remanente para esa Fracción+Pedimento. Si quedan varios sin usar, selecciona el de precio unitario más cercano (tolerancia ±30%). Válido cuando el material no tiene otra posible correspondencia.",
+    desc: "Filtra candidatos del 551 ya usados y asigna el único remanente (o el más cercano en precio unitario ±30%). Válido cuando el material no tiene otra posible correspondencia.",
     color: "#8b5cf6",
+    icon: "⬛",
+  },
+  {
+    id: "E9",
+    name: "Mismo capítulo arancelario — corrige Fracción",
+    desc: "Si la fracción del Layout no está en el 551 pero existe otra fracción del mismo capítulo (mismos 4 dígitos) en el mismo pedimento, la corrige usando el 551 como fuente oficial. Usa tolerancia de cantidades ±2 ud / ±5 USD o precio unitario ±20%. La fracción corregida aparece en rojo en el Excel.",
+    color: "#ec4899",
+    icon: "⬛",
+  },
+  {
+    id: "E10",
+    name: "Solo Pedimento + precio unitario — corrige Fracción y País",
+    desc: "Busca en todo el pedimento sin restricción de fracción ni país. Usa precio por pieza (±25%) como discriminador o asigna el único candidato disponible. Corrige tanto FraccionNico como PaisOrigen si difieren del 551. Las correcciones aparecen en rojo en el Excel.",
+    color: "#14b8a6",
+    icon: "⬛",
+  },
+  {
+    id: "E11",
+    name: "Fuerza 1:1 greedy — emparejamiento por precio unitario",
+    desc: "Último recurso total: empareja los grupos Layout pendientes con las secuencias 551 no usadas del mismo pedimento, ordenando ambas listas por precio unitario y asignando en pares (greedy). Aplica todas las correcciones necesarias de fracción y país. Sin límite de tolerancia.",
+    color: "#64748b",
     icon: "⬛",
   },
 ];
@@ -1162,13 +1328,13 @@ export default function App() {
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
-      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows } = runCascade(layoutRows, s551Rows);
+      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
-      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows);
+      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap);
       setProgress(100);
 
-      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length });
+      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size });
       setOutputWb(newWb);
 
       setTimeout(() => setPhase("results"), 400);
@@ -1386,12 +1552,13 @@ export default function App() {
               <div style={{ color: "#475569", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 12 }}>
                 {fileName} · {results.total} filas procesadas
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))", gap: 12 }}>
                 <StatCard label="Éxito global" value={`${pct}%`} sub={`${matched} de ${results.total} filas`} accent="#f59e0b" />
                 <StatCard label="Filas asignadas" value={matched} sub="SecuenciaPed actualizada" accent="#22c55e" />
-                <StatCard label="Sin match (Layout)" value={results.unmatchedFinal.length} sub="Requieren revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
-                <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout en Excel" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
-                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 8 disponibles" accent="#a855f7" />
+                <StatCard label="Sin match" value={results.unmatchedFinal.length} sub="Revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
+                <StatCard label="Correcciones" value={results.correctionCount || 0} sub="Campos ajustados por 551" accent={(results.correctionCount || 0) > 0 ? "#f97316" : "#22c55e"} />
+                <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
+                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 11 disponibles" accent="#a855f7" />
               </div>
             </div>
 
