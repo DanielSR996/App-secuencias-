@@ -212,6 +212,14 @@ function runCascade(layoutRows, s551Rows) {
     _551idx:  i,
   }));
 
+  // ── Totales globales para validar si Layout y 551 balancean ──────────────
+  const globalTotals = {
+    layoutCant:  layout.reduce((a, r) => a + (parseFloat(r[L_CANT])  || 0), 0),
+    layoutVCUSD: layout.reduce((a, r) => a + (parseFloat(r[L_VCUSD]) || 0), 0),
+    s551Cant:    s551.reduce((a, r) => a + (parseFloat(r["CantidadUMComercial"]) || 0), 0),
+    s551Val:     s551.reduce((a, r) => a + (parseFloat(r["ValorDolares"])        || 0), 0),
+  };
+
   // ── Set de todas las fracciones en el 551 (para diagnóstico) ────────────
   const fracSet551 = new Set(s551.map((r) => r._frac));
 
@@ -245,7 +253,7 @@ function runCascade(layoutRows, s551Rows) {
   const assigned      = new Set();
   const used551       = new Set();
   const correctionMap = new Map(); // rowIdx → [{field, original, corrected}]
-  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0 };
+  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0 };
 
   // Almacena el registro 551 que generó el match; auto-detecta correcciones de País/Fracción.
   const assignRows = (rows, seq, strategy, r551 = null, extraCorrections = []) => {
@@ -465,6 +473,75 @@ function runCascade(layoutRows, s551Rows) {
     layoutPF.get(k).push(r);
   }
 
+  // ── R1: Barrido inverso — precio unitario ±30%, SIN filtro used551 ─────────
+  // Las E anteriores solo usan secuencias 551 "libres". R1 permite reusar cualquier
+  // secuencia 551 (incluso asignada) con tolerancia más amplia de precio/pieza.
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+    const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
+    const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
+    const cands = (lookupPFP.get(kPFP) || []).length > 0
+      ? lookupPFP.get(kPFP)
+      : (lookupPF.get(kPF) || []);
+    if (!cands.length) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const match = tryMatch(cands, cant, vcusd, 3, 8)
+               || tryMatchUnitPrice(cands, cant, vcusd, 0.30);
+    if (match) assignRows(g.rows, match.seq, "R1", match.r551);
+  }
+
+  // ── R2: Solo Pedimento — sin filtro used551 — corrige Fracción y País ──────
+  // Busca en todo el pedimento sin importar fracción ni país, con precio ±40%.
+  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+    const kP    = String(g.keyVals[0]);
+    const cands = lookupP.get(kP) || [];
+    if (!cands.length) continue;
+    const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+    const match = tryMatchUnitPrice(cands, cant, vcusd, 0.40)
+               || (cands.length === 1 ? { seq: cands[0][S_SEQ], r551: cands[0] } : null);
+    if (!match) continue;
+    const corrFrac = String(g.keyVals[1]) !== match.r551._frac
+      ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: match.r551._frac }]
+      : [];
+    assignRows(g.rows, match.seq, "R2", match.r551, corrFrac);
+  }
+
+  // ── R3: Fuerza total greedy — sin filtro, sin tolerancia ──────────────────
+  // Último recurso absoluto: empareja cada grupo Layout restante con la secuencia
+  // 551 del mismo pedimento cuyo precio/pieza sea más cercano (sin importar diferencia).
+  {
+    const pendR3  = groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS]);
+    const pedMapR = new Map();
+    for (const g of pendR3) {
+      const ped = String(g.keyVals[0]);
+      if (!pedMapR.has(ped)) pedMapR.set(ped, []);
+      const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+      pedMapR.get(ped).push({ rows: g.rows, keyVals: g.keyVals,
+        up: vcusd / Math.max(cant, 0.0001) });
+    }
+    for (const [ped, grps] of pedMapR) {
+      const avail = (lookupP.get(ped) || []).map((r) => ({
+        r551: r,
+        up: (parseFloat(r["ValorDolares"]) || 0) /
+            Math.max(parseFloat(r["CantidadUMComercial"]) || 1, 0.0001),
+      }));
+      if (!avail.length) continue;
+      for (const grp of grps) {
+        const unassigned = grp.rows.filter((r) => !assigned.has(r._idx));
+        if (!unassigned.length) continue;
+        let best = null, bestDiff = Infinity;
+        for (const a of avail) {
+          const diff = Math.abs(a.up - grp.up) / Math.max(grp.up, 0.0001);
+          if (diff < bestDiff) { bestDiff = diff; best = a; }
+        }
+        if (!best) continue;
+        const corrFrac = String(grp.keyVals[1]) !== best.r551._frac
+          ? [{ field: "FraccionNico", original: String(grp.keyVals[1]), corrected: best.r551._frac }]
+          : [];
+        assignRows(unassigned, best.r551[S_SEQ], "R3", best.r551, corrFrac);
+      }
+    }
+  }
+
   // ── Secuencias del 551 que NO se usaron en ningún match (orphans) ─────────
   const getOrphanReason = (r) => {
     const cant = parseFloat(r["CantidadUMComercial"]);
@@ -657,11 +734,11 @@ function runCascade(layoutRows, s551Rows) {
     return (a.estrategia || "").localeCompare(b.estrategia || "");
   });
 
-  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap };
+  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals };
 }
 
 // ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
-function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap) {
+function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals) {
   const wb = XLSX.utils.book_new();
 
   // ── Datos originales del Layout ─────────────────────────────────────────
@@ -1069,8 +1146,28 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     ["E9 - Corrección de Fracción (capítulo)", stats.E9, "Si la fracción del Layout no existe en el 551 para ese pedimento pero sí existe otra del mismo capítulo (4 dígitos), corrige FraccionNico con el valor del 551. La celda corregida aparece en ROJO en el Excel."],
     ["E10 - Solo Pedimento + precio unitario", stats.E10, "Búsqueda en todo el pedimento ignorando fracción y país. Precio unitario ±25% o único candidato disponible. Corrige FraccionNico y/o PaisOrigen según el 551. Celdas corregidas en ROJO."],
     ["E11 - Fuerza 1:1 greedy",           stats.E11, "Empareja grupos Layout pendientes con secuencias 551 no usadas del mismo pedimento, ordenando por precio unitario (sin límite de tolerancia). Aplica todas las correcciones necesarias. Celdas corregidas en ROJO."],
+    ["R1 - Barrido inverso Ped+Frac ±30%", stats.R1, "Barrido inverso sin filtro used551: usa cualquier sec. 551 del mismo Ped+Frac, precio ±30% o exacto. Elimina restricción de secuencias 'ya usadas' para maximizar asignación."],
+    ["R2 - Barrido inverso solo Pedimento ±40%", stats.R2, "Busca en todo el pedimento sin restricción de fracción/país, precio ±40%. Corrige Fracción y País si difieren del 551. Para casos con fracción completamente diferente en Layout."],
+    ["R3 - Fuerza total greedy sin filtro", stats.R3, "Fuerza máxima: empareja todos los grupos Layout restantes con cualquier sec. 551 del mismo pedimento, sin filtro ni tolerancia, eligiendo siempre la de precio/pieza más cercano."],
     [],
   ];
+
+  if (globalTotals) {
+    const fmt4 = (n) => Number(n.toFixed(4));
+    const diffCant  = globalTotals.layoutCant  - globalTotals.s551Cant;
+    const diffVal   = globalTotals.layoutVCUSD - globalTotals.s551Val;
+    const pctC = globalTotals.s551Cant  > 0 ? ((diffCant  / globalTotals.s551Cant)  * 100).toFixed(2) + "%" : "N/A";
+    const pctV = globalTotals.s551Val   > 0 ? ((diffVal   / globalTotals.s551Val)   * 100).toFixed(2) + "%" : "N/A";
+    const balance = Math.abs(diffCant) < 1 && Math.abs(diffVal) < 2 ? "✓ BALANCE EXACTO" : "⚠ DIFERENCIA";
+    reportRows.push(["VALIDACIÓN DE TOTALES GLOBALES (Layout vs 551)"]);
+    reportRows.push(["", "Cantidad total", "Valor USD total"]);
+    reportRows.push(["Layout (suma CantidadSaldo + VCUSD)", fmt4(globalTotals.layoutCant), fmt4(globalTotals.layoutVCUSD)]);
+    reportRows.push(["551   (suma CantidadUMC + ValorDolares)", fmt4(globalTotals.s551Cant),  fmt4(globalTotals.s551Val)]);
+    reportRows.push(["Diferencia (Layout − 551)", fmt4(diffCant), fmt4(diffVal)]);
+    reportRows.push(["Diferencia %", pctC, pctV]);
+    reportRows.push([balance]);
+    reportRows.push([]);
+  }
 
   if (unmatchedFinal.length > 0) {
     reportRows.push(["GRUPOS SIN MATCH — REVISIÓN MANUAL REQUERIDA"]);
@@ -1184,6 +1281,27 @@ const STRATEGIES = [
     color: "#64748b",
     icon: "⬛",
   },
+  {
+    id: "R1",
+    name: "Barrido inverso — precio unitario ±30% (cualquier sec. 551)",
+    desc: "Primer barrido inverso: usa cualquier secuencia del 551 del mismo Pedimento+Fracción (sin importar si ya fue asignada antes). Criterio: precio por pieza ±30% o cantidades exactas ±3 ud / ±8 USD. Elimina el sesgo del filtro 'used551'.",
+    color: "#0ea5e9",
+    icon: "⬛",
+  },
+  {
+    id: "R2",
+    name: "Barrido inverso — solo Pedimento, precio ±40%, corrige Fracción",
+    desc: "Busca en todo el pedimento ignorando fracción y país. Precio unitario ±40% o único candidato disponible. Corrige FraccionNico y PaisOrigen si difieren del 551. Para los casos donde el Layout tiene fracción completamente diferente.",
+    color: "#10b981",
+    icon: "⬛",
+  },
+  {
+    id: "R3",
+    name: "Fuerza total — greedy global sin tolerancia",
+    desc: "Fuerza máxima: empareja TODOS los grupos Layout restantes con cualquier secuencia 551 del mismo pedimento, sin filtro ni tolerancia, eligiendo siempre la de precio unitario más cercano. Garantiza cobertura máxima aunque las correcciones sean necesarias.",
+    color: "#f43f5e",
+    icon: "⬛",
+  },
 ];
 
 function UploadZone({ onFile, isDragging, setIsDragging }) {
@@ -1234,7 +1352,9 @@ function UploadZone({ onFile, isDragging, setIsDragging }) {
 }
 
 function StrategyBar({ stats, total }) {
-  const colors = { E1: "#22c55e", E2: "#3b82f6", E3: "#f59e0b", E4: "#a855f7", E5: "#ef4444" };
+  const colors = { E1: "#22c55e", E2: "#3b82f6", E3: "#f59e0b", E4: "#a855f7", E5: "#ef4444",
+                   E6: "#06b6d4", E7: "#f97316", E8: "#8b5cf6", E9: "#ec4899", E10: "#14b8a6", E11: "#64748b",
+                   R1: "#0ea5e9", R2: "#10b981", R3: "#f43f5e" };
   const unmatched = total - Object.values(stats).reduce((a, b) => a + b, 0);
   const segs = [
     ...Object.entries(stats).map(([k, v]) => ({ label: k, val: v, color: colors[k] })),
@@ -1328,13 +1448,13 @@ export default function App() {
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
-      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap } = runCascade(layoutRows, s551Rows);
+      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
-      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap);
+      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals);
       setProgress(100);
 
-      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size });
+      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals });
       setOutputWb(newWb);
 
       setTimeout(() => setPhase("results"), 400);
@@ -1558,9 +1678,62 @@ export default function App() {
                 <StatCard label="Sin match" value={results.unmatchedFinal.length} sub="Revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
                 <StatCard label="Correcciones" value={results.correctionCount || 0} sub="Campos ajustados por 551" accent={(results.correctionCount || 0) > 0 ? "#f97316" : "#22c55e"} />
                 <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
-                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 11 disponibles" accent="#a855f7" />
+                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 14 disponibles" accent="#a855f7" />
               </div>
             </div>
+
+            {/* Totales globales Layout vs 551 */}
+            {results.globalTotals && (() => {
+              const gt = results.globalTotals;
+              const diffC = gt.layoutCant  - gt.s551Cant;
+              const diffV = gt.layoutVCUSD - gt.s551Val;
+              const balanced = Math.abs(diffC) < 1 && Math.abs(diffV) < 2;
+              return (
+                <div style={{
+                  background: "#0f172a",
+                  border: `1px solid ${balanced ? "rgba(34,197,94,0.4)" : "rgba(245,158,11,0.4)"}`,
+                  borderRadius: 4, padding: "20px 28px", marginBottom: 20,
+                }}>
+                  <div style={{ color: "#94a3b8", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 14 }}>
+                    BALANCE GLOBAL — LAYOUT vs 551
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
+                    {[
+                      { label: "Layout — Cantidad total", val: gt.layoutCant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
+                      { label: "551 — Cantidad total", val: gt.s551Cant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
+                      { label: "Layout — Valor USD total", val: `$${gt.layoutVCUSD.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
+                      { label: "551 — Valor USD total", val: `$${gt.s551Val.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
+                    ].map((item) => (
+                      <div key={item.label}>
+                        <div style={{ color: "#475569", fontSize: 10, fontFamily: "DM Mono, monospace", marginBottom: 4 }}>{item.label}</div>
+                        <div style={{ color: item.color, fontFamily: "DM Mono, monospace", fontSize: 14, fontWeight: 700 }}>{item.val}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid #1e293b", display: "flex", gap: 32, alignItems: "center" }}>
+                    <span style={{ color: "#475569", fontSize: 11, fontFamily: "DM Mono, monospace" }}>
+                      Dif. Cantidad: <span style={{ color: Math.abs(diffC) < 1 ? "#22c55e" : "#f59e0b", fontWeight: 700 }}>
+                        {diffC >= 0 ? "+" : ""}{diffC.toFixed(0)} ud
+                      </span>
+                    </span>
+                    <span style={{ color: "#475569", fontSize: 11, fontFamily: "DM Mono, monospace" }}>
+                      Dif. Valor: <span style={{ color: Math.abs(diffV) < 2 ? "#22c55e" : "#f59e0b", fontWeight: 700 }}>
+                        {diffV >= 0 ? "+" : ""}${diffV.toFixed(2)}
+                      </span>
+                    </span>
+                    <span style={{
+                      marginLeft: "auto",
+                      background: balanced ? "rgba(34,197,94,0.1)" : "rgba(245,158,11,0.1)",
+                      border: `1px solid ${balanced ? "rgba(34,197,94,0.3)" : "rgba(245,158,11,0.3)"}`,
+                      color: balanced ? "#22c55e" : "#f59e0b",
+                      padding: "3px 12px", borderRadius: 20, fontSize: 11, fontFamily: "DM Mono, monospace",
+                    }}>
+                      {balanced ? "✓ BALANCE EXACTO" : "⚠ TOTALES DIFIEREN — revisar pedimentos faltantes"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Progress bar */}
             <div style={{
