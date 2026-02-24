@@ -820,13 +820,25 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   const layoutData = XLSX.utils.sheet_to_json(layoutSheet, { header: 1 });
   const rawHeaders  = layoutData[0] || [];
 
-  // Buscar columnas clave (tolerante a espacios)
-  const secIdx   = rawHeaders.findIndex((h) => String(h ?? "").trim() === "SecuenciaPed");
-  const paisIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "PaisOrigen");
-  const fracIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "FraccionNico");
-  const descIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "Descripcion");
-  const notasIdx = rawHeaders.length;  // nueva columna al final
-  const headers  = [...rawHeaders, "Notas"];
+  // Helper: busca la primera columna cuyo nombre (sin espacios, en minúsculas) coincida
+  // con alguno de los nombres candidatos. Tolera variaciones de mayúsculas/minúsculas y espacios.
+  const normH = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
+  const findCol = (...names) => {
+    const targets = names.map(normH);
+    return rawHeaders.findIndex((h) => targets.includes(normH(h)));
+  };
+
+  // Buscar columnas clave con tolerancia a variaciones de nombre
+  const secIdx      = findCol("SecuenciaPed", "Secuencia Ped", "Secuencia");
+  const paisIdx     = findCol("PaisOrigen", "Pais Origen", "PaisOrigenDestino", "Pais");
+  const fracIdx     = findCol("FraccionNico", "Fraccion Nico", "FraccionArancelaria", "Fraccion");
+  const descIdx     = findCol("Descripcion", "DescripcionMercancia", "Descripcion Mercancia");
+  const pedIdx      = findCol("Pedimento", "NumPedimento", "Num Pedimento");
+  const cantIdx     = findCol("CantidadSaldo", "Cantidad Saldo", "CantidadUMComercial", "Cantidad");
+  const vcusdIdx    = findCol("VCUSD", "ValorDolares", "Valor Dolares", "ValorComercialUSD");
+  const candadoIdx  = findCol("CANDADO DS 551", "CANDADODS551", "CandadoDS551");
+  const notasIdx    = rawHeaders.length;  // nueva columna al final
+  const headers     = [...rawHeaders, "Notas"];
 
   // Normaliza SecuenciaPed para comparación (número o texto limpio)
   const normSeq = (v) => {
@@ -881,9 +893,11 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       const r551 = assignment.get(rowIdx).r551;
       if (r551) {
         const camposDef = [
-          { field: "PaisOrigen",   colIdx: paisIdx, s551Key: "PaisOrigenDestino",  equal: (a, b) => a === b },
-          { field: "FraccionNico", colIdx: fracIdx, s551Key: "Fraccion",           equal: (a, b) => nFracLocal(a) === nFracLocal(b) },
-          { field: "Descripcion",  colIdx: descIdx, s551Key: "DescripcionMercancia", equal: (a, b) => a === b },
+          { field: "PaisOrigen",   colIdx: paisIdx,    s551Key: "PaisOrigenDestino",    equal: (a, b) => a === b },
+          { field: "FraccionNico", colIdx: fracIdx,    s551Key: "Fraccion",             equal: (a, b) => nFracLocal(a) === nFracLocal(b) },
+          { field: "Descripcion",  colIdx: descIdx,    s551Key: "DescripcionMercancia", equal: (a, b) => a === b },
+          { field: "Pedimento",    colIdx: pedIdx,     s551Key: "Pedimento",            equal: (a, b) => String(a).trim() === String(b).trim() },
+          { field: "CandadoDS551", colIdx: candadoIdx, s551Key: "Secuencias",           equal: (a, b) => a === b },
         ];
         for (const def of camposDef) {
           const val551 = String(r551[def.s551Key] ?? "").trim();
@@ -964,23 +978,23 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     sectionHdr[0] = `▼ FILAS AÑADIDAS DESDE EL 551 — Secuencias sin partida en Layout (${orphan551Rows.length} registros) — campos llenados con datos del 551`;
     updatedRows.push(sectionHdr);
 
-    // Localizar índices de columnas del Layout para mapear los datos del 551
-    const pedIdxL   = rawHeaders.findIndex((h) => String(h ?? "").trim() === "Pedimento");
-    const fracIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "FraccionNico");
-    const paisIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "PaisOrigen");
-    const cantIdxL  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "CantidadSaldo");
-    const vcusdIdxL = rawHeaders.findIndex((h) => String(h ?? "").trim() === "VCUSD");
+    // Usar los índices flexibles ya definidos arriba (findCol) + mapeo 551→Layout
+    const orphanFieldMap = [
+      { colIdx: secIdx,     val: (r) => r["SecuenciaFraccion"]       ?? "" },
+      { colIdx: pedIdx,     val: (r) => r["Pedimento"]               ?? "" },
+      { colIdx: fracIdx,    val: (r) => r["Fraccion"]                ?? "" },
+      { colIdx: paisIdx,    val: (r) => r["PaisOrigenDestino"]       ?? "" },
+      { colIdx: cantIdx,    val: (r) => parseFloat(r["CantidadUMComercial"]) || 0 },
+      { colIdx: vcusdIdx,   val: (r) => parseFloat(r["ValorDolares"])        || 0 },
+      { colIdx: descIdx,    val: (r) => r["DescripcionMercancia"]    ?? "" },
+      { colIdx: candadoIdx, val: (r) => r["Secuencias"]              ?? "" },
+    ];
 
     for (const r551 of orphan551Rows) {
       const row = Array(headers.length).fill("");
-      if (secIdx   >= 0) row[secIdx]   = r551["SecuenciaFraccion"] ?? "";
-      if (pedIdxL  >= 0) row[pedIdxL]  = r551["Pedimento"] ?? "";
-      if (fracIdxL >= 0) row[fracIdxL] = r551["Fraccion"]  ?? "";
-      if (paisIdxL >= 0) row[paisIdxL] = r551["PaisOrigenDestino"] ?? "";
-      if (cantIdxL >= 0) row[cantIdxL] = parseFloat(r551["CantidadUMComercial"]) || 0;
-      if (vcusdIdxL >= 0) row[vcusdIdxL] = parseFloat(r551["ValorDolares"])      || 0;
-      // Llenar Descripcion desde DescripcionMercancia del 551
-      if (descIdx  >= 0) row[descIdx]  = r551["DescripcionMercancia"] ?? "";
+      for (const { colIdx, val } of orphanFieldMap) {
+        if (colIdx >= 0) row[colIdx] = val(r551);
+      }
       row[notasIdx] = `FILA AÑADIDA DESDE 551 — ${r551._orphanReason || "secuencia sin partida en Layout"}`;
       updatedRows.push(row);
     }
