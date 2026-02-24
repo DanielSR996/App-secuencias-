@@ -1151,6 +1151,77 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     XLSX.utils.book_append_sheet(wb, wsCruce, "Cruce_Layout_vs_551");
   }
 
+  // ── Hoja Reporte_Secuencias_vs_551: totales globales + detalle por secuencia asignada ──
+  const matchedOnly = (cruceData || []).filter((d) => d.tipo === "matched");
+  const reportSecRows = [];
+  reportSecRows.push(["REPORTE — SECUENCIAS ASIGNADAS vs DATA 551"]);
+  reportSecRows.push([]);
+
+  // Total global Layout vs 551
+  if (globalTotals) {
+    reportSecRows.push(["TOTALES GLOBALES"]);
+    reportSecRows.push(["", "Cantidad", "Valor USD"]);
+    reportSecRows.push(["Layout (suma total)", Number(globalTotals.layoutCant.toFixed(4)), Number(globalTotals.layoutVCUSD.toFixed(4))]);
+    reportSecRows.push(["551 (suma total)", Number(globalTotals.s551Cant.toFixed(4)), Number(globalTotals.s551Val.toFixed(4))]);
+    const dC = globalTotals.layoutCant - globalTotals.s551Cant;
+    const dV = globalTotals.layoutVCUSD - globalTotals.s551Val;
+    reportSecRows.push(["Diferencia (Layout − 551)", Number(dC.toFixed(4)), Number(dV.toFixed(4))]);
+    const okGlobal = Math.abs(dC) < 1 && Math.abs(dV) < 2;
+    reportSecRows.push(["¿Totales coinciden?", okGlobal ? "Sí" : "No"]);
+    reportSecRows.push([]);
+  }
+
+  // Detalle por secuencia asignada: Layout vs 551 (cantidad, valor, país, descripción)
+  reportSecRows.push(["DETALLE POR SECUENCIA ASIGNADA (Layout vs 551)"]);
+  const detalleHeaders = [
+    "Estrategia", "Secuencia asignada", "Pedimento",
+    "Layout — Descripción", "Layout — Cantidad", "Layout — Valor USD",
+    "551 — Clave (Secuencias)", "551 — Descripción", "551 — Cantidad", "551 — Valor USD",
+    "¿Cantidad coincide?", "¿Valor coincide?", "¿País coincide?", "¿Descripción coincide?",
+    "Estado match",
+  ];
+  reportSecRows.push(detalleHeaders);
+
+  const fmtR = (v) => v == null ? "" : (typeof v === "number" ? Number(v.toFixed(4)) : String(v ?? ""));
+  const checkR = (ok) => (ok ? "Sí" : "No");
+  const descCoincide = (layoutDesc, s551Desc) => {
+    const a = String(layoutDesc ?? "").trim();
+    const b = String(s551Desc ?? "").trim();
+    if (!a && !b) return true;
+    return a === b;
+  };
+
+  for (const d of matchedOnly) {
+    const statusMatch = d.okCant && d.okVal ? "Match exacto" : "Tolerado / diferencia";
+    const descOk = descCoincide(d.layoutDesc, d.s551Desc);
+    reportSecRows.push([
+      d.estrategia ?? "",
+      d.secAsignada ?? "",
+      d.pedimento ?? "",
+      (d.layoutDesc ?? "").toString().slice(0, 200),
+      fmtR(d.layoutCant),
+      fmtR(d.layoutVCUSD),
+      (d.s551Secuencias ?? "").toString().slice(0, 80),
+      (d.s551Desc ?? "").toString().slice(0, 200),
+      fmtR(d.s551Cant),
+      fmtR(d.s551Val),
+      checkR(d.okCant),
+      checkR(d.okVal),
+      checkR(d.okPais),
+      checkR(descOk),
+      statusMatch,
+    ]);
+  }
+
+  if (matchedOnly.length === 0) {
+    reportSecRows.push(["Sin secuencias asignadas para detallar."]);
+  }
+
+  const wsReportSec = XLSX.utils.aoa_to_sheet(reportSecRows);
+  const colWidthsReportSec = [10, 10, 14, 42, 14, 14, 38, 42, 14, 14, 14, 14, 14, 18, 18];
+  wsReportSec["!cols"] = colWidthsReportSec.map((w) => ({ wch: Math.min(w, 50) }));
+  XLSX.utils.book_append_sheet(wb, wsReportSec, "Reporte_Secuencias_vs_551");
+
   // Resultado_Validacion sheet
   const matched = total - unmatchedFinal.length;
   const pct = ((matched / total) * 100).toFixed(1);
