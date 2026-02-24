@@ -6,6 +6,7 @@ import * as XLSX from "xlsx-js-style";
 // se usa header:1 y búsqueda por nombre trimado en lugar de sheet_to_json directamente).
 const COLS_551 = [
   "Pedimento",
+  "Secuencias",         // clave compuesta Ped-Fraccion-SecuenciaFraccion (match directo con CANDADO DS 551 del Layout)
   "Fraccion",           // clave de cruce con FraccionNico del Layout
   "SecuenciaFraccion",  // valor a asignar en Layout.SecuenciaPed
   "PaisOrigenDestino",
@@ -253,7 +254,7 @@ function runCascade(layoutRows, s551Rows) {
   const assigned      = new Set();
   const used551       = new Set();
   const correctionMap = new Map(); // rowIdx → [{field, original, corrected}]
-  const strategyStats = { E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0 };
+  const strategyStats = { E0: 0, E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0 };
 
   // Almacena el registro 551 que generó el match; auto-detecta correcciones de País/Fracción.
   const assignRows = (rows, seq, strategy, r551 = null, extraCorrections = []) => {
@@ -277,6 +278,30 @@ function runCascade(layoutRows, s551Rows) {
       }
     }
   };
+
+  // ── E0: Match directo por clave compuesta CANDADO DS 551 ↔ 551.Secuencias ──
+  // La columna "CANDADO DS 551" del Layout contiene la clave compuesta
+  // "Pedimento-Fraccion-SecuenciaFraccion" que corresponde EXACTAMENTE a la
+  // columna "Secuencias" del 551. Esto da asignación perfecta sin ningún cálculo.
+  {
+    // Construir lookup: 551.Secuencias → fila del 551
+    const lookupSecuencias = new Map();
+    for (const r of s551) {
+      const clave = String(r["Secuencias"] ?? "").trim();
+      if (clave) lookupSecuencias.set(clave, r);
+    }
+    // Leer columna "CANDADO DS 551" de cada fila del Layout y asignar directamente
+    for (const r of layout) {
+      if (assigned.has(r._idx)) continue;
+      const candado = String(r["CANDADO DS 551"] ?? "").trim();
+      if (!candado) continue;
+      const r551match = lookupSecuencias.get(candado);
+      if (!r551match) continue;
+      const seq = r551match["SecuenciaFraccion"];
+      if (!seq && seq !== 0) continue;
+      assignRows([r], seq, "E0", r551match);
+    }
+  }
 
   // ── E1: Pedimento + Fracción + País, cantidades exactas (±1 ud / ±2 USD) ──
   for (const g of groupBy(layout, [L_PED, "_frac", L_PAIS])) {
@@ -1135,6 +1160,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     [],
     ["DESGLOSE POR ESTRATEGIA"],
     ["Estrategia", "Filas Asignadas", "Descripción"],
+    ["E0 - Match directo CANDADO DS 551",   stats.E0, "Usa columna 'CANDADO DS 551' del Layout como clave compuesta directa hacia 'Secuencias' del 551. Asignación perfecta sin cálculos. Requiere que el Layout tenga esta columna poblada."],
     ["E1 - Ped+Fracción+País exacto",      stats.E1, "Agrupa Layout por Pedimento+FraccionNico+País. Suma CantidadSaldo y VCUSD; busca en 551 con tolerancia ±1 ud / ±2 USD."],
     ["E2 - Sub-grupo por SecuenciaPed",   stats.E2, "Misma clave E1 pero sub-divide por SecuenciaPed existente. Resuelve cuando la misma fracción+país tiene múltiples entradas en el 551."],
     ["E3 - Sin País (solo Ped+Fracción)", stats.E3, "Ignora PaisOrigen para manejar diferencias de código de país entre Layout y 551. Cantidades y valores exactos."],
@@ -1204,6 +1230,13 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
 
 // ─── COMPONENTS ───────────────────────────────────────────────────────────────
 const STRATEGIES = [
+  {
+    id: "E0",
+    name: "Match directo — CANDADO DS 551 ↔ Secuencias 551",
+    desc: "Estrategia prioritaria: usa la columna 'CANDADO DS 551' del Layout (clave compuesta Ped-Fracción-Secuencia) para hacer match DIRECTO con la columna 'Secuencias' del 551. Asignación perfecta sin cálculos. Resuelve el 99%+ de los casos cuando el Layout tiene esta columna poblada.",
+    color: "#00d4aa",
+    icon: "⬛",
+  },
   {
     id: "E1",
     name: "Pedimento + Fracción + País",
@@ -1352,7 +1385,7 @@ function UploadZone({ onFile, isDragging, setIsDragging }) {
 }
 
 function StrategyBar({ stats, total }) {
-  const colors = { E1: "#22c55e", E2: "#3b82f6", E3: "#f59e0b", E4: "#a855f7", E5: "#ef4444",
+  const colors = { E0: "#00d4aa", E1: "#22c55e", E2: "#3b82f6", E3: "#f59e0b", E4: "#a855f7", E5: "#ef4444",
                    E6: "#06b6d4", E7: "#f97316", E8: "#8b5cf6", E9: "#ec4899", E10: "#14b8a6", E11: "#64748b",
                    R1: "#0ea5e9", R2: "#10b981", R3: "#f43f5e" };
   const unmatched = total - Object.values(stats).reduce((a, b) => a + b, 0);
@@ -1678,7 +1711,7 @@ export default function App() {
                 <StatCard label="Sin match" value={results.unmatchedFinal.length} sub="Revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
                 <StatCard label="Correcciones" value={results.correctionCount || 0} sub="Campos ajustados por 551" accent={(results.correctionCount || 0) > 0 ? "#f97316" : "#22c55e"} />
                 <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
-                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 14 disponibles" accent="#a855f7" />
+                <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 15 disponibles" accent="#a855f7" />
               </div>
             </div>
 
