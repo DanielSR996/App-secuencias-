@@ -588,11 +588,17 @@ function runCascade(layoutRows, s551Rows) {
     if (!layoutPF.has(kPF))
       return `Sec.${seq} — Pedimento ${ped} / Fracción ${frac} no tiene partidas en Layout`;
 
-    // Layout sí tiene esa combinación pero no cuadran cantidades
+    // Esta secuencia 551 no recibió ninguna fila del Layout. El total Layout es de TODA la fracción (otras secuencias sí pueden tener asignación).
     const layoutCands = layoutPF.get(kPF);
     const sumCant = layoutCands.reduce((a, lr) => a + (parseFloat(lr[L_CANT]) || 0), 0);
     const sumVal  = layoutCands.reduce((a, lr) => a + (parseFloat(lr[L_VCUSD]) || 0), 0);
-    return `Sec.${seq} — Cantidad/Valor no coinciden: Layout(${sumCant.toFixed(0)} ud / $${sumVal.toFixed(2)}) vs 551(${cant.toFixed(0)} ud / $${val.toFixed(2)})`;
+    const sinAsignar = layoutCands.filter((lr) => !assigned.has(lr._idx));
+    const sumSinAsignarC = sinAsignar.reduce((a, lr) => a + (parseFloat(lr[L_CANT]) || 0), 0);
+    const sumSinAsignarV = sinAsignar.reduce((a, lr) => a + (parseFloat(lr[L_VCUSD]) || 0), 0);
+    const parte = sumSinAsignarC > 0 || sumSinAsignarV > 0
+      ? ` Layout sin asignar (esta fracción): ${sumSinAsignarC.toFixed(0)} ud / $${sumSinAsignarV.toFixed(2)}.`
+      : "";
+    return `Sec.${seq} — Ninguna fila del Layout asignada a esta secuencia. Total Layout (ped+fracción): ${sumCant.toFixed(0)} ud / $${sumVal.toFixed(2)}; esta línea 551: ${cant.toFixed(0)} ud / $${val.toFixed(2)}.${parte}`;
   };
 
   const orphan551Rows = s551
