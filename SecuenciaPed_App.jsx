@@ -23,7 +23,12 @@ function firstIndexByHeader(headerRow, colName) {
   return -1;
 }
 
-/** Lee la hoja 551 tomando la PRIMERA columna que coincida con cada nombre (maneja espacios y duplicados). */
+/** Lee la hoja 551 tomando la PRIMERA columna que coincida con cada nombre (maneja espacios y duplicados).
+ *  Caso especial: "ValorDolares" puede aparecer dos veces en el encabezado del 551.
+ *  La primera columna suele ser el valor del lote/parcial; la segunda puede ser el valor en
+ *  aduana o el acumulado. Usamos la primera que tenga un valor numérico no-cero;
+ *  si ambas son 0 o vacías, usamos 0. Así evitamos que un ValorDolares=0 erróneo rompa el matching.
+ */
 function read551Sheet(sheet) {
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return [];
@@ -33,13 +38,28 @@ function read551Sheet(sheet) {
     const idx = firstIndexByHeader(headerRow, col);
     if (idx >= 0) indices[col] = idx;
   }
+
+  // Recolectar TODOS los índices de columnas llamadas "ValorDolares"
+  const vdIndices = headerRow.reduce((acc, h, i) => { if (h === "ValorDolares") acc.push(i); return acc; }, []);
+
   const out = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
-    if (row.every((c) => c === "" || c == null)) continue; // saltar filas vacías
+    if (row.every((c) => c === "" || c == null)) continue;
     const obj = {};
     for (const [col, idx] of Object.entries(indices)) {
       obj[col] = row[idx];
+    }
+    // Resolver ValorDolares efectivo cuando hay columnas duplicadas:
+    // recorrer todos los índices y quedarse con el primero que tenga valor numérico ≠ 0.
+    if (vdIndices.length > 1) {
+      let efectivo = null;
+      for (const idx of vdIndices) {
+        const n = parseFloat(row[idx]);
+        if (!isNaN(n) && n !== 0) { efectivo = row[idx]; break; }
+      }
+      // Si todas son 0/vacío, usar la primera (mantiene semántica de 0)
+      obj["ValorDolares"] = efectivo !== null ? efectivo : (row[vdIndices[0]] ?? 0);
     }
     out.push(obj);
   }
@@ -267,11 +287,26 @@ function runCascade(layoutRows, s551Rows) {
 
         const corrs = [...extraCorrections];
         if (r551) {
-          // Corrección automática de país cuando E3/E4/E5 ignoraron el país
+          // Corrección automática de PaisOrigen: llena si está vacío o difiere del 551
           const pais551 = String(r551[S_PAIS] ?? "").trim();
           const paisL   = String(r[L_PAIS]   ?? "").trim();
-          if (paisL && pais551 && paisL !== pais551) {
+          if (pais551 && paisL !== pais551 &&
+              !corrs.some((c) => c.field === "PaisOrigen")) {
             corrs.push({ field: "PaisOrigen", original: paisL, corrected: pais551 });
+          }
+          // Corrección automática de FraccionNico: llena si está vacío o difiere (normalizada)
+          const frac551raw = String(r551[S_FRAC] ?? "").trim();
+          const fracLraw   = String(r[L_FRAC]   ?? "").trim();
+          if (frac551raw && nFrac(fracLraw) !== nFrac(frac551raw) &&
+              !corrs.some((c) => c.field === "FraccionNico")) {
+            corrs.push({ field: "FraccionNico", original: fracLraw, corrected: frac551raw });
+          }
+          // Corrección automática de Descripcion: llena si está vacío o difiere del 551
+          const desc551 = String(r551["DescripcionMercancia"] ?? "").trim();
+          const descL   = String(r["Descripcion"]             ?? "").trim();
+          if (desc551 && descL !== desc551 &&
+              !corrs.some((c) => c.field === "Descripcion")) {
+            corrs.push({ field: "Descripcion", original: descL, corrected: desc551 });
           }
         }
         if (corrs.length > 0) correctionMap.set(r._idx, corrs);
@@ -670,6 +705,10 @@ function runCascade(layoutRows, s551Rows) {
   // Un registro por GRUPO (Ped + Frac + Pais + SecuenciaPedAsignada)
   const cruceData = [];
 
+  // rowMatchMap: rowIdx → { okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant, layoutVCUSD }
+  // Permite que buildOutputExcel marque en rojo las filas donde los totales Layout ≠ 551.
+  const rowMatchMap = new Map();
+
   // Grupos ASIGNADOS: agrupar por (seq asignada + frac + pais + ped)
   const matchedGroupMap = new Map();
   for (const [rowIdx, info] of assignment) {
@@ -692,6 +731,11 @@ function runCascade(layoutRows, s551Rows) {
     const okPais = r551 ? (String(g.firstRow[L_PAIS] || "").trim() === String(r551[S_PAIS] || "").trim()) : false;
     const okCant = diffCant !== null && Math.abs(diffCant) <= 1;
     const okVal  = diffVal  !== null && Math.abs(diffVal)  <= 2;
+
+    // Registrar discrepancia por fila individual para que buildOutputExcel la señale
+    for (const row of g.rows) {
+      rowMatchMap.set(row._idx, { okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant: cant, layoutVCUSD: vcusd });
+    }
 
     // Descripciones únicas de las partes en el grupo
     const descs = [...new Set(g.rows.map((r) => r["Descripcion"]).filter(Boolean))].join(" / ");
@@ -765,11 +809,11 @@ function runCascade(layoutRows, s551Rows) {
     return (a.estrategia || "").localeCompare(b.estrategia || "");
   });
 
-  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals };
+  return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap };
 }
 
 // ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
-function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals) {
+function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap = new Map()) {
   const wb = XLSX.utils.book_new();
 
   // ── Datos originales del Layout ─────────────────────────────────────────
@@ -780,6 +824,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   const secIdx   = rawHeaders.findIndex((h) => String(h ?? "").trim() === "SecuenciaPed");
   const paisIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "PaisOrigen");
   const fracIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "FraccionNico");
+  const descIdx  = rawHeaders.findIndex((h) => String(h ?? "").trim() === "Descripcion");
   const notasIdx = rawHeaders.length;  // nueva columna al final
   const headers  = [...rawHeaders, "Notas"];
 
@@ -798,21 +843,64 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   const changeMap = new Map();
   const updatedRows = [headers];
 
+  // Helper local para normalizar fracción (igual que en runCascade)
+  const nFracLocal = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
+
+  // rowIdx paralelo que sólo cuenta filas NO vacías, igual que readLayoutSheet/_idx
+  let dataRowIdx = 0;
+
   for (let i = 1; i < layoutData.length; i++) {
-    const row      = [...layoutData[i]];
-    const rowIdx   = i - 1;
+    const rawDataRow = layoutData[i] || [];
+    const isEmpty    = rawDataRow.every((c) => c === "" || c == null);
+    const row        = [...rawDataRow];
     while (row.length <= notasIdx) row.push("");
 
-    const originalRaw = secIdx >= 0 ? (layoutData[i][secIdx] ?? "") : "";
+    if (isEmpty) {
+      // Fila vacía: conservar sin tocar y no consumir índice
+      updatedRows.push(row);
+      continue;
+    }
+
+    const rowIdx      = dataRowIdx++;   // sincronizado con _idx de runCascade
+    const originalRaw = secIdx >= 0 ? (rawDataRow[secIdx] ?? "") : "";
     const originalStr = normSeq(originalRaw);
 
-    // ── Aplicar correcciones de campo (País, Fracción) basadas en el 551 ───
-    const corrections = correctionMap ? (correctionMap.get(rowIdx) || []) : [];
-    for (const corr of corrections) {
+    // ── Correcciones extra que vienen de estrategias específicas (E9, E10, R2…) ──
+    const extraCorrs = correctionMap ? (correctionMap.get(rowIdx) || []) : [];
+    for (const corr of extraCorrs) {
       const colIdx = corr.field === "PaisOrigen"   ? paisIdx
-                   : corr.field === "FraccionNico" ? fracIdx : -1;
+                   : corr.field === "FraccionNico" ? fracIdx
+                   : corr.field === "Descripcion"  ? descIdx : -1;
       if (colIdx >= 0) row[colIdx] = corr.corrected;
     }
+
+    // ── Correcciones DIRECTAS desde r551 (siempre, para todos los campos clave) ──
+    // Independientes de correctionMap para garantizar que siempre se apliquen.
+    const directCorrs = [];
+    if (assignment.has(rowIdx)) {
+      const r551 = assignment.get(rowIdx).r551;
+      if (r551) {
+        const camposDef = [
+          { field: "PaisOrigen",   colIdx: paisIdx, s551Key: "PaisOrigenDestino",  equal: (a, b) => a === b },
+          { field: "FraccionNico", colIdx: fracIdx, s551Key: "Fraccion",           equal: (a, b) => nFracLocal(a) === nFracLocal(b) },
+          { field: "Descripcion",  colIdx: descIdx, s551Key: "DescripcionMercancia", equal: (a, b) => a === b },
+        ];
+        for (const def of camposDef) {
+          const val551 = String(r551[def.s551Key] ?? "").trim();
+          if (!val551) continue;
+          const valL   = String(def.colIdx >= 0 ? (row[def.colIdx] ?? "") : "").trim();
+          if (!def.equal(valL, val551)) {
+            // No duplicar si extraCorrs ya tiene este campo
+            if (!extraCorrs.some((c) => c.field === def.field)) {
+              directCorrs.push({ field: def.field, original: valL, corrected: val551 });
+            }
+            if (def.colIdx >= 0) row[def.colIdx] = val551;  // escribir valor del 551
+          }
+        }
+      }
+    }
+
+    const corrections = [...extraCorrs, ...directCorrs];
     const corrNote = corrections.length > 0
       ? corrections.map((c) =>
           `[CORRECCIÓN ${c.field}] '${c.original}' → '${c.corrected}' (fuente: 551)`
@@ -838,7 +926,6 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
         row[notasIdx] = nota;
         changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, nota, corrections });
       } else {
-        // Secuencia no cambió, pero puede haber correcciones de campo
         row[notasIdx] = corrNote || "";
         const tipo = corrections.length > 0 ? "igual_corr" : "igual";
         changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, corrections });
@@ -848,6 +935,20 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       row[notasIdx] = rowNotes ? (rowNotes.get(rowIdx) || "") : "";
       changeMap.set(rowIdx, { tipo: "sinmatch" });
     }
+
+    // Señalar discrepancia de totales Layout vs 551 si la hay
+    if (assignment.has(rowIdx) && rowMatchMap) {
+      const mq = rowMatchMap.get(rowIdx);
+      if (mq && (!mq.okCant || !mq.okVal)) {
+        const dC = mq.diffCant != null ? ((mq.diffCant > 0 ? "+" : "") + mq.diffCant.toFixed(0)) : "?";
+        const dV = mq.diffVal  != null ? ((mq.diffVal  > 0 ? "+" : "") + mq.diffVal.toFixed(2))  : "?";
+        const badNote = `⚠ DIFERENCIA TOTALES: Layout(${(mq.layoutCant||0).toFixed(0)} ud / $${(mq.layoutVCUSD||0).toFixed(2)}) ≠ 551(${mq.cant551 != null ? mq.cant551.toFixed(0) : "?"} ud / $${mq.val551 != null ? mq.val551.toFixed(2) : "?"}) | Δcant:${dC} | Δval:${dV}`;
+        row[notasIdx] = row[notasIdx] ? `${row[notasIdx]} | ${badNote}` : badNote;
+        const cm = changeMap.get(rowIdx);
+        if (cm) cm.hasBadMatch = true;
+      }
+    }
+
     updatedRows.push(row);
   }
 
@@ -860,7 +961,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
 
     // Encabezado de sección
     const sectionHdr = Array(headers.length).fill("");
-    sectionHdr[0] = `▼ SECUENCIAS DEL 551 NO ASIGNADAS AL LAYOUT  (${orphan551Rows.length} registros)`;
+    sectionHdr[0] = `▼ FILAS AÑADIDAS DESDE EL 551 — Secuencias sin partida en Layout (${orphan551Rows.length} registros) — campos llenados con datos del 551`;
     updatedRows.push(sectionHdr);
 
     // Localizar índices de columnas del Layout para mapear los datos del 551
@@ -878,7 +979,9 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       if (paisIdxL >= 0) row[paisIdxL] = r551["PaisOrigenDestino"] ?? "";
       if (cantIdxL >= 0) row[cantIdxL] = parseFloat(r551["CantidadUMComercial"]) || 0;
       if (vcusdIdxL >= 0) row[vcusdIdxL] = parseFloat(r551["ValorDolares"])      || 0;
-      row[notasIdx] = r551._orphanReason || "";
+      // Llenar Descripcion desde DescripcionMercancia del 551
+      if (descIdx  >= 0) row[descIdx]  = r551["DescripcionMercancia"] ?? "";
+      row[notasIdx] = `FILA AÑADIDA DESDE 551 — ${r551._orphanReason || "secuencia sin partida en Layout"}`;
       updatedRows.push(row);
     }
   }
@@ -930,14 +1033,24 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     fill: { patternType: "solid", fgColor: { rgb: "FEF9E7" } },
     alignment: { wrapText: true },
   };
-  const S_CORRECTED_CELL = {   // celda de campo corregido (País/Fracción): rojo-naranja
-    font: { bold: true, color: { rgb: "C0392B" } },
-    fill: { patternType: "solid", fgColor: { rgb: "FDEBD0" } },
-    alignment: { horizontal: "center" },
+  const S_CORRECTED_CELL = {   // celda corregida por la app (País/Fracción/Descripcion): rojo claro
+    font: { bold: true, color: { rgb: "7B241C" } },
+    fill: { patternType: "solid", fgColor: { rgb: "FFCCCC" } },
+    alignment: { horizontal: "center", wrapText: true },
   };
   const S_NOTA_CORRECCION = {  // nota de corrección: fondo naranja claro
     font: { bold: true, sz: 10, color: { rgb: "784212" } },
     fill: { patternType: "solid", fgColor: { rgb: "FDEBD0" } },
+    alignment: { wrapText: true },
+  };
+  const S_SEQ_DISCREPANCIA = {  // SecuenciaPed con diferencia de totales: fondo rojo intenso, texto blanco
+    font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } },
+    fill: { patternType: "solid", fgColor: { rgb: "922B21" } },
+    alignment: { horizontal: "center" },
+  };
+  const S_NOTA_DISCREPANCIA = {  // nota de diferencia de totales: rojo oscuro
+    font: { bold: true, sz: 10, color: { rgb: "641E16" } },
+    fill: { patternType: "solid", fgColor: { rgb: "FADBD8" } },
     alignment: { wrapText: true },
   };
 
@@ -976,12 +1089,25 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     if (info.corrections && info.corrections.length > 0) {
       for (const corr of info.corrections) {
         const colIdx = corr.field === "PaisOrigen"   ? paisIdx
-                     : corr.field === "FraccionNico" ? fracIdx : -1;
+                     : corr.field === "FraccionNico" ? fracIdx
+                     : corr.field === "Descripcion"  ? descIdx : -1;
         if (colIdx < 0) continue;
         const addrCorr = XLSX.utils.encode_cell({ r: rowI, c: colIdx });
         if (!wsLayout[addrCorr]) wsLayout[addrCorr] = { t: "s", v: corr.corrected };
         wsLayout[addrCorr].s = S_CORRECTED_CELL;
       }
+    }
+
+    // Señalar en rojo cuando los totales Layout ≠ 551 para esta fila asignada
+    if (info.hasBadMatch) {
+      if (secIdx >= 0) {
+        const addrSeqDisc = XLSX.utils.encode_cell({ r: rowI, c: secIdx });
+        if (!wsLayout[addrSeqDisc]) wsLayout[addrSeqDisc] = { t: "s", v: "" };
+        wsLayout[addrSeqDisc].s = S_SEQ_DISCREPANCIA;
+      }
+      const addrNotaDisc = XLSX.utils.encode_cell({ r: rowI, c: notasIdx });
+      if (!wsLayout[addrNotaDisc]) wsLayout[addrNotaDisc] = { t: "s", v: "" };
+      wsLayout[addrNotaDisc].s = S_NOTA_DISCREPANCIA;
     }
   }
 
@@ -1558,10 +1684,10 @@ export default function App() {
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
-      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals } = runCascade(layoutRows, s551Rows);
+      const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
-      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals);
+      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap);
       setProgress(100);
 
       setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals });
