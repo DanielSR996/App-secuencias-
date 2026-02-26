@@ -1767,15 +1767,21 @@ function readDS2020Sheet(sheet) {
   }
   console.log("[DS2020] colIdx:", JSON.stringify(idx));
 
+  // Columna REVISADO en el DS (para escribir motivos de no-match)
+  const revisadoColIdx = hdr.reduce((l, h, i) => nH2020(h) === "revisado" ? i : l, -1);
+
   const out = [];
   for (let i = hdrI + 1; i < rows.length; i++) {
     const row = rows[i];
     if (!row || row.every(c => c === "" || c == null)) continue;
-    const obj = { _dsIdx: out.length };
+    const obj = { _dsIdx: out.length, _rowI: i }; // _rowI = índice 0-based en el sheet (para encode_cell)
     for (const [col, ci] of Object.entries(idx)) obj[col] = row[ci] ?? "";
     out.push(obj);
   }
-  console.log("[DS2020] DS rows leídas:", out.length, "muestra:", out.slice(0,2).map(r=>({ped:r.Pedimento2,frac:r.Fraccion,sec:r.SecuenciaFraccion,cant:r.CantidadUMComercial,val:r.ValorDolares,candado:r["Candado 551"]})));
+  out._hdrI         = hdrI;
+  out._revisadoCol  = revisadoColIdx;
+  console.log("[DS2020] DS rows:", out.length, "REVISADO col:", revisadoColIdx,
+    "muestra:", out.slice(0,2).map(r=>({ped:r.Pedimento2,frac:r.Fraccion,sec:r.SecuenciaFraccion,candado:r["Candado 551"]})));
   return out;
 }
 
@@ -2072,13 +2078,47 @@ function runCascade2020(layoutRows, dsRows) {
   const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx));
   const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
   for (const a of assignment.values()) {
-    if (a.status === "ok")        stats.verified++;
+    if (a.status === "ok")             stats.verified++;
     else if (a.status === "corrected") stats.corrected++;
     else if (a.status === "new")       stats.newAssigned++;
     else                               stats.unmatched++;
   }
 
-  return { assignment, stats, unusedDS, layoutRows, dsRows };
+  // ── Calcular motivos de no-match para DS no usadas ────────────────────────
+  // Construir totales del Layout por Pedimento+Fraccion (para el diagnóstico)
+  const layoutTotals = new Map(); // "ped|||frac" → { cant, val, rows, noInc }
+  for (const row of layoutRows) {
+    const k = `${row.Pedimento}|||${nFrac(row.FraccionNico)}`;
+    if (!layoutTotals.has(k)) layoutTotals.set(k, { cant: 0, val: 0, rows: 0, noInc: 0 });
+    const g = layoutTotals.get(k);
+    g.cant += row.Cantidad; g.val += row.ValorUSD; g.rows++;
+    if (row.noIncluir) g.noInc++;
+  }
+
+  const mismatchReasons = new Map(); // _dsIdx → reason string
+  for (const dsRow of unusedDS) {
+    const frac = nFrac(normStr(dsRow["Fraccion"]));
+    const k    = `${normStr(dsRow["Pedimento2"])}|||${frac}`;
+    const g    = layoutTotals.get(k);
+    const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+    const dsVal  = parseFloat(dsRow["ValorDolares"])        || 0;
+    let reason;
+    if (!g) {
+      reason = `Fracción ${dsRow["Fraccion"]} no encontrada en Layout para ped. ${dsRow["Pedimento2"]}`;
+    } else if (g.noInc === g.rows) {
+      reason = `Todas las filas Layout (${g.rows}) marcadas NO INCLUIR`;
+    } else {
+      const diffCant = Math.abs(g.cant - dsCant);
+      const diffVal  = Math.abs(g.val  - dsVal);
+      const pctCant  = dsCant > 0 ? (diffCant / dsCant * 100).toFixed(0) : "∞";
+      const pctVal   = dsVal  > 0 ? (diffVal  / dsVal  * 100).toFixed(0) : "∞";
+      const fmt = n => Number(n).toLocaleString("es-MX", { maximumFractionDigits: 0 });
+      reason = `Sin concordancia — Cant.Layout=${fmt(g.cant)} vs DS=${fmt(dsCant)} (+${pctCant}%) | Valor Layout=$${fmt(g.val)} vs DS=$${fmt(dsVal)} (+${pctVal}%)`;
+    }
+    mismatchReasons.set(dsRow._dsIdx, reason);
+  }
+
+  return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons };
 }
 
 /** Construye el Excel 2020 de salida: modifica celdas específicas del Layout. */
@@ -2093,7 +2133,7 @@ function runCascade2020(layoutRows, dsRows) {
  * sobre una hoja de 22 millones de celdas.
  */
 function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
-                               layout2020Data, assignment) {
+                               layout2020Data, assignment, mismatchReasons) {
   const { layoutRows, colIdx } = layout2020Data;
   const ws = workbook.Sheets[layoutSheetName]; // referencia al worksheet original
 
@@ -2138,6 +2178,43 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         setCell(ws, r, ci, corr.corrected, S_CORR_FLD);
       }
     }
+  }
+
+  // ── Escribir motivos de no-match en columna REVISADO del DS ──────────────
+  const dsWsOut = workbook.Sheets[dsSheetName];
+  const dsRows  = layout2020Data.dsRows;  // las filas del DS con _rowI y _dsIdx
+  const revCol  = dsRows?._revisadoCol ?? -1;
+
+  const S_REVISADO_FAIL = {
+    font:  { bold: true, color: { rgb: "7B241C" }, sz: 10 },
+    fill:  { patternType: "solid", fgColor: { rgb: "FADBD8" } },
+    alignment: { wrapText: true },
+  };
+  const S_REVISADO_OK = {
+    font:  { bold: true, color: { rgb: "145A32" }, sz: 10 },
+    fill:  { patternType: "solid", fgColor: { rgb: "D5F5E3" } },
+    alignment: { horizontal: "center" },
+  };
+
+  if (dsWsOut && revCol >= 0 && dsRows) {
+    for (const dsRow of dsRows) {
+      if (typeof dsRow._rowI !== "number") continue;
+      const addr = XLSX.utils.encode_cell({ r: dsRow._rowI, c: revCol });
+      const reason = mismatchReasons?.get(dsRow._dsIdx);
+      if (reason) {
+        // Fila DS sin match: escribir motivo en rojo
+        dsWsOut[addr] = { t: "s", v: reason, s: S_REVISADO_FAIL };
+      } else {
+        // Fila DS sí fue usada: marcar OK en verde (solo si estaba vacía)
+        const existing = dsWsOut[addr];
+        if (!existing || !String(existing.v ?? "").trim()) {
+          dsWsOut[addr] = { t: "s", v: "OK — Secuencia verificada/asignada", s: S_REVISADO_OK };
+        }
+      }
+    }
+    // Ajustar ancho de columna REVISADO
+    if (!dsWsOut["!cols"]) dsWsOut["!cols"] = [];
+    dsWsOut["!cols"][revCol] = { wch: 80 };
   }
 
   // ── Construir libro de salida ─────────────────────────────────────────────
@@ -2221,12 +2298,13 @@ function App2020() {
       setProgress2020(40);
       const dsRows      = readDS2020Sheet(wb.Sheets[dsName]);
       const layout2020  = readLayout2020Sheet(wb.Sheets[layName]);
+      layout2020.dsRows = dsRows; // pasar ref al DS para que buildOutput pueda leer _rowI y _revisadoCol
       setProgress2020(60);
 
-      const { assignment, stats, unusedDS } = runCascade2020(layout2020.layoutRows, dsRows);
+      const { assignment, stats, unusedDS, mismatchReasons } = runCascade2020(layout2020.layoutRows, dsRows);
       setProgress2020(80);
 
-      const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment);
+      const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment, mismatchReasons);
       setProgress2020(100);
 
       setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName });
