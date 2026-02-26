@@ -1662,8 +1662,613 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MÓDULO 2020 — DS multi-pedimento (hoja DS*, Layout*)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Encuentra la hoja DS y la hoja Layout dentro del workbook 2020. */
+function resolveDS2020SheetNames(wb) {
+  const names = wb.SheetNames || [];
+  // DS: hoja cuyo nombre contiene "DS" como palabra completa o al inicio
+  const dsName  = names.find(n => /^DS\b/i.test(n.trim()) || /\bDS\b/.test(n));
+  // Layout: hoja cuyo nombre contiene "layout" (ci)
+  let layName = names.find(n => n.toLowerCase().includes("layout"));
+  // Si la hoja layout parece una tabla dinámica (≤3 columnas en fila 0), buscar alternativa
+  if (layName) {
+    const ws = wb.Sheets[layName];
+    const r0 = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", sheetRows: 3 })[0] || [];
+    if (r0.filter(c => c !== "").length <= 4) {
+      // Buscar otra hoja con más columnas (excluyendo TC, DS, td551, etc.)
+      const alt = names.find(n => !["tc","td551","td conciliado"].includes(n.toLowerCase()) &&
+        !n.toUpperCase().includes("DS") && n !== layName);
+      if (alt) layName = alt;
+    }
+  }
+  return { dsName, layName };
+}
+
+/** Lee la hoja DS 2020 — equivalente al 551 pero con Pedimento2. */
+function readDS2020Sheet(sheet) {
+  const COLS_DS = ["Pedimento2","Fraccion","SecuenciaFraccion","DescripcionMercancia",
+                   "CantidadUMComercial","ValorDolares","PaisOrigenDestino","Candado 551"];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  if (!rows.length) return [];
+
+  // Encontrar fila de cabecera: primera con ≥3 columnas que coincidan con COLS_DS
+  let hdrI = 0;
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    const hits = rows[i].filter(c => COLS_DS.includes(String(c ?? "").trim())).length;
+    if (hits >= 3) { hdrI = i; break; }
+  }
+  const hdr = rows[hdrI].map(c => String(c ?? "").trim());
+  // Usar el ÚLTIMO índice en caso de columnas duplicadas
+  const getLastIdx = (name) => hdr.reduce((last, h, i) => h === name ? i : last, -1);
+  const idx = {};
+  for (const col of COLS_DS) { const i = getLastIdx(col); if (i >= 0) idx[col] = i; }
+
+  // ValorDolares puede estar duplicado: resolver al primer no-cero
+  const vdIdxs = hdr.reduce((acc, h, i) => { if (h === "ValorDolares") acc.push(i); return acc; }, []);
+
+  const out = [];
+  for (let i = hdrI + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.every(c => c === "" || c == null)) continue;
+    const obj = { _dsIdx: out.length };
+    for (const [col, ci] of Object.entries(idx)) obj[col] = row[ci] ?? "";
+    if (vdIdxs.length > 1) {
+      let ef = null;
+      for (const ci of vdIdxs) { const n = parseFloat(row[ci]); if (!isNaN(n) && n !== 0) { ef = row[ci]; break; } }
+      obj["ValorDolares"] = ef !== null ? ef : (row[vdIdxs[0]] ?? 0);
+    }
+    out.push(obj);
+  }
+  return out;
+}
+
+/** Lee la hoja Layout 2020 — encabezado puede estar en fila 0 o 1. */
+function readLayout2020Sheet(sheet) {
+  const nH = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  if (!rows.length) return { layoutRows: [], headerRowIdx: 0, rawHeaders: [], rawRows: [], colIdx: {} };
+
+  // Encontrar fila de cabecera: primera con ≥ 5 celdas no vacías
+  let hdrI = 0;
+  for (let i = 0; i < Math.min(rows.length, 5); i++) {
+    if (rows[i].filter(c => c !== "" && c != null).length >= 5) { hdrI = i; break; }
+  }
+  const rawHeaders = (rows[hdrI] || []).map(c => String(c ?? "").trim());
+
+  // Último índice para columnas duplicadas
+  const findLast = (...names) => {
+    const ts = names.map(nH);
+    return rawHeaders.reduce((last, h, i) => ts.includes(nH(h)) ? i : last, -1);
+  };
+  const colIdx = {
+    pedimento: findLast("pedimento"),
+    frac:      findLast("FraccionNico"),
+    desc:      findLast("descripcion","descripcionmercancia"),
+    pais:      findLast("pais_origen","paisorigen","paisorigendestino"),
+    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    val:       findLast("ValorMPDolares","valormpdolares","valordolares","vcusd"),
+    sec:       findLast("SEC CALC","seccalc","secuenciaped"),
+    notas:     findLast("NOTAS"),
+    estado:    findLast("ESTADO"),
+  };
+
+  const layoutRows = [];
+  for (let i = hdrI + 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.every(c => c === "" || c == null)) continue;
+    const g = (ci) => ci >= 0 ? (row[ci] ?? "") : "";
+    layoutRows.push({
+      _idx:        layoutRows.length,
+      _rowI:       i,
+      Pedimento:   String(g(colIdx.pedimento)).trim(),
+      FraccionNico:String(g(colIdx.frac)).trim(),
+      Descripcion: String(g(colIdx.desc)).trim(),
+      PaisOrigen:  String(g(colIdx.pais)).trim(),
+      Cantidad:    parseFloat(g(colIdx.cant)) || 0,
+      ValorUSD:    parseFloat(g(colIdx.val))  || 0,
+      SecCalc:     String(g(colIdx.sec)).trim(),
+      Notas:       String(g(colIdx.notas)).trim(),
+      Estado:      String(g(colIdx.estado)).trim(),
+    });
+  }
+  return { layoutRows, headerRowIdx: hdrI, rawHeaders, rawRows: rows, colIdx };
+}
+
+/** Cascade 2020: verifica secuencias existentes y asigna las que faltan. */
+function runCascade2020(layoutRows, dsRows) {
+  const nFrac = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
+  const normStr = (v) => String(v ?? "").trim();
+
+  // ── Lookups del DS ────────────────────────────────────────────────────────
+  const dsByCandado  = new Map(); // "Candado 551" → dsRow
+  const dsByPFP      = new Map(); // Pedimento2|||Fraccion|||Pais → [dsRow]
+  const dsByPF       = new Map(); // Pedimento2|||Fraccion → [dsRow]
+  const usedDS       = new Set();
+
+  for (const r of dsRows) {
+    const candado = normStr(r["Candado 551"]);
+    if (candado) dsByCandado.set(candado, r);
+
+    const ped2 = normStr(r["Pedimento2"]);
+    const frac = nFrac(normStr(r["Fraccion"]));
+    const pais = normStr(r["PaisOrigenDestino"]);
+
+    const kPFP = `${ped2}|||${frac}|||${pais}`;
+    if (!dsByPFP.has(kPFP)) dsByPFP.set(kPFP, []);
+    dsByPFP.get(kPFP).push(r);
+
+    const kPF = `${ped2}|||${frac}`;
+    if (!dsByPF.has(kPF)) dsByPF.set(kPF, []);
+    dsByPF.get(kPF).push(r);
+  }
+
+  // Función de match por cantidades (tolerancia ±1 ud / ±2 USD)
+  const tryMatchQty = (cands, sumCant, sumVal, tolC = 1, tolV = 2) => {
+    for (const r of cands) {
+      if (usedDS.has(r._dsIdx)) continue;
+      const c = parseFloat(r["CantidadUMComercial"]) || 0;
+      const v = parseFloat(r["ValorDolares"])        || 0;
+      if (Math.abs(sumCant - c) <= tolC && Math.abs(sumVal - v) <= tolV) return r;
+    }
+    return null;
+  };
+
+  const tryMatchUP = (cands, sumCant, sumVal, tolPct = 0.15) => {
+    if (sumCant <= 0) return null;
+    const up = sumVal / sumCant;
+    let best = null, bestDiff = Infinity;
+    for (const r of cands) {
+      if (usedDS.has(r._dsIdx)) continue;
+      const c = parseFloat(r["CantidadUMComercial"]) || 0;
+      const v = parseFloat(r["ValorDolares"])        || 0;
+      if (c <= 0) continue;
+      const diff = Math.abs((v / c) - up) / Math.max(up, 0.001);
+      if (diff <= tolPct && diff < bestDiff) { bestDiff = diff; best = r; }
+    }
+    return best;
+  };
+
+  // assignment: _idx → { status, newSec, dsRow, corrections[], reason }
+  // status: "ok"|"corrected"|"new"|"unmatched"
+  const assignment = new Map();
+
+  // ── E0: Verificar SEC CALC existente contra DS "Candado 551" ─────────────
+  for (const row of layoutRows) {
+    if (!row.SecCalc) continue;
+    const candado = `${row.Pedimento}-${nFrac(row.FraccionNico)}-${row.SecCalc}`;
+    const dsRow = dsByCandado.get(candado);
+    if (dsRow) {
+      usedDS.add(dsRow._dsIdx);
+      // Verificar también coherencia de campos (pais, frac, desc)
+      const corrs = [];
+      const pais551 = normStr(dsRow["PaisOrigenDestino"]);
+      const frac551 = nFrac(normStr(dsRow["Fraccion"]));
+      if (pais551 && normStr(row.PaisOrigen) !== pais551)
+        corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
+      if (frac551 && nFrac(row.FraccionNico) !== frac551)
+        corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(dsRow["Fraccion"]) });
+      assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: corrs,
+        reason: "OK — Secuencia verificada contra DS 2020" });
+    }
+    // Si no matchea, se procesa en la segunda pasada
+  }
+
+  // ── E1–E4: Asignar filas sin secuencia o cuya secuencia no coincidió ──────
+  // Agrupar por Pedimento + FraccionNico + PaisOrigen
+  const groups = new Map();
+  for (const row of layoutRows) {
+    const a = assignment.get(row._idx);
+    if (a?.status === "ok") continue; // ya verificada
+    const key = `${row.Pedimento}|||${nFrac(row.FraccionNico)}|||${normStr(row.PaisOrigen)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  for (const [key, rows] of groups) {
+    const [ped, frac, pais] = key.split("|||");
+    const sumCant = rows.reduce((a, r) => a + r.Cantidad, 0);
+    const sumVal  = rows.reduce((a, r) => a + r.ValorUSD, 0);
+
+    let matched = null;
+    let estrategia = "";
+
+    // E1: Ped+Frac+Pais exacto, tolerancia ±1/±2
+    const candsE1 = (dsByPFP.get(`${ped}|||${frac}|||${pais}`) || []);
+    matched = tryMatchQty(candsE1, sumCant, sumVal, 1, 2);
+    if (matched) estrategia = "E1";
+
+    // E2: Sin pais, Ped+Frac ±1/±2
+    if (!matched) {
+      const candsE2 = (dsByPF.get(`${ped}|||${frac}`) || []);
+      matched = tryMatchQty(candsE2, sumCant, sumVal, 1, 2);
+      if (matched) estrategia = "E2";
+    }
+
+    // E3: Ped+Frac+Pais, tolerancia ±5%
+    if (!matched) {
+      const tolC = Math.max(2, sumCant * 0.05);
+      const tolV = Math.max(5, sumVal  * 0.05);
+      matched = tryMatchQty(candsE1, sumCant, sumVal, tolC, tolV);
+      if (matched) estrategia = "E3";
+    }
+
+    // E4: Precio unitario ±15%
+    if (!matched) {
+      const candsE4 = (dsByPF.get(`${ped}|||${frac}`) || []);
+      matched = tryMatchUP(candsE4, sumCant, sumVal, 0.15);
+      if (matched) estrategia = "E4";
+    }
+
+    // E5: Único candidato disponible en Ped+Frac (sin restricción)
+    if (!matched) {
+      const candsE5 = (dsByPF.get(`${ped}|||${frac}`) || []).filter(r => !usedDS.has(r._dsIdx));
+      if (candsE5.length === 1) { matched = candsE5[0]; estrategia = "E5"; }
+    }
+
+    if (matched) {
+      usedDS.add(matched._dsIdx);
+      const newSec = normStr(matched["SecuenciaFraccion"]);
+      const pais551 = normStr(matched["PaisOrigenDestino"]);
+      const frac551 = nFrac(normStr(matched["Fraccion"]));
+      const desc551 = normStr(matched["DescripcionMercancia"]);
+
+      for (const row of rows) {
+        const wasEmpty = !row.SecCalc;
+        const corrs = [];
+        if (pais551 && normStr(row.PaisOrigen) !== pais551)
+          corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
+        if (frac551 && nFrac(row.FraccionNico) !== frac551)
+          corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(matched["Fraccion"]) });
+        if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion)
+          corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
+
+        const prevSec = row.SecCalc;
+        assignment.set(row._idx, {
+          status: wasEmpty ? "new" : "corrected",
+          newSec, dsRow: matched, corrections: corrs, estrategia,
+          reason: wasEmpty
+            ? `[${estrategia}] Secuencia asignada: ${newSec}`
+            : `[${estrategia}] Secuencia corregida: ${prevSec} → ${newSec}`,
+        });
+      }
+    } else {
+      for (const row of rows) {
+        if (!assignment.has(row._idx)) {
+          assignment.set(row._idx, {
+            status: "unmatched", newSec: row.SecCalc || "", dsRow: null, corrections: [],
+            reason: `Sin match en DS para Ped ${ped} / Frac ${frac}`,
+          });
+        }
+      }
+    }
+  }
+
+  // Secuencias DS no usadas
+  const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx));
+  const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
+  for (const a of assignment.values()) {
+    if (a.status === "ok")        stats.verified++;
+    else if (a.status === "corrected") stats.corrected++;
+    else if (a.status === "new")       stats.newAssigned++;
+    else                               stats.unmatched++;
+  }
+
+  return { assignment, stats, unusedDS, layoutRows, dsRows };
+}
+
+/** Construye el Excel 2020 de salida: modifica celdas específicas del Layout. */
+function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
+                               layout2020Data, assignment) {
+  const { layoutRows, headerRowIdx, rawRows, rawHeaders, colIdx } = layout2020Data;
+  const wb = XLSX.utils.book_new();
+
+  // ── Copiar todas las hojas del original ──────────────────────────────────
+  for (const name of workbook.SheetNames) {
+    if (name !== layoutSheetName) {
+      const ws2 = XLSX.utils.aoa_to_sheet(
+        XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: "" })
+      );
+      XLSX.utils.book_append_sheet(wb, ws2, name);
+    }
+  }
+
+  // ── Reconstruir hoja Layout con modificaciones ───────────────────────────
+  const layData = rawRows.map(r => [...r]); // copia profunda de arrays
+
+  // Añadir columna NOTAS si no existe
+  const notasIsNew = colIdx.notas < 0;
+  if (notasIsNew) {
+    const hdrRow = layData[headerRowIdx];
+    while (hdrRow.length <= rawHeaders.length) hdrRow.push("");
+    hdrRow.push("NOTAS 2020");
+    colIdx.notas = hdrRow.length - 1;
+  }
+
+  // Asegurar que SEC CALC existe
+  if (colIdx.sec < 0) {
+    const hdrRow = layData[headerRowIdx];
+    hdrRow.push("SEC CALC");
+    colIdx.sec = hdrRow.length - 1;
+  }
+
+  for (const row of layoutRows) {
+    const a = assignment.get(row._idx);
+    if (!a) continue;
+    const dataRow = layData[row._rowI];
+    if (!dataRow) continue;
+
+    // Asegurar longitud de fila
+    while (dataRow.length <= Math.max(colIdx.sec, colIdx.notas)) dataRow.push("");
+
+    // Escribir SEC CALC
+    if (a.status !== "unmatched") dataRow[colIdx.sec] = a.newSec;
+
+    // Escribir notas
+    let notaText = a.reason || "";
+    if (a.corrections?.length) {
+      notaText += " | " + a.corrections.map(c =>
+        `[CORRECCIÓN ${c.field.toUpperCase()}] '${c.original}' → '${c.corrected}'`
+      ).join(" | ");
+    }
+    dataRow[colIdx.notas] = notaText;
+
+    // Aplicar correcciones de campo
+    for (const corr of (a.corrections || [])) {
+      const ci = corr.field === "pais" ? colIdx.pais
+               : corr.field === "frac" ? colIdx.frac
+               : corr.field === "desc" ? colIdx.desc : -1;
+      if (ci >= 0) dataRow[ci] = corr.corrected;
+    }
+  }
+
+  const wsLayout = XLSX.utils.aoa_to_sheet(layData);
+
+  // ── Estilos ───────────────────────────────────────────────────────────────
+  const S_GREEN_CELL = { font:{bold:true,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{horizontal:"center"} };
+  const S_RED_CELL   = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center"} };
+  const S_ORANGE_CELL= { font:{bold:true,color:{rgb:"784212"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{horizontal:"center",wrapText:true} };
+  const S_GREEN_NOTE = { font:{italic:true,sz:10,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true} };
+  const S_RED_NOTE   = { font:{bold:true,sz:10,color:{rgb:"641E16"}}, fill:{patternType:"solid",fgColor:{rgb:"FADBD8"}}, alignment:{wrapText:true} };
+  const S_ORANGE_NOTE= { font:{bold:true,sz:10,color:{rgb:"784212"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{wrapText:true} };
+  const S_GRAY_NOTE  = { font:{italic:true,sz:10,color:{rgb:"7F8C8D"}}, fill:{patternType:"solid",fgColor:{rgb:"F2F3F4"}}, alignment:{wrapText:true} };
+
+  for (const row of layoutRows) {
+    const a = assignment.get(row._idx);
+    if (!a) continue;
+    const sheetRow = row._rowI;
+
+    const secAddr   = XLSX.utils.encode_cell({ r: sheetRow, c: colIdx.sec   });
+    const notasAddr = XLSX.utils.encode_cell({ r: sheetRow, c: colIdx.notas });
+
+    if (!wsLayout[secAddr])   wsLayout[secAddr]   = { t:"s", v:"" };
+    if (!wsLayout[notasAddr]) wsLayout[notasAddr] = { t:"s", v:"" };
+
+    if (a.status === "ok") {
+      wsLayout[secAddr].s   = S_GREEN_CELL;
+      wsLayout[notasAddr].s = S_GREEN_NOTE;
+    } else if (a.status === "corrected") {
+      wsLayout[secAddr].s   = S_RED_CELL;
+      wsLayout[notasAddr].s = S_RED_NOTE;
+    } else if (a.status === "new") {
+      wsLayout[secAddr].s   = S_RED_CELL;
+      wsLayout[notasAddr].s = S_RED_NOTE;
+    } else {
+      wsLayout[notasAddr].s = S_GRAY_NOTE;
+    }
+
+    // Celdas de campo corregido (Pais/Frac/Desc) → naranja-rojo
+    for (const corr of (a.corrections || [])) {
+      const ci = corr.field === "pais" ? colIdx.pais
+               : corr.field === "frac" ? colIdx.frac
+               : corr.field === "desc" ? colIdx.desc : -1;
+      if (ci >= 0) {
+        const addr = XLSX.utils.encode_cell({ r: sheetRow, c: ci });
+        if (!wsLayout[addr]) wsLayout[addr] = { t:"s", v: corr.corrected };
+        wsLayout[addr].s = S_ORANGE_CELL;
+      }
+    }
+  }
+
+  // Anchos columnas clave
+  if (!wsLayout["!cols"]) wsLayout["!cols"] = [];
+  if (colIdx.sec   >= 0) wsLayout["!cols"][colIdx.sec]   = { wch: 14 };
+  if (colIdx.notas >= 0) wsLayout["!cols"][colIdx.notas] = { wch: 80 };
+
+  // Insertar hoja Layout en la posición original
+  const origPos = workbook.SheetNames.indexOf(layoutSheetName);
+  XLSX.utils.book_append_sheet(wb, wsLayout, layoutSheetName + " (Actualizado)");
+
+  // ── Hoja resumen 2020 ────────────────────────────────────────────────────
+  const { stats } = { stats: {} };  // stats viene de runCascade2020; la UI lo pasa separado
+  const reportRows2020 = [
+    ["REPORTE MÓDULO 2020 — Verificación y Asignación de Secuencias"],
+    [],
+    ["Hoja DS usada", dsSheetName || "DS *"],
+    ["Hoja Layout usada", layoutSheetName],
+    [],
+    ["LEYENDA DE COLORES"],
+    ["Verde (celda SEC CALC)", "Secuencia existente verificada — coincide exactamente con DS"],
+    ["Rojo (celda SEC CALC)", "Secuencia nueva asignada o corregida por la app"],
+    ["Naranja (celda campo)", "Campo corregido (PaisOrigen, FraccionNico, Descripcion) — fuente: DS"],
+    [],
+    ["DETALLE POR FILA"],
+    ["Pedimento","FraccionNico","PaisOrigen","Cantidad","ValorUSD","SEC CALC anterior","SEC CALC nuevo","Estado","Notas / Razón"],
+  ];
+  for (const row of layoutRows) {
+    const a = assignment.get(row._idx);
+    reportRows2020.push([
+      row.Pedimento, row.FraccionNico, row.PaisOrigen,
+      row.Cantidad, row.ValorUSD,
+      row.SecCalc, a?.newSec ?? "",
+      a?.status ?? "—", a?.reason ?? "",
+    ]);
+  }
+  const wsReport2020 = XLSX.utils.aoa_to_sheet(reportRows2020);
+  wsReport2020["!cols"] = [22,14,8,12,12,14,14,12,80].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, wsReport2020, "Reporte_2020");
+
+  return wb;
+}
+
+// ─── COMPONENTE APP2020 ────────────────────────────────────────────────────────
+function App2020() {
+  const [phase2020, setPhase2020]     = useState("upload");
+  const [isDragging2020, setIsDrag2020] = useState(false);
+  const [error2020, setError2020]     = useState(null);
+  const [fileName2020, setFileName2020] = useState("");
+  const [results2020, setResults2020] = useState(null);
+  const [outputWb2020, setOutputWb2020] = useState(null);
+  const [progress2020, setProgress2020] = useState(0);
+  const inputRef2020 = useRef(null);
+
+  const process2020 = useCallback(async (file) => {
+    setError2020(null);
+    setFileName2020(file.name);
+    setPhase2020("processing");
+    setProgress2020(0);
+    try {
+      const buf = await file.arrayBuffer();
+      setProgress2020(20);
+      const wb = XLSX.read(buf, { type: "array" });
+      setProgress2020(30);
+
+      const { dsName, layName } = resolveDS2020SheetNames(wb);
+      if (!dsName)  throw new Error('No se encontró hoja DS (debe contener "DS" en el nombre)');
+      if (!layName) throw new Error('No se encontró hoja Layout (debe contener "layout" en el nombre)');
+
+      setProgress2020(40);
+      const dsRows      = readDS2020Sheet(wb.Sheets[dsName]);
+      const layout2020  = readLayout2020Sheet(wb.Sheets[layName]);
+      setProgress2020(60);
+
+      const { assignment, stats, unusedDS } = runCascade2020(layout2020.layoutRows, dsRows);
+      setProgress2020(80);
+
+      const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment);
+      setProgress2020(100);
+
+      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName });
+      setOutputWb2020(newWb);
+      setTimeout(() => setPhase2020("results"), 400);
+    } catch (e) {
+      setError2020(e.message);
+      setPhase2020("upload");
+    }
+  }, []);
+
+  const onFile2020 = useCallback((file) => {
+    if (!file?.name?.match(/\.(xlsx|xls)$/i)) { setError2020("Solo archivos Excel (.xlsx / .xls)"); return; }
+    process2020(file);
+  }, [process2020]);
+
+  const download2020 = () => {
+    if (!outputWb2020) return;
+    const out = XLSX.write(outputWb2020, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([out], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url;
+    a.download = fileName2020.replace(/\.xlsx?$/i, "") + "_2020_secuencias.xlsx";
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  const reset2020 = () => { setPhase2020("upload"); setResults2020(null); setOutputWb2020(null); setError2020(null); setProgress2020(0); };
+
+  return (
+    <div>
+      {/* Botones header */}
+      {phase2020 === "results" && (
+        <div style={{ display:"flex", gap:8, marginBottom:24 }}>
+          <button onClick={reset2020} style={{ background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"8px 16px",cursor:"pointer",borderRadius:4,fontSize:13 }}>← Nuevo archivo</button>
+          <button onClick={download2020} style={{ background:"#22c55e",border:"none",color:"#0f172a",padding:"8px 20px",cursor:"pointer",borderRadius:4,fontSize:13,fontWeight:800 }}>⬇ Descargar Excel 2020</button>
+        </div>
+      )}
+
+      {phase2020 === "upload" && (
+        <div style={{ animation:"fadeUp 0.4s ease" }}>
+          <div style={{ textAlign:"center", marginBottom:40 }}>
+            <div style={{ display:"inline-block",background:"rgba(34,197,94,0.1)",border:"1px solid rgba(34,197,94,0.2)",color:"#22c55e",padding:"4px 14px",borderRadius:20,fontSize:11,letterSpacing:"0.12em",fontFamily:"DM Mono, monospace",marginBottom:16 }}>
+              MULTI-PEDIMENTO · VERIFICACIÓN + ASIGNACIÓN
+            </div>
+            <h2 style={{ fontSize:32,fontWeight:900,margin:"0 0 12px",letterSpacing:"-0.02em" }}>
+              Módulo <span style={{color:"#22c55e"}}>DS 2020</span> — Secuencias Multi-Pedimento
+            </h2>
+            <p style={{ color:"#64748b",fontSize:14,maxWidth:520,margin:"0 auto" }}>
+              Sube un Excel con hojas <b style={{color:"#22c55e"}}>DS *</b> (Data Stage) y <b style={{color:"#22c55e"}}>Layout *</b>.
+              La app verifica secuencias existentes y asigna las faltantes por pedimento.
+            </p>
+          </div>
+
+          {error2020 && (
+            <div style={{ background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:4,padding:"12px 18px",marginBottom:20,color:"#fca5a5",fontSize:13 }}>
+              ⚠ {error2020}
+            </div>
+          )}
+
+          <div
+            onClick={() => inputRef2020.current?.click()}
+            onDragOver={e => { e.preventDefault(); setIsDrag2020(true); }}
+            onDragLeave={() => setIsDrag2020(false)}
+            onDrop={e => { e.preventDefault(); setIsDrag2020(false); const f = e.dataTransfer.files[0]; if(f) onFile2020(f); }}
+            style={{ border:`2px dashed ${isDragging2020?"#22c55e":"#334155"}`,borderRadius:8,padding:"48px 32px",textAlign:"center",cursor:"pointer",background:isDragging2020?"rgba(34,197,94,0.05)":"transparent",transition:"all 0.2s" }}
+          >
+            <input ref={inputRef2020} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e => e.target.files[0] && onFile2020(e.target.files[0])} />
+            <div style={{fontSize:40,marginBottom:12}}>📊</div>
+            <div style={{color:"#f8fafc",fontSize:16,fontWeight:700,marginBottom:8}}>Sube tu archivo Excel 2020</div>
+            <div style={{color:"#94a3b8",fontSize:12}}>Requiere hojas <span style={{color:"#22c55e",fontFamily:"monospace"}}>DS 2020</span> y <span style={{color:"#22c55e",fontFamily:"monospace"}}>Layout 2020</span></div>
+          </div>
+
+          <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
+            <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA por la app"],["Naranja en celda","Campo corregido (PaisOrigen / FraccionNico / Descripcion) — fuente DS"]].map(([c,d]) => (
+              <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
+                <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
+                <span style={{color:"#64748b"}}>{d}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {phase2020 === "processing" && (
+        <div style={{textAlign:"center",padding:"80px 0",animation:"fadeUp 0.3s ease"}}>
+          <div style={{width:48,height:48,border:"3px solid #22c55e",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 24px"}} />
+          <div style={{color:"#f8fafc",fontSize:18,fontWeight:700,marginBottom:8}}>Procesando DS 2020...</div>
+          <div style={{color:"#64748b",fontSize:13,marginBottom:24}}>{fileName2020}</div>
+          <div style={{width:280,height:4,background:"#1e293b",borderRadius:2,margin:"0 auto",overflow:"hidden"}}>
+            <div style={{height:"100%",background:"#22c55e",width:`${progress2020}%`,transition:"width 0.4s ease",borderRadius:2}} />
+          </div>
+        </div>
+      )}
+
+      {phase2020 === "results" && results2020 && (
+        <div style={{animation:"fadeUp 0.4s ease"}}>
+          <div style={{color:"#94a3b8",fontSize:12,marginBottom:16,fontFamily:"monospace"}}>
+            DS: <span style={{color:"#22c55e"}}>{results2020.dsName}</span> · Layout: <span style={{color:"#22c55e"}}>{results2020.layName}</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:32}}>
+            {[
+              { label:"Verificadas (OK)", value: results2020.stats.verified,    accent:"#22c55e",  sub:"Verde en Excel" },
+              { label:"Corregidas",        value: results2020.stats.corrected,   accent:"#ef4444",  sub:"Rojo — cambio aplicado" },
+              { label:"Nuevas asignadas",  value: results2020.stats.newAssigned, accent:"#f59e0b",  sub:"Rojo — asignación nueva" },
+              { label:"Sin match",         value: results2020.stats.unmatched,   accent:"#64748b",  sub:"Revisar manualmente" },
+            ].map(c => <StatCard key={c.label} label={c.label} value={c.value} sub={c.sub} accent={c.accent} />)}
+          </div>
+          <div style={{background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:6,padding:"16px 20px",marginBottom:24,fontSize:13,color:"#94a3b8"}}>
+            Total filas Layout: <b style={{color:"#f8fafc"}}>{results2020.total}</b> &nbsp;·&nbsp;
+            Secuencias DS no usadas: <b style={{color: results2020.unusedDSCount>0?"#ef4444":"#22c55e"}}>{results2020.unusedDSCount}</b>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
 export default function App() {
+  const [activeTab, setActiveTab] = useState("551"); // "551" | "2020"
   const [phase, setPhase] = useState("upload"); // upload | processing | results
   const [isDragging, setIsDragging] = useState(false);
   const [results, setResults] = useState(null);
@@ -1777,9 +2382,21 @@ export default function App() {
               COMERCIO EXTERIOR · INMEX · PEDIMENTO 551
             </div>
           </div>
+          {/* Tab selector */}
+          <div style={{ display:"flex", gap:4, marginLeft:24, background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:4 }}>
+            {[{ id:"551", label:"Módulo 551" }, { id:"2020", label:"Módulo DS 2020" }].map(t => (
+              <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
+                background: activeTab===t.id ? (t.id==="2020"?"#22c55e":"#f59e0b") : "transparent",
+                border:"none", color: activeTab===t.id ? "#0f172a" : "#64748b",
+                padding:"6px 16px", cursor:"pointer", borderRadius:4,
+                fontSize:12, fontWeight:700, fontFamily:"Syne, sans-serif",
+                transition:"all 0.2s",
+              }}>{t.label}</button>
+            ))}
+          </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {phase === "results" && (
+          {activeTab==="551" && phase === "results" && (
             <>
               <button
                 onClick={reset}
@@ -1809,6 +2426,12 @@ export default function App() {
       </div>
 
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 24px" }}>
+
+        {/* MÓDULO DS 2020 */}
+        {activeTab === "2020" && <App2020 />}
+
+        {/* MÓDULO 551 — original */}
+        {activeTab === "551" && <>
 
         {/* UPLOAD PHASE */}
         {phase === "upload" && (
@@ -2174,6 +2797,10 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* Cierre módulo 551 */}
+        </>}
+
       </div>
     </div>
   );
