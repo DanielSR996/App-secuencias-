@@ -1729,41 +1729,34 @@ function readLayout2020Sheet(sheet) {
   if (!sheet || !sheet["!ref"]) return { layoutRows: [], headerRowIdx: 1, colIdx: {} };
 
   const range = XLSX.utils.decode_range(sheet["!ref"]);
-  const cellVal = (r, c) => {
-    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
-    return cell ? String(cell.v ?? "").trim() : "";
-  };
-  const cellNum = (r, c) => {
-    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
-    return cell ? (parseFloat(cell.v) || 0) : 0;
-  };
 
-  // ── 1. Detectar fila de encabezado (escanear filas 0-9 buscando nombres conocidos) ──
+  // ── 1. Leer los primeros 10 renglones con sheet_to_json ───────────────────
+  // sheet_to_json resuelve shared strings automáticamente (cell.v da el texto real,
+  // no el índice numérico). Usar solo para encontrar los headers.
+  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(9, range.e.r), c: range.e.c } };
+  const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
+
+  // ── 2. Detectar fila de encabezado ────────────────────────────────────────
   const KNOWN = new Set(["pedimento","fraccionnico","seccalc","descripcion",
-                         "paisorigen","pais_origen","valormpdolares","cantidad_comercial"]);
-  let hdrI = 1; // default: Excel fila 2 = índice 1 (confirmado por workbook.xml)
+                         "paisorigen","pais_origen","valormpdolares","cantidad_comercial",
+                         "notas","estado","pais_origenparalayout"]);
+  let hdrI = 1;
   let bestHits = 0;
-  for (let r = 0; r <= Math.min(9, range.e.r); r++) {
-    let hits = 0;
-    for (let c = range.s.c; c <= Math.min(range.e.c, 200); c++) {
-      if (KNOWN.has(nH2020(cellVal(r, c)))) hits++;
-    }
-    if (hits > bestHits) { bestHits = hits; hdrI = r; }
+  for (let i = 0; i < sampleRows.length; i++) {
+    const hits = sampleRows[i].filter(c => KNOWN.has(nH2020(String(c ?? "")))).length;
+    if (hits > bestHits) { bestHits = hits; hdrI = i; }
     if (hits >= 4) break;
   }
 
-  // ── 2. Leer fila de encabezado y encontrar índices de columnas clave ────────
-  const rawHeaders = [];
-  for (let c = range.s.c; c <= range.e.c; c++) {
-    rawHeaders.push(cellVal(hdrI, c));
-  }
-  // Último índice para cada nombre (maneja duplicados)
+  // ── 3. Mapear índices de columnas clave ───────────────────────────────────
+  // rawHeaders usa los valores resueltos de sheet_to_json (strings reales, no índices)
+  const rawHeaders = (sampleRows[hdrI] || []).map(c => String(c ?? "").trim());
   const findLast = (...names) => {
     const ts = names.map(nH2020);
     return rawHeaders.reduce((last, h, i) => ts.includes(nH2020(h)) ? i : last, -1);
   };
   const colIdx = {
-    pedimento: findLast("pedimento"),                                        // último "pedimento" = cadena "Aduanal-Patente-Numero"
+    pedimento: findLast("pedimento"),
     frac:      findLast("FraccionNico","fraccionnico"),
     desc:      findLast("descripcion","clase_descripcion","descripcionmercancia"),
     pais:      findLast("pais_origen","paisorigen","paisorigendestino","paisorigenparalayout"),
@@ -1773,7 +1766,23 @@ function readLayout2020Sheet(sheet) {
     notas:     findLast("NOTAS"),
     estado:    findLast("ESTADO"),
   };
-  console.log("[2020] Layout headers en fila", hdrI, "| hits:", bestHits, "| colIdx:", colIdx);
+  console.log("[2020] Layout hdrI:", hdrI, "| hits:", bestHits, "| colIdx:", JSON.stringify(colIdx));
+  console.log("[2020] rawHeaders sample:", rawHeaders.slice(170, 200));
+
+  // Helpers para leer celdas de datos (cell-by-cell = eficiente para 117K filas)
+  const cellVal = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    if (!cell) return "";
+    // Para celdas de fórmula (t="str") y números, cell.v ya tiene el valor correcto.
+    // Para shared strings (t="s"), si xlsx resolvió correctamente cell.v = string.
+    // Si no resolvió, cell.v = índice numérico — en ese caso intentamos cell.w (formatted).
+    const v = cell.v ?? cell.w ?? "";
+    return String(v).trim();
+  };
+  const cellNum = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    return cell ? (parseFloat(cell.v) || 0) : 0;
+  };
 
   // ── 3. Leer solo las columnas necesarias fila por fila ─────────────────────
   const layoutRows = [];
