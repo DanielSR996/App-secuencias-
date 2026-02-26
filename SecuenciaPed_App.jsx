@@ -1672,8 +1672,14 @@ const nH2020 = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "
 
 /**
  * Encuentra la hoja DS y la hoja Layout dentro del workbook.
- * Detección por CONTENIDO (no solo por nombre) para evitar elegir
- * hojas pivot/resumen como "td layout" cuando el Layout real se llama "2020".
+ *
+ * Estrategia en dos pasos:
+ * 1. Detección por CONTENIDO para hojas que SÍ cargaron en memoria.
+ *    Evita elegir tablas pivot/resumen ("td layout") cuando el Layout real
+ *    se llama "2020" u otro nombre sin la palabra "layout".
+ * 2. Fallback por NOMBRE ("layout" en el nombre) para hojas que NO cargaron
+ *    (sheets demasiado grandes que xlsx no puede parsear completamente,
+ *    ej. "Layout 2020" en archivos de 600 MB).
  */
 function resolveDS2020SheetNames(wb) {
   const names = wb.SheetNames || [];
@@ -1681,8 +1687,7 @@ function resolveDS2020SheetNames(wb) {
   // ── DS: primera hoja con "DS" en el nombre ─────────────────────────────────
   const dsName = names.find(n => n.toUpperCase().includes("DS"));
 
-  // ── Layout: hoja con más columnas conocidas de Layout ─────────────────────
-  // Columnas típicas del Layout real (no de una tabla pivot)
+  // ── Layout: paso 1 — detección por contenido ──────────────────────────────
   const LAY_KNOWN = new Set([
     "pedimento","fraccionnico","seccalc","descripcion","paisorigen","pais_origen",
     "valormpdolares","cantidad_comercial","cantidadcomercial","notas","estado",
@@ -1693,18 +1698,26 @@ function resolveDS2020SheetNames(wb) {
   for (const name of names) {
     if (name === dsName) continue;
     const ws = wb.Sheets[name];
-    if (!ws) continue;
-    // Leer solo las primeras 5 filas para detectar encabezados
+    if (!ws) continue; // hoja no cargada → se intentará en paso 2
     try {
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", sheetRows: 5 });
       for (const row of rows) {
         const hits = row.filter(c => LAY_KNOWN.has(nH2020(String(c ?? "")))).length;
         if (hits > bestHits) { bestHits = hits; layName = name; }
       }
-    } catch (_) { /* skip sheets que no carguen */ }
+    } catch (_) { /* skip hojas que lancen error */ }
   }
 
-  console.log("[resolve2020] dsName:", dsName, "| layName:", layName, "(hits:", bestHits, ")");
+  // ── Layout: paso 2 — fallback por nombre (hojas grandes no cargadas) ───────
+  // Si no se encontró por contenido, buscar hojas con "layout" en el nombre
+  // que NO cargaron (típico de archivos con hojas >500 MB).
+  if (!layName) {
+    const fallback = names.find(n => n !== dsName && n.toLowerCase().includes("layout"));
+    if (fallback) layName = fallback;
+  }
+
+  console.log("[resolve2020] dsName:", dsName, "| layName:", layName,
+    layName ? `(hits: ${bestHits}, cargada: ${!!wb.Sheets[layName]})` : "(NO ENCONTRADA)");
   return { dsName, layName };
 }
 
