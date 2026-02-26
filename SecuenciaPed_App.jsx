@@ -1664,134 +1664,143 @@ function StatCard({ label, value, sub, accent }) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MÓDULO 2020 — DS multi-pedimento (hoja DS*, Layout*)
+// Lectura celda-por-celda para manejar hojas de >600 MB sin colapsar memoria.
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Helper compartido ──────────────────────────────────────────────────────────
+const nH2020 = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
 
 /** Encuentra la hoja DS y la hoja Layout dentro del workbook 2020. */
 function resolveDS2020SheetNames(wb) {
   const names = wb.SheetNames || [];
-  // DS: hoja cuyo nombre contiene "DS" como palabra completa o al inicio
-  const dsName  = names.find(n => /^DS\b/i.test(n.trim()) || /\bDS\b/.test(n));
-  // Layout: hoja cuyo nombre contiene "layout" (ci)
-  let layName = names.find(n => n.toLowerCase().includes("layout"));
-  // Si la hoja layout parece una tabla dinámica (≤3 columnas en fila 0), buscar alternativa
-  if (layName) {
-    const ws = wb.Sheets[layName];
-    const r0 = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", sheetRows: 3 })[0] || [];
-    if (r0.filter(c => c !== "").length <= 4) {
-      // Buscar otra hoja con más columnas (excluyendo TC, DS, td551, etc.)
-      const alt = names.find(n => !["tc","td551","td conciliado"].includes(n.toLowerCase()) &&
-        !n.toUpperCase().includes("DS") && n !== layName);
-      if (alt) layName = alt;
-    }
-  }
+  const dsName  = names.find(n => n.toUpperCase().includes("DS"));
+  const layName = names.find(n => n.toLowerCase().includes("layout"));
   return { dsName, layName };
 }
 
-/** Lee la hoja DS 2020 — equivalente al 551 pero con Pedimento2. */
+/**
+ * Lee la hoja DS 2020 usando sheet_to_json (tiene ~25K filas, manejable).
+ * Columnas clave: Pedimento2, Fraccion, SecuenciaFraccion, DescripcionMercancia,
+ *                 CantidadUMComercial, ValorDolares, PaisOrigenDestino, "Candado 551".
+ */
 function readDS2020Sheet(sheet) {
+  if (!sheet) return [];
   const COLS_DS = ["Pedimento2","Fraccion","SecuenciaFraccion","DescripcionMercancia",
                    "CantidadUMComercial","ValorDolares","PaisOrigenDestino","Candado 551"];
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return [];
 
-  // Encontrar fila de cabecera: primera con ≥3 columnas que coincidan con COLS_DS
+  // Header = primera fila con ≥3 columnas conocidas
   let hdrI = 0;
   for (let i = 0; i < Math.min(rows.length, 5); i++) {
-    const hits = rows[i].filter(c => COLS_DS.includes(String(c ?? "").trim())).length;
-    if (hits >= 3) { hdrI = i; break; }
+    if (rows[i].filter(c => COLS_DS.includes(String(c ?? "").trim())).length >= 3) { hdrI = i; break; }
   }
   const hdr = rows[hdrI].map(c => String(c ?? "").trim());
-  // Usar el ÚLTIMO índice en caso de columnas duplicadas
-  const getLastIdx = (name) => hdr.reduce((last, h, i) => h === name ? i : last, -1);
+  const lastIdx = (name) => hdr.reduce((l, h, i) => h === name ? i : l, -1);
   const idx = {};
-  for (const col of COLS_DS) { const i = getLastIdx(col); if (i >= 0) idx[col] = i; }
+  for (const col of COLS_DS) { const i = lastIdx(col); if (i >= 0) idx[col] = i; }
 
-  // ValorDolares puede estar duplicado: resolver al primer no-cero
-  const vdIdxs = hdr.reduce((acc, h, i) => { if (h === "ValorDolares") acc.push(i); return acc; }, []);
+  // ValorDolares duplicado: usar primer valor no-cero
+  const vdIs = hdr.reduce((a, h, i) => { if (h === "ValorDolares") a.push(i); return a; }, []);
 
   const out = [];
   for (let i = hdrI + 1; i < rows.length; i++) {
     const row = rows[i];
-    if (row.every(c => c === "" || c == null)) continue;
+    if (!row || row.every(c => c === "" || c == null)) continue;
     const obj = { _dsIdx: out.length };
     for (const [col, ci] of Object.entries(idx)) obj[col] = row[ci] ?? "";
-    if (vdIdxs.length > 1) {
+    if (vdIs.length > 1) {
       let ef = null;
-      for (const ci of vdIdxs) { const n = parseFloat(row[ci]); if (!isNaN(n) && n !== 0) { ef = row[ci]; break; } }
-      obj["ValorDolares"] = ef !== null ? ef : (row[vdIdxs[0]] ?? 0);
+      for (const ci of vdIs) { const n = parseFloat(row[ci]); if (!isNaN(n) && n !== 0) { ef = row[ci]; break; } }
+      obj["ValorDolares"] = ef !== null ? ef : (row[vdIs[0]] ?? 0);
     }
     out.push(obj);
   }
   return out;
 }
 
-/** Lee la hoja Layout 2020 — encabezado puede estar en cualquier fila de las primeras 15. */
+/**
+ * Lee la hoja Layout 2020 celda-por-celda (solo las columnas necesarias).
+ * Esto permite manejar hojas enormes (>600 MB) sin crear arrays de 22 millones
+ * de elementos en memoria.
+ * Estructura conocida del archivo: fila 1 (Excel) = fórmulas, fila 2 = headers, fila 3+ = datos.
+ */
 function readLayout2020Sheet(sheet) {
-  const nH = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
+  if (!sheet || !sheet["!ref"]) return { layoutRows: [], headerRowIdx: 1, colIdx: {} };
 
-  // Columnas críticas que DEBEN aparecer en la fila de encabezado
-  const CRITICAL = new Set(["pedimento","fraccionnico","descripcion","seccalc",
-                             "pais_origen","paisorigen","valormpdolares","cantidad_comercial"]);
+  const range = XLSX.utils.decode_range(sheet["!ref"]);
+  const cellVal = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    return cell ? String(cell.v ?? "").trim() : "";
+  };
+  const cellNum = (r, c) => {
+    const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+    return cell ? (parseFloat(cell.v) || 0) : 0;
+  };
 
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
-  if (!rows.length) return { layoutRows: [], headerRowIdx: 0, rawHeaders: [], rawRows: [], colIdx: {} };
-
-  // Buscar la fila con más coincidencias de nombres de columna conocidos (hasta fila 15)
-  let hdrI = 0;
+  // ── 1. Detectar fila de encabezado (escanear filas 0-9 buscando nombres conocidos) ──
+  const KNOWN = new Set(["pedimento","fraccionnico","seccalc","descripcion",
+                         "paisorigen","pais_origen","valormpdolares","cantidad_comercial"]);
+  let hdrI = 1; // default: Excel fila 2 = índice 1 (confirmado por workbook.xml)
   let bestHits = 0;
-  for (let i = 0; i < Math.min(rows.length, 15); i++) {
-    const hits = rows[i].filter(c => CRITICAL.has(nH(c))).length;
-    if (hits > bestHits) { bestHits = hits; hdrI = i; }
-    if (hits >= 4) break; // suficientes coincidencias, detenerse
-  }
-  // Fallback: si no se encontraron coincidencias, tomar primera fila con ≥10 celdas no vacías
-  if (bestHits === 0) {
-    for (let i = 0; i < Math.min(rows.length, 15); i++) {
-      if (rows[i].filter(c => c !== "" && c != null).length >= 10) { hdrI = i; break; }
+  for (let r = 0; r <= Math.min(9, range.e.r); r++) {
+    let hits = 0;
+    for (let c = range.s.c; c <= Math.min(range.e.c, 200); c++) {
+      if (KNOWN.has(nH2020(cellVal(r, c)))) hits++;
     }
+    if (hits > bestHits) { bestHits = hits; hdrI = r; }
+    if (hits >= 4) break;
   }
-  const rawHeaders = (rows[hdrI] || []).map(c => String(c ?? "").trim());
 
-  // Último índice para columnas duplicadas
+  // ── 2. Leer fila de encabezado y encontrar índices de columnas clave ────────
+  const rawHeaders = [];
+  for (let c = range.s.c; c <= range.e.c; c++) {
+    rawHeaders.push(cellVal(hdrI, c));
+  }
+  // Último índice para cada nombre (maneja duplicados)
   const findLast = (...names) => {
-    const ts = names.map(nH);
-    return rawHeaders.reduce((last, h, i) => ts.includes(nH(h)) ? i : last, -1);
+    const ts = names.map(nH2020);
+    return rawHeaders.reduce((last, h, i) => ts.includes(nH2020(h)) ? i : last, -1);
   };
   const colIdx = {
-    // "pedimento" tiene varias ocurrencias: la ÚLTIMA es la cadena "400-3459-XXXX"
-    pedimento: findLast("pedimento"),
+    pedimento: findLast("pedimento"),                                        // último "pedimento" = cadena "Aduanal-Patente-Numero"
     frac:      findLast("FraccionNico","fraccionnico"),
-    desc:      findLast("descripcion","descripcionmercancia","clase_descripcion"),
-    pais:      findLast("pais_origen","paisorigen","paisorigendestino","pais_origen PARA LAYOUT"),
-    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc","CantidadUMComercial"),
-    val:       findLast("ValorMPDolares","valormpdolares","valordolares","vcusd","Valor ME"),
-    sec:       findLast("SEC CALC","seccalc","secuenciaped","SecuenciaPed"),
+    desc:      findLast("descripcion","clase_descripcion","descripcionmercancia"),
+    pais:      findLast("pais_origen","paisorigen","paisorigendestino","paisorigenparalayout"),
+    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    val:       findLast("ValorMPDolares","valormpdolares","valorme","valordolares"),
+    sec:       findLast("SEC CALC","seccalc","secuenciaped"),
     notas:     findLast("NOTAS"),
     estado:    findLast("ESTADO"),
   };
-  // Log de diagnóstico (visible en consola del browser)
-  console.log("[2020] headerRow detectado en índice:", hdrI, "| colIdx:", colIdx);
+  console.log("[2020] Layout headers en fila", hdrI, "| hits:", bestHits, "| colIdx:", colIdx);
 
+  // ── 3. Leer solo las columnas necesarias fila por fila ─────────────────────
   const layoutRows = [];
-  for (let i = hdrI + 1; i < rows.length; i++) {
-    const row = rows[i];
-    if (row.every(c => c === "" || c == null)) continue;
-    const g = (ci) => ci >= 0 ? (row[ci] ?? "") : "";
+  const requiredCols = Object.values(colIdx).filter(c => c >= 0);
+
+  for (let r = hdrI + 1; r <= range.e.r; r++) {
+    // Verificar que la fila no sea completamente vacía en las columnas requeridas
+    const pedVal = colIdx.pedimento >= 0 ? cellVal(r, colIdx.pedimento) : "";
+    const fracVal = colIdx.frac      >= 0 ? cellVal(r, colIdx.frac)      : "";
+    if (!pedVal && !fracVal) continue; // fila vacía en campos clave → saltar
+
     layoutRows.push({
       _idx:        layoutRows.length,
-      _rowI:       i,
-      Pedimento:   String(g(colIdx.pedimento)).trim(),
-      FraccionNico:String(g(colIdx.frac)).trim(),
-      Descripcion: String(g(colIdx.desc)).trim(),
-      PaisOrigen:  String(g(colIdx.pais)).trim(),
-      Cantidad:    parseFloat(g(colIdx.cant)) || 0,
-      ValorUSD:    parseFloat(g(colIdx.val))  || 0,
-      SecCalc:     String(g(colIdx.sec)).trim(),
-      Notas:       String(g(colIdx.notas)).trim(),
-      Estado:      String(g(colIdx.estado)).trim(),
+      _rowI:       r,                    // índice real en el worksheet (0-based)
+      Pedimento:   pedVal,
+      FraccionNico:fracVal,
+      Descripcion: colIdx.desc   >= 0 ? cellVal(r, colIdx.desc)   : "",
+      PaisOrigen:  colIdx.pais   >= 0 ? cellVal(r, colIdx.pais)   : "",
+      Cantidad:    colIdx.cant   >= 0 ? cellNum(r, colIdx.cant)   : 0,
+      ValorUSD:    colIdx.val    >= 0 ? cellNum(r, colIdx.val)    : 0,
+      SecCalc:     colIdx.sec    >= 0 ? cellVal(r, colIdx.sec)    : "",
+      Notas:       colIdx.notas  >= 0 ? cellVal(r, colIdx.notas)  : "",
+      Estado:      colIdx.estado >= 0 ? cellVal(r, colIdx.estado) : "",
     });
   }
-  return { layoutRows, headerRowIdx: hdrI, rawHeaders, rawRows: rows, colIdx };
+  console.log("[2020] layoutRows leídas:", layoutRows.length);
+  return { layoutRows, headerRowIdx: hdrI, colIdx };
 }
 
 /** Cascade 2020: verifica secuencias existentes y asigna las que faltan. */
@@ -1977,137 +1986,91 @@ function runCascade2020(layoutRows, dsRows) {
 }
 
 /** Construye el Excel 2020 de salida: modifica celdas específicas del Layout. */
+/**
+ * Modifica DIRECTAMENTE las celdas del worksheet original (sin reconstruirlo).
+ * Luego crea un libro de salida con:
+ *   - La hoja Layout modificada (celdas SEC CALC + NOTAS en verde/rojo)
+ *   - La hoja DS 2020 sin cambios
+ *   - Una hoja "Reporte_2020" con el detalle
+ *
+ * Escribir celdas directamente es ~1000x más eficiente que sheet_to_json → aoa_to_sheet
+ * sobre una hoja de 22 millones de celdas.
+ */
 function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
                                layout2020Data, assignment) {
-  const { layoutRows, headerRowIdx, rawRows, rawHeaders, colIdx } = layout2020Data;
-  const wb = XLSX.utils.book_new();
-
-  // ── Copiar todas las hojas del original (omitir Layout — se reconstruye abajo) ──
-  for (const name of workbook.SheetNames) {
-    if (name === layoutSheetName) continue;         // Layout se reconstruye
-    if (!workbook.Sheets[name]) continue;           // hoja no cargada (demasiado grande, etc.)
-    const safeName = name.slice(0, 31);             // garantizar máx 31 chars
-    try {
-      const ws2 = XLSX.utils.aoa_to_sheet(
-        XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: "" })
-      );
-      XLSX.utils.book_append_sheet(wb, ws2, safeName);
-    } catch (_) { /* ignorar hojas que fallen al copiar */ }
-  }
-
-  // ── Reconstruir hoja Layout con modificaciones ───────────────────────────
-  const layData = rawRows.map(r => [...r]); // copia profunda de arrays
-
-  // Añadir columna NOTAS si no existe
-  const notasIsNew = colIdx.notas < 0;
-  if (notasIsNew) {
-    const hdrRow = layData[headerRowIdx];
-    while (hdrRow.length <= rawHeaders.length) hdrRow.push("");
-    hdrRow.push("NOTAS 2020");
-    colIdx.notas = hdrRow.length - 1;
-  }
-
-  // Asegurar que SEC CALC existe
-  if (colIdx.sec < 0) {
-    const hdrRow = layData[headerRowIdx];
-    hdrRow.push("SEC CALC");
-    colIdx.sec = hdrRow.length - 1;
-  }
-
-  for (const row of layoutRows) {
-    const a = assignment.get(row._idx);
-    if (!a) continue;
-    const dataRow = layData[row._rowI];
-    if (!dataRow) continue;
-
-    // Asegurar longitud de fila
-    while (dataRow.length <= Math.max(colIdx.sec, colIdx.notas)) dataRow.push("");
-
-    // Escribir SEC CALC
-    if (a.status !== "unmatched") dataRow[colIdx.sec] = a.newSec;
-
-    // Escribir notas
-    let notaText = a.reason || "";
-    if (a.corrections?.length) {
-      notaText += " | " + a.corrections.map(c =>
-        `[CORRECCIÓN ${c.field.toUpperCase()}] '${c.original}' → '${c.corrected}'`
-      ).join(" | ");
-    }
-    dataRow[colIdx.notas] = notaText;
-
-    // Aplicar correcciones de campo
-    for (const corr of (a.corrections || [])) {
-      const ci = corr.field === "pais" ? colIdx.pais
-               : corr.field === "frac" ? colIdx.frac
-               : corr.field === "desc" ? colIdx.desc : -1;
-      if (ci >= 0) dataRow[ci] = corr.corrected;
-    }
-  }
-
-  const wsLayout = XLSX.utils.aoa_to_sheet(layData);
+  const { layoutRows, colIdx } = layout2020Data;
+  const ws = workbook.Sheets[layoutSheetName]; // referencia al worksheet original
 
   // ── Estilos ───────────────────────────────────────────────────────────────
-  const S_GREEN_CELL = { font:{bold:true,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{horizontal:"center"} };
-  const S_RED_CELL   = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center"} };
-  const S_ORANGE_CELL= { font:{bold:true,color:{rgb:"784212"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{horizontal:"center",wrapText:true} };
-  const S_GREEN_NOTE = { font:{italic:true,sz:10,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true} };
-  const S_RED_NOTE   = { font:{bold:true,sz:10,color:{rgb:"641E16"}}, fill:{patternType:"solid",fgColor:{rgb:"FADBD8"}}, alignment:{wrapText:true} };
-  const S_ORANGE_NOTE= { font:{bold:true,sz:10,color:{rgb:"784212"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{wrapText:true} };
-  const S_GRAY_NOTE  = { font:{italic:true,sz:10,color:{rgb:"7F8C8D"}}, fill:{patternType:"solid",fgColor:{rgb:"F2F3F4"}}, alignment:{wrapText:true} };
+  const S_OK_SEC   = { font:{bold:true,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{horizontal:"center"} };
+  const S_NEW_SEC  = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center"} };
+  const S_OK_NOTA  = { font:{italic:true,sz:10,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true} };
+  const S_NEW_NOTA = { font:{bold:true,sz:10,color:{rgb:"641E16"}}, fill:{patternType:"solid",fgColor:{rgb:"FADBD8"}}, alignment:{wrapText:true} };
+  const S_CORR_FLD = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center",wrapText:true} };
 
-  for (const row of layoutRows) {
-    const a = assignment.get(row._idx);
-    if (!a) continue;
-    const sheetRow = row._rowI;
+  const setCell = (ws, r, c, val, style) => {
+    if (c < 0 || !ws) return;
+    const addr = XLSX.utils.encode_cell({ r, c });
+    const t = (typeof val === "number") ? "n" : "s";
+    ws[addr] = { t, v: val, s: style };
+  };
 
-    const secAddr   = XLSX.utils.encode_cell({ r: sheetRow, c: colIdx.sec   });
-    const notasAddr = XLSX.utils.encode_cell({ r: sheetRow, c: colIdx.notas });
+  // ── Modificar celdas en el worksheet original ─────────────────────────────
+  if (ws) {
+    for (const row of layoutRows) {
+      const a = assignment.get(row._idx);
+      if (!a || a.status === "unmatched") continue;
 
-    if (!wsLayout[secAddr])   wsLayout[secAddr]   = { t:"s", v:"" };
-    if (!wsLayout[notasAddr]) wsLayout[notasAddr] = { t:"s", v:"" };
+      const r = row._rowI;
+      const newSecVal = isNaN(parseFloat(a.newSec)) ? a.newSec : parseFloat(a.newSec);
+      const isOk = a.status === "ok";
 
-    if (a.status === "ok") {
-      wsLayout[secAddr].s   = S_GREEN_CELL;
-      wsLayout[notasAddr].s = S_GREEN_NOTE;
-    } else if (a.status === "corrected") {
-      wsLayout[secAddr].s   = S_RED_CELL;
-      wsLayout[notasAddr].s = S_RED_NOTE;
-    } else if (a.status === "new") {
-      wsLayout[secAddr].s   = S_RED_CELL;
-      wsLayout[notasAddr].s = S_RED_NOTE;
-    } else {
-      wsLayout[notasAddr].s = S_GRAY_NOTE;
-    }
+      // SEC CALC
+      setCell(ws, r, colIdx.sec, newSecVal, isOk ? S_OK_SEC : S_NEW_SEC);
 
-    // Celdas de campo corregido (Pais/Frac/Desc) → naranja-rojo
-    for (const corr of (a.corrections || [])) {
-      const ci = corr.field === "pais" ? colIdx.pais
-               : corr.field === "frac" ? colIdx.frac
-               : corr.field === "desc" ? colIdx.desc : -1;
-      if (ci >= 0) {
-        const addr = XLSX.utils.encode_cell({ r: sheetRow, c: ci });
-        if (!wsLayout[addr]) wsLayout[addr] = { t:"s", v: corr.corrected };
-        wsLayout[addr].s = S_ORANGE_CELL;
+      // NOTAS
+      const nota = a.reason + (a.corrections?.length
+        ? " | " + a.corrections.map(c2 => `[CORR ${c2.field.toUpperCase()}] '${c2.original}'→'${c2.corrected}'`).join(" | ")
+        : "");
+      setCell(ws, r, colIdx.notas, nota, isOk ? S_OK_NOTA : S_NEW_NOTA);
+
+      // Correcciones de campo (FraccionNico, PaisOrigen, Descripcion)
+      for (const corr of (a.corrections || [])) {
+        const ci = corr.field === "pais" ? colIdx.pais
+                 : corr.field === "frac" ? colIdx.frac
+                 : corr.field === "desc" ? colIdx.desc : -1;
+        setCell(ws, r, ci, corr.corrected, S_CORR_FLD);
       }
     }
   }
 
-  // Anchos columnas clave
-  if (!wsLayout["!cols"]) wsLayout["!cols"] = [];
-  if (colIdx.sec   >= 0) wsLayout["!cols"][colIdx.sec]   = { wch: 14 };
-  if (colIdx.notas >= 0) wsLayout["!cols"][colIdx.notas] = { wch: 80 };
+  // ── Construir libro de salida ─────────────────────────────────────────────
+  const wb = XLSX.utils.book_new();
 
-  // Nombre de la hoja de salida — máx 31 chars (límite de Excel)
-  const safeLayName = (layoutSheetName.slice(0, 17) + " (Actualiz.)").slice(0, 31);
-  XLSX.utils.book_append_sheet(wb, wsLayout, safeLayName);
+  // Añadir la hoja Layout modificada (referencia al ws ya modificado arriba)
+  if (ws) {
+    if (!ws["!cols"]) ws["!cols"] = [];
+    if (colIdx.sec   >= 0) ws["!cols"][colIdx.sec]   = { wch: 14 };
+    if (colIdx.notas >= 0) ws["!cols"][colIdx.notas] = { wch: 80 };
+    const safeLayName = (layoutSheetName.slice(0, 17) + " (Actualiz.)").slice(0, 31);
+    XLSX.utils.book_append_sheet(wb, ws, safeLayName);
+  }
 
-  // ── Hoja resumen 2020 ────────────────────────────────────────────────────
-  const { stats } = { stats: {} };  // stats viene de runCascade2020; la UI lo pasa separado
+  // Añadir DS 2020 sin cambios
+  if (workbook.Sheets[dsSheetName]) {
+    try { XLSX.utils.book_append_sheet(wb, workbook.Sheets[dsSheetName], dsSheetName.slice(0,31)); } catch(_){}
+  }
+
+  // ── Hoja Reporte_2020 ─────────────────────────────────────────────────────
   const reportRows2020 = [
     ["REPORTE MÓDULO 2020 — Verificación y Asignación de Secuencias"],
     [],
     ["Hoja DS usada", dsSheetName || "DS *"],
     ["Hoja Layout usada", layoutSheetName],
+    [],
+    ["LEYENDA"],
+    ["Verde en SEC CALC", "Secuencia verificada y correcta (ya estaba bien)"],
+    ["Rojo en SEC CALC",  "Secuencia asignada o corregida por la app"],
     [],
     ["LEYENDA DE COLORES"],
     ["Verde (celda SEC CALC)", "Secuencia existente verificada — coincide exactamente con DS"],
