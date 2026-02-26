@@ -1679,29 +1679,50 @@ function resolveDS2020SheetNames(wb) {
 }
 
 /**
- * Lee la hoja DS 2020 usando sheet_to_json (tiene ~25K filas, manejable).
- * Columnas clave: Pedimento2, Fraccion, SecuenciaFraccion, DescripcionMercancia,
- *                 CantidadUMComercial, ValorDolares, PaisOrigenDestino, "Candado 551".
+ * Lee la hoja DS 2020.
+ * Soporta variantes de nombre de columna (ej. "Valor usd redondeado" en lugar de "ValorDolares").
  */
 function readDS2020Sheet(sheet) {
   if (!sheet) return [];
-  const COLS_DS = ["Pedimento2","Fraccion","SecuenciaFraccion","DescripcionMercancia",
-                   "CantidadUMComercial","ValorDolares","PaisOrigenDestino","Candado 551"];
+
+  // Aliases internos → posibles nombres en el Excel (normalizados con nH2020)
+  const DS_COL_MAP = {
+    Pedimento2:           ["Pedimento2"],
+    Fraccion:             ["Fraccion"],
+    SecuenciaFraccion:    ["SecuenciaFraccion"],
+    DescripcionMercancia: ["DescripcionMercancia"],
+    CantidadUMComercial:  ["CantidadUMComercial"],
+    ValorDolares:         ["ValorDolares","Valor usd redondeado","ValorAduana","Valor Aduana Estadístico"],
+    PaisOrigenDestino:    ["PaisOrigenDestino"],
+    "Candado 551":        ["Candado 551","Candado DS 551"],
+  };
+  const knownNorms = new Set(Object.values(DS_COL_MAP).flat().map(nH2020));
+
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return [];
 
-  // Header = primera fila con ≥3 columnas conocidas
-  let hdrI = 0;
+  // Detectar fila header: la que tenga más columnas conocidas
+  let hdrI = 0, bestHits = 0;
   for (let i = 0; i < Math.min(rows.length, 5); i++) {
-    if (rows[i].filter(c => COLS_DS.includes(String(c ?? "").trim())).length >= 3) { hdrI = i; break; }
+    const hits = rows[i].filter(c => knownNorms.has(nH2020(String(c ?? "")))).length;
+    if (hits > bestHits) { bestHits = hits; hdrI = i; }
+    if (hits >= 3) break;
   }
   const hdr = rows[hdrI].map(c => String(c ?? "").trim());
-  const lastIdx = (name) => hdr.reduce((l, h, i) => h === name ? i : l, -1);
-  const idx = {};
-  for (const col of COLS_DS) { const i = lastIdx(col); if (i >= 0) idx[col] = i; }
+  console.log("[DS2020] hdrI:", hdrI, "hits:", bestHits, "headers:", hdr.slice(0, 16));
 
-  // ValorDolares duplicado: usar primer valor no-cero
-  const vdIs = hdr.reduce((a, h, i) => { if (h === "ValorDolares") a.push(i); return a; }, []);
+  // Mapear: nombre interno → primer índice que coincida, respetando ORDEN de aliases
+  const idx = {};
+  for (const [internalName, aliases] of Object.entries(DS_COL_MAP)) {
+    let found = -1;
+    for (const alias of aliases) {
+      const n = nH2020(alias);
+      const i = hdr.findIndex(h => nH2020(h) === n);
+      if (i >= 0) { found = i; break; }
+    }
+    if (found >= 0) idx[internalName] = found;
+  }
+  console.log("[DS2020] colIdx:", JSON.stringify(idx));
 
   const out = [];
   for (let i = hdrI + 1; i < rows.length; i++) {
@@ -1709,106 +1730,119 @@ function readDS2020Sheet(sheet) {
     if (!row || row.every(c => c === "" || c == null)) continue;
     const obj = { _dsIdx: out.length };
     for (const [col, ci] of Object.entries(idx)) obj[col] = row[ci] ?? "";
-    if (vdIs.length > 1) {
-      let ef = null;
-      for (const ci of vdIs) { const n = parseFloat(row[ci]); if (!isNaN(n) && n !== 0) { ef = row[ci]; break; } }
-      obj["ValorDolares"] = ef !== null ? ef : (row[vdIs[0]] ?? 0);
-    }
     out.push(obj);
   }
+  console.log("[DS2020] DS rows leídas:", out.length, "muestra:", out.slice(0,2).map(r=>({ped:r.Pedimento2,frac:r.Fraccion,sec:r.SecuenciaFraccion,cant:r.CantidadUMComercial,val:r.ValorDolares,candado:r["Candado 551"]})));
   return out;
 }
 
 /**
  * Lee la hoja Layout 2020 celda-por-celda (solo las columnas necesarias).
- * Esto permite manejar hojas enormes (>600 MB) sin crear arrays de 22 millones
- * de elementos en memoria.
- * Estructura conocida del archivo: fila 1 (Excel) = fórmulas, fila 2 = headers, fila 3+ = datos.
+ * Usa sheet_to_json solo para detectar encabezados (resuelve shared strings),
+ * luego lee dato a dato para eficiencia con hojas grandes.
  */
 function readLayout2020Sheet(sheet) {
-  if (!sheet || !sheet["!ref"]) return { layoutRows: [], headerRowIdx: 1, colIdx: {} };
+  if (!sheet || !sheet["!ref"]) {
+    console.log("[Layout2020] ERROR: sheet undefined o sin !ref");
+    return { layoutRows: [], headerRowIdx: 0, colIdx: {} };
+  }
 
   const range = XLSX.utils.decode_range(sheet["!ref"]);
+  console.log("[Layout2020] ref:", sheet["!ref"], "filas totales:", range.e.r + 1, "cols:", range.e.c + 1);
 
-  // ── 1. Leer los primeros 10 renglones con sheet_to_json ───────────────────
-  // sheet_to_json resuelve shared strings automáticamente (cell.v da el texto real,
-  // no el índice numérico). Usar solo para encontrar los headers.
-  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(9, range.e.r), c: range.e.c } };
+  // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
+  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: range.e.c } };
   const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
+  console.log("[Layout2020] sampleRows leídas:", sampleRows.length);
 
   // ── 2. Detectar fila de encabezado ────────────────────────────────────────
   const KNOWN = new Set(["pedimento","fraccionnico","seccalc","descripcion",
-                         "paisorigen","pais_origen","valormpdolares","cantidad_comercial",
-                         "notas","estado","pais_origenparalayout"]);
-  let hdrI = 1;
-  let bestHits = 0;
+                         "paisorigen","valormpdolares","cantidadcomercial",
+                         "cantidad_comercial","notas","estado"]);
+  let hdrI = 0, bestHits = 0;
   for (let i = 0; i < sampleRows.length; i++) {
     const hits = sampleRows[i].filter(c => KNOWN.has(nH2020(String(c ?? "")))).length;
+    console.log(`[Layout2020] fila[${i}] hits:${hits}`, sampleRows[i].slice(0,6).map(v=>String(v).slice(0,12)));
     if (hits > bestHits) { bestHits = hits; hdrI = i; }
     if (hits >= 4) break;
   }
+  console.log("[Layout2020] hdrI:", hdrI, "bestHits:", bestHits);
 
-  // ── 3. Mapear índices de columnas clave ───────────────────────────────────
-  // rawHeaders usa los valores resueltos de sheet_to_json (strings reales, no índices)
+  // ── 3. Mapear columnas ────────────────────────────────────────────────────
   const rawHeaders = (sampleRows[hdrI] || []).map(c => String(c ?? "").trim());
+  console.log("[Layout2020] headers:", rawHeaders);
+
+  // findFirst: prueba cada alias EN ORDEN y devuelve la primera columna que coincida
+  // Esto garantiza que el alias más específico (primero en la lista) gana.
+  const findFirst = (...names) => {
+    for (const name of names) {
+      const n = nH2020(name);
+      const idx = rawHeaders.findIndex(h => nH2020(h) === n);
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  };
+  // findLast: última columna que coincida (para duplicados donde queremos el último)
   const findLast = (...names) => {
     const ts = names.map(nH2020);
     return rawHeaders.reduce((last, h, i) => ts.includes(nH2020(h)) ? i : last, -1);
   };
-  const colIdx = {
-    pedimento: findLast("pedimento"),
-    frac:      findLast("FraccionNico","fraccionnico"),
-    desc:      findLast("descripcion","clase_descripcion","descripcionmercancia"),
-    pais:      findLast("pais_origen","paisorigen","paisorigendestino","paisorigenparalayout"),
-    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
-    val:       findLast("ValorMPDolares","valormpdolares","valorme","valordolares"),
-    sec:       findLast("SEC CALC","seccalc","secuenciaped"),
-    notas:     findLast("NOTAS"),
-    estado:    findLast("ESTADO"),
-  };
-  console.log("[2020] Layout hdrI:", hdrI, "| hits:", bestHits, "| colIdx:", JSON.stringify(colIdx));
-  console.log("[2020] rawHeaders sample:", rawHeaders.slice(170, 200));
 
-  // Helpers para leer celdas de datos (cell-by-cell = eficiente para 117K filas)
+  const colIdx = {
+    pedimento:  findFirst("pedimento"),
+    frac:       findLast("FraccionNico","fraccionnico"),          // última FraccionNico
+    desc:       findFirst("descripcion","descripcionmercancia"),
+    pais:       findFirst("pais_origen","paisorigen","paisorigendestino"),  // primera pais_origen
+    cant:       findFirst("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    val:        findFirst("ValorMPDolares","valormpdolares","valordolares","valor_me","valorme"),
+    sec:        findFirst("SEC CALC","seccalc","secuenciaped"),
+    notasIn:    findFirst("NOTAS","notas"),   // primera NOTAS = flags de entrada ("NO INCLUIR")
+    notas:      findLast("NOTAS","notas"),    // última NOTAS = columna de salida
+    estado:     findFirst("ESTADO","estado"),
+  };
+  console.log("[Layout2020] colIdx:", JSON.stringify(colIdx));
+
+  // ── 4. Helpers lectura celda ──────────────────────────────────────────────
   const cellVal = (r, c) => {
+    if (c < 0) return "";
     const cell = sheet[XLSX.utils.encode_cell({ r, c })];
     if (!cell) return "";
-    // Para celdas de fórmula (t="str") y números, cell.v ya tiene el valor correcto.
-    // Para shared strings (t="s"), si xlsx resolvió correctamente cell.v = string.
-    // Si no resolvió, cell.v = índice numérico — en ese caso intentamos cell.w (formatted).
     const v = cell.v ?? cell.w ?? "";
     return String(v).trim();
   };
   const cellNum = (r, c) => {
+    if (c < 0) return 0;
     const cell = sheet[XLSX.utils.encode_cell({ r, c })];
     return cell ? (parseFloat(cell.v) || 0) : 0;
   };
 
-  // ── 3. Leer solo las columnas necesarias fila por fila ─────────────────────
+  // ── 5. Leer filas de datos celda-por-celda ────────────────────────────────
   const layoutRows = [];
-  const requiredCols = Object.values(colIdx).filter(c => c >= 0);
-
   for (let r = hdrI + 1; r <= range.e.r; r++) {
-    // Verificar que la fila no sea completamente vacía en las columnas requeridas
-    const pedVal = colIdx.pedimento >= 0 ? cellVal(r, colIdx.pedimento) : "";
-    const fracVal = colIdx.frac      >= 0 ? cellVal(r, colIdx.frac)      : "";
-    if (!pedVal && !fracVal) continue; // fila vacía en campos clave → saltar
+    const pedVal  = cellVal(r, colIdx.pedimento);
+    const fracVal = cellVal(r, colIdx.frac);
+    if (!pedVal && !fracVal) continue;
+
+    const notasInVal = cellVal(r, colIdx.notasIn).toUpperCase();
+    const noIncluir  = notasInVal.includes("NO INCLUIR");
 
     layoutRows.push({
       _idx:        layoutRows.length,
-      _rowI:       r,                    // índice real en el worksheet (0-based)
+      _rowI:       r,
       Pedimento:   pedVal,
       FraccionNico:fracVal,
-      Descripcion: colIdx.desc   >= 0 ? cellVal(r, colIdx.desc)   : "",
-      PaisOrigen:  colIdx.pais   >= 0 ? cellVal(r, colIdx.pais)   : "",
-      Cantidad:    colIdx.cant   >= 0 ? cellNum(r, colIdx.cant)   : 0,
-      ValorUSD:    colIdx.val    >= 0 ? cellNum(r, colIdx.val)    : 0,
-      SecCalc:     colIdx.sec    >= 0 ? cellVal(r, colIdx.sec)    : "",
-      Notas:       colIdx.notas  >= 0 ? cellVal(r, colIdx.notas)  : "",
-      Estado:      colIdx.estado >= 0 ? cellVal(r, colIdx.estado) : "",
+      Descripcion: cellVal(r, colIdx.desc),
+      PaisOrigen:  cellVal(r, colIdx.pais),
+      Cantidad:    cellNum(r, colIdx.cant),
+      ValorUSD:    cellNum(r, colIdx.val),
+      SecCalc:     cellVal(r, colIdx.sec),
+      Notas:       cellVal(r, colIdx.notas),
+      Estado:      cellVal(r, colIdx.estado),
+      noIncluir,
     });
   }
-  console.log("[2020] layoutRows leídas:", layoutRows.length);
+  console.log("[Layout2020] layoutRows:", layoutRows.length,
+    "muestra:", layoutRows.slice(0,3).map(r=>({ped:r.Pedimento,frac:r.FraccionNico,sec:r.SecCalc,noInc:r.noIncluir})));
   return { layoutRows, headerRowIdx: hdrI, colIdx };
 }
 
@@ -1816,6 +1850,11 @@ function readLayout2020Sheet(sheet) {
 function runCascade2020(layoutRows, dsRows) {
   const nFrac = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
   const normStr = (v) => String(v ?? "").trim();
+  // Una secuencia es "real" si es un número válido (no ".", no vacío)
+  const isRealSec = (v) => {
+    const s = normStr(v);
+    return s !== "" && s !== "." && !isNaN(parseFloat(s));
+  };
 
   // ── Lookups del DS ────────────────────────────────────────────────────────
   const dsByCandado  = new Map(); // "Candado 551" → dsRow
@@ -1872,7 +1911,8 @@ function runCascade2020(layoutRows, dsRows) {
 
   // ── E0: Verificar SEC CALC existente contra DS "Candado 551" ─────────────
   for (const row of layoutRows) {
-    if (!row.SecCalc) continue;
+    if (row.noIncluir) continue;         // filas marcadas "NO INCLUIR" → saltar
+    if (!isRealSec(row.SecCalc)) continue; // ".", vacío, no numérico → saltar
     const candado = `${row.Pedimento}-${nFrac(row.FraccionNico)}-${row.SecCalc}`;
     const dsRow = dsByCandado.get(candado);
     if (dsRow) {
@@ -1891,12 +1931,13 @@ function runCascade2020(layoutRows, dsRows) {
     // Si no matchea, se procesa en la segunda pasada
   }
 
-  // ── E1–E4: Asignar filas sin secuencia o cuya secuencia no coincidió ──────
+  // ── E1–E5: Asignar filas sin secuencia o cuya secuencia no coincidió ─────
   // Agrupar por Pedimento + FraccionNico + PaisOrigen
   const groups = new Map();
   for (const row of layoutRows) {
+    if (row.noIncluir) continue;          // filas "NO INCLUIR" → no asignar
     const a = assignment.get(row._idx);
-    if (a?.status === "ok") continue; // ya verificada
+    if (a?.status === "ok") continue;     // ya verificada en E0
     const key = `${row.Pedimento}|||${nFrac(row.FraccionNico)}|||${normStr(row.PaisOrigen)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
@@ -1951,7 +1992,7 @@ function runCascade2020(layoutRows, dsRows) {
       const desc551 = normStr(matched["DescripcionMercancia"]);
 
       for (const row of rows) {
-        const wasEmpty = !row.SecCalc;
+        const wasEmpty = !isRealSec(row.SecCalc);
         const corrs = [];
         if (pais551 && normStr(row.PaisOrigen) !== pais551)
           corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
