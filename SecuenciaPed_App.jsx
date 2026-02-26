@@ -1982,14 +1982,17 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   const { layoutRows, headerRowIdx, rawRows, rawHeaders, colIdx } = layout2020Data;
   const wb = XLSX.utils.book_new();
 
-  // ── Copiar todas las hojas del original ──────────────────────────────────
+  // ── Copiar todas las hojas del original (omitir Layout — se reconstruye abajo) ──
   for (const name of workbook.SheetNames) {
-    if (name !== layoutSheetName) {
+    if (name === layoutSheetName) continue;         // Layout se reconstruye
+    if (!workbook.Sheets[name]) continue;           // hoja no cargada (demasiado grande, etc.)
+    const safeName = name.slice(0, 31);             // garantizar máx 31 chars
+    try {
       const ws2 = XLSX.utils.aoa_to_sheet(
         XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: "" })
       );
-      XLSX.utils.book_append_sheet(wb, ws2, name);
-    }
+      XLSX.utils.book_append_sheet(wb, ws2, safeName);
+    } catch (_) { /* ignorar hojas que fallen al copiar */ }
   }
 
   // ── Reconstruir hoja Layout con modificaciones ───────────────────────────
@@ -2094,9 +2097,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   if (colIdx.sec   >= 0) wsLayout["!cols"][colIdx.sec]   = { wch: 14 };
   if (colIdx.notas >= 0) wsLayout["!cols"][colIdx.notas] = { wch: 80 };
 
-  // Insertar hoja Layout en la posición original
-  const origPos = workbook.SheetNames.indexOf(layoutSheetName);
-  XLSX.utils.book_append_sheet(wb, wsLayout, layoutSheetName + " (Actualizado)");
+  // Nombre de la hoja de salida — máx 31 chars (límite de Excel)
+  const safeLayName = (layoutSheetName.slice(0, 17) + " (Actualiz.)").slice(0, 31);
+  XLSX.utils.book_append_sheet(wb, wsLayout, safeLayName);
 
   // ── Hoja resumen 2020 ────────────────────────────────────────────────────
   const { stats } = { stats: {} };  // stats viene de runCascade2020; la UI lo pasa separado
