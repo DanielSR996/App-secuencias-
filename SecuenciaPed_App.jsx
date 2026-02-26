@@ -1670,11 +1670,41 @@ function StatCard({ label, value, sub, accent }) {
 // ── Helper compartido ──────────────────────────────────────────────────────────
 const nH2020 = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
 
-/** Encuentra la hoja DS y la hoja Layout dentro del workbook 2020. */
+/**
+ * Encuentra la hoja DS y la hoja Layout dentro del workbook.
+ * Detección por CONTENIDO (no solo por nombre) para evitar elegir
+ * hojas pivot/resumen como "td layout" cuando el Layout real se llama "2020".
+ */
 function resolveDS2020SheetNames(wb) {
   const names = wb.SheetNames || [];
-  const dsName  = names.find(n => n.toUpperCase().includes("DS"));
-  const layName = names.find(n => n.toLowerCase().includes("layout"));
+
+  // ── DS: primera hoja con "DS" en el nombre ─────────────────────────────────
+  const dsName = names.find(n => n.toUpperCase().includes("DS"));
+
+  // ── Layout: hoja con más columnas conocidas de Layout ─────────────────────
+  // Columnas típicas del Layout real (no de una tabla pivot)
+  const LAY_KNOWN = new Set([
+    "pedimento","fraccionnico","seccalc","descripcion","paisorigen","pais_origen",
+    "valormpdolares","cantidad_comercial","cantidadcomercial","notas","estado",
+    "aduana_es","numero_parte","numeroparte","precio_unitario","valorme","fraccionmex",
+  ]);
+
+  let layName = null, bestHits = 0;
+  for (const name of names) {
+    if (name === dsName) continue;
+    const ws = wb.Sheets[name];
+    if (!ws) continue;
+    // Leer solo las primeras 5 filas para detectar encabezados
+    try {
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", sheetRows: 5 });
+      for (const row of rows) {
+        const hits = row.filter(c => LAY_KNOWN.has(nH2020(String(c ?? "")))).length;
+        if (hits > bestHits) { bestHits = hits; layName = name; }
+      }
+    } catch (_) { /* skip sheets que no carguen */ }
+  }
+
+  console.log("[resolve2020] dsName:", dsName, "| layName:", layName, "(hits:", bestHits, ")");
   return { dsName, layName };
 }
 
@@ -1789,15 +1819,18 @@ function readLayout2020Sheet(sheet) {
   };
 
   const colIdx = {
-    pedimento:  findFirst("pedimento"),
-    frac:       findLast("FraccionNico","fraccionnico"),          // última FraccionNico
-    desc:       findFirst("descripcion","descripcionmercancia"),
-    pais:       findFirst("pais_origen","paisorigen","paisorigendestino"),  // primera pais_origen
-    cant:       findFirst("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    // findLast para columnas que pueden estar duplicadas y la versión útil es la ÚLTIMA
+    // (ej. "pedimento" en col 3 es "20-400-3459-..." pero col 174 es "400-3459-..." = formato DS)
+    pedimento:  findLast("pedimento"),
+    frac:       findLast("FraccionNico","fraccionnico"),
+    cant:       findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    notas:      findLast("NOTAS","notas"),    // última NOTAS = columna de salida
+    // findFirst para columnas sin ambigüedad importante
+    desc:       findFirst("descripcion","clase_descripcion","descripcionmercancia"),
+    pais:       findFirst("pais_origen","paisorigen","paisorigendestino"),
     val:        findFirst("ValorMPDolares","valormpdolares","valordolares","valor_me","valorme"),
     sec:        findFirst("SEC CALC","seccalc","secuenciaped"),
     notasIn:    findFirst("NOTAS","notas"),   // primera NOTAS = flags de entrada ("NO INCLUIR")
-    notas:      findLast("NOTAS","notas"),    // última NOTAS = columna de salida
     estado:     findFirst("ESTADO","estado"),
   };
   console.log("[Layout2020] colIdx:", JSON.stringify(colIdx));
@@ -2170,7 +2203,7 @@ function App2020() {
 
       const { dsName, layName } = resolveDS2020SheetNames(wb);
       if (!dsName)  throw new Error('No se encontró hoja DS (debe contener "DS" en el nombre)');
-      if (!layName) throw new Error('No se encontró hoja Layout (debe contener "layout" en el nombre)');
+      if (!layName) throw new Error('No se encontró hoja Layout (debe tener columnas de Layout: pedimento, FraccionNico, SEC CALC, etc.)');
 
       setProgress2020(40);
       const dsRows      = readDS2020Sheet(wb.Sheets[dsName]);
