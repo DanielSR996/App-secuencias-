@@ -1725,16 +1725,30 @@ function readDS2020Sheet(sheet) {
   return out;
 }
 
-/** Lee la hoja Layout 2020 — encabezado puede estar en fila 0 o 1. */
+/** Lee la hoja Layout 2020 — encabezado puede estar en cualquier fila de las primeras 15. */
 function readLayout2020Sheet(sheet) {
   const nH = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
+
+  // Columnas críticas que DEBEN aparecer en la fila de encabezado
+  const CRITICAL = new Set(["pedimento","fraccionnico","descripcion","seccalc",
+                             "pais_origen","paisorigen","valormpdolares","cantidad_comercial"]);
+
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return { layoutRows: [], headerRowIdx: 0, rawHeaders: [], rawRows: [], colIdx: {} };
 
-  // Encontrar fila de cabecera: primera con ≥ 5 celdas no vacías
+  // Buscar la fila con más coincidencias de nombres de columna conocidos (hasta fila 15)
   let hdrI = 0;
-  for (let i = 0; i < Math.min(rows.length, 5); i++) {
-    if (rows[i].filter(c => c !== "" && c != null).length >= 5) { hdrI = i; break; }
+  let bestHits = 0;
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    const hits = rows[i].filter(c => CRITICAL.has(nH(c))).length;
+    if (hits > bestHits) { bestHits = hits; hdrI = i; }
+    if (hits >= 4) break; // suficientes coincidencias, detenerse
+  }
+  // Fallback: si no se encontraron coincidencias, tomar primera fila con ≥10 celdas no vacías
+  if (bestHits === 0) {
+    for (let i = 0; i < Math.min(rows.length, 15); i++) {
+      if (rows[i].filter(c => c !== "" && c != null).length >= 10) { hdrI = i; break; }
+    }
   }
   const rawHeaders = (rows[hdrI] || []).map(c => String(c ?? "").trim());
 
@@ -1744,16 +1758,19 @@ function readLayout2020Sheet(sheet) {
     return rawHeaders.reduce((last, h, i) => ts.includes(nH(h)) ? i : last, -1);
   };
   const colIdx = {
+    // "pedimento" tiene varias ocurrencias: la ÚLTIMA es la cadena "400-3459-XXXX"
     pedimento: findLast("pedimento"),
-    frac:      findLast("FraccionNico"),
-    desc:      findLast("descripcion","descripcionmercancia"),
-    pais:      findLast("pais_origen","paisorigen","paisorigendestino"),
-    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
-    val:       findLast("ValorMPDolares","valormpdolares","valordolares","vcusd"),
-    sec:       findLast("SEC CALC","seccalc","secuenciaped"),
+    frac:      findLast("FraccionNico","fraccionnico"),
+    desc:      findLast("descripcion","descripcionmercancia","clase_descripcion"),
+    pais:      findLast("pais_origen","paisorigen","paisorigendestino","pais_origen PARA LAYOUT"),
+    cant:      findLast("cantidad_comercial","cantidadcomercial","cantidadumc","CantidadUMComercial"),
+    val:       findLast("ValorMPDolares","valormpdolares","valordolares","vcusd","Valor ME"),
+    sec:       findLast("SEC CALC","seccalc","secuenciaped","SecuenciaPed"),
     notas:     findLast("NOTAS"),
     estado:    findLast("ESTADO"),
   };
+  // Log de diagnóstico (visible en consola del browser)
+  console.log("[2020] headerRow detectado en índice:", hdrI, "| colIdx:", colIdx);
 
   const layoutRows = [];
   for (let i = hdrI + 1; i < rows.length; i++) {
