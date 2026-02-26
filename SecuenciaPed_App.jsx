@@ -2036,6 +2036,38 @@ function runCascade2020(layoutRows, dsRows) {
       if (candsE5.length === 1) { matched = candsE5[0]; estrategia = "E5"; }
     }
 
+    // E0b: Completar una secuencia parcialmente verificada en E0 ──────────────
+    // Se aplica cuando E1-E5 no encuentran candidato disponible (la secuencia
+    // fue marcada como "usada" en E0), PERO el grupo actual encaja dentro del
+    // remanente de la secuencia DS (total proyectado ≤ DS_cant × 1.05).
+    // Ej: DS sec3=6,018,000 → E0 verificó 141 filas MEX (6,017,300) →
+    //     queda remanente ~700 ud → fila USA (700) encaja → asigna sec3.
+    if (!matched) {
+      // Construir mapa de totales ya verificados en E0 por ped|||frac
+      // (se recalcula inline para no necesitar un pre-pass global)
+      const dsCands = (dsByPF.get(`${ped}|||${frac}`) || []);
+      for (const dsR of dsCands) {
+        if (!usedDS.has(dsR._dsIdx)) continue; // solo candidatos ya usados
+        const dsCant = parseFloat(dsR["CantidadUMComercial"]) || 0;
+        // Cuánto ya verificamos de esta DS row en E0
+        let verifiedCant = 0;
+        for (const lRow of layoutRows) {
+          const a0 = assignment.get(lRow._idx);
+          if (a0?.status === "ok" && a0.dsRow?._dsIdx === dsR._dsIdx) {
+            verifiedCant += lRow.Cantidad;
+          }
+        }
+        const remanente  = dsCant - verifiedCant;
+        const proyectado = verifiedCant + sumCant;
+        // Asigna si el grupo completa el remanente (dentro de 5% del total DS)
+        if (sumCant > 0 && proyectado <= dsCant * 1.05) {
+          matched = dsR;
+          estrategia = "E0b";
+          break;
+        }
+      }
+    }
+
     if (matched) {
       usedDS.add(matched._dsIdx);
       const newSec = normStr(matched["SecuenciaFraccion"]);
@@ -2074,7 +2106,7 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
-  // Secuencias DS no usadas
+  // Secuencias DS no usadas (ni E0 ni E0b ni E1-E5)
   const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx));
   const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
   for (const a of assignment.values()) {
@@ -2095,27 +2127,58 @@ function runCascade2020(layoutRows, dsRows) {
     if (row.noIncluir) g.noInc++;
   }
 
+  const fmt = n => Number(n).toLocaleString("es-MX", { maximumFractionDigits: 0 });
+
+  // Calcular totales Layout ASIGNADOS por DS row (para comparar con DS)
+  const assignedTotalsByDS = new Map(); // _dsIdx → { cant, val }
+  for (const row of layoutRows) {
+    const a = assignment.get(row._idx);
+    if (!a || a.status === "unmatched" || !a.dsRow) continue;
+    const di = a.dsRow._dsIdx;
+    if (!assignedTotalsByDS.has(di)) assignedTotalsByDS.set(di, { cant: 0, val: 0 });
+    const g = assignedTotalsByDS.get(di);
+    g.cant += row.Cantidad; g.val += row.ValorUSD;
+  }
+
   const mismatchReasons = new Map(); // _dsIdx → reason string
-  for (const dsRow of unusedDS) {
-    const frac = nFrac(normStr(dsRow["Fraccion"]));
-    const k    = `${normStr(dsRow["Pedimento2"])}|||${frac}`;
-    const g    = layoutTotals.get(k);
+  // Para DS usadas: verificar si el total Layout coincide con DS
+  for (const dsRow of dsRows) {
     const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
     const dsVal  = parseFloat(dsRow["ValorDolares"])        || 0;
-    let reason;
-    if (!g) {
-      reason = `Fracción ${dsRow["Fraccion"]} no encontrada en Layout para ped. ${dsRow["Pedimento2"]}`;
-    } else if (g.noInc === g.rows) {
-      reason = `Todas las filas Layout (${g.rows}) marcadas NO INCLUIR`;
-    } else {
-      const diffCant = Math.abs(g.cant - dsCant);
-      const diffVal  = Math.abs(g.val  - dsVal);
-      const pctCant  = dsCant > 0 ? (diffCant / dsCant * 100).toFixed(0) : "∞";
-      const pctVal   = dsVal  > 0 ? (diffVal  / dsVal  * 100).toFixed(0) : "∞";
-      const fmt = n => Number(n).toLocaleString("es-MX", { maximumFractionDigits: 0 });
-      reason = `Sin concordancia — Cant.Layout=${fmt(g.cant)} vs DS=${fmt(dsCant)} (+${pctCant}%) | Valor Layout=$${fmt(g.val)} vs DS=$${fmt(dsVal)} (+${pctVal}%)`;
+    const asg    = assignedTotalsByDS.get(dsRow._dsIdx);
+
+    if (!usedDS.has(dsRow._dsIdx)) {
+      // DS no usada → calcular motivo
+      const frac = nFrac(normStr(dsRow["Fraccion"]));
+      const k    = `${normStr(dsRow["Pedimento2"])}|||${frac}`;
+      const g    = layoutTotals.get(k);
+      let reason;
+      if (!g) {
+        reason = `Fracción ${dsRow["Fraccion"]} no encontrada en Layout (ped. ${dsRow["Pedimento2"]})`;
+      } else if (g.noInc === g.rows) {
+        reason = `Todas las filas Layout (${g.rows}) marcadas NO INCLUIR`;
+      } else {
+        const diffCant = g.cant - dsCant;
+        const diffVal  = g.val  - dsVal;
+        const pctCant  = dsCant > 0 ? (diffCant / dsCant * 100).toFixed(0) : "∞";
+        const pctVal   = dsVal  > 0 ? (diffVal  / dsVal  * 100).toFixed(0) : "∞";
+        reason = `Sin concordancia — Cant.Layout=${fmt(g.cant)} vs DS=${fmt(dsCant)} (${diffCant>=0?"+":""}${pctCant}%) | Valor Layout=$${fmt(g.val)} vs DS=$${fmt(dsVal)} (${diffVal>=0?"+":""}${pctVal}%)`;
+      }
+      mismatchReasons.set(dsRow._dsIdx, reason);
+    } else if (asg) {
+      // DS usada: verificar si el total asignado coincide con DS
+      const diffCant = Math.abs(asg.cant - dsCant);
+      const diffVal  = Math.abs(asg.val  - dsVal);
+      const tolCant  = Math.max(5, dsCant * 0.01); // tolerancia 1%
+      const tolVal   = Math.max(5, dsVal  * 0.01);
+      if (diffCant > tolCant || diffVal > tolVal) {
+        const pctC = dsCant > 0 ? ((asg.cant - dsCant) / dsCant * 100).toFixed(1) : "∞";
+        const pctV = dsVal  > 0 ? ((asg.val  - dsVal)  / dsVal  * 100).toFixed(1) : "∞";
+        mismatchReasons.set(dsRow._dsIdx,
+          `⚠ DISCREPANCIA — Cant.Layout=${fmt(asg.cant)} vs DS=${fmt(dsCant)} (${pctC}%) | Valor Layout=$${fmt(asg.val)} vs DS=$${fmt(dsVal)} (${pctV}%)`
+        );
+      }
     }
-    mismatchReasons.set(dsRow._dsIdx, reason);
   }
 
   return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons };
