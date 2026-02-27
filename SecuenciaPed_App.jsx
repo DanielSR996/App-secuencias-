@@ -139,13 +139,11 @@ function tryMatch(candidates, sumCant, sumVCUSD, tolCant = 1, tolVCUSD = 2) {
  * Detecta el caso donde el mismo material entró en varios lotes del mismo pedimento.
  * Limita el pool a 12 para evitar explosión combinatoria (12C3 = 220 iteraciones máx.).
  */
-function tryMatchCombination(candidates, sumCant, sumVCUSD, tolPct = 0.02) {
+function tryMatchCombination(candidates, sumCant, sumVCUSD, tolC = 1, tolV = 4) {
   const pool = candidates
     .filter((r) => (parseFloat(r["CantidadUMComercial"]) || 0) > 0)
     .slice(0, 12);
-  const n    = pool.length;
-  const tolC = Math.max(2, sumCant  * tolPct);
-  const tolV = Math.max(5, sumVCUSD * tolPct);
+  const n = pool.length;
 
   // Pares
   for (let i = 0; i < n - 1; i++) {
@@ -300,40 +298,14 @@ function runCascade(layoutRows, s551Rows) {
   const correctionMap = new Map(); // rowIdx → [{field, original, corrected}]
   const strategyStats = { E0: 0, E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0 };
 
-  // Almacena el registro 551 que generó el match; auto-detecta correcciones de País/Fracción.
-  const assignRows = (rows, seq, strategy, r551 = null, extraCorrections = []) => {
+  // Asigna filas a secuencia 551. NO modifica país, fracción ni descripción del Layout.
+  const assignRows = (rows, seq, strategy, r551 = null) => {
     for (const r of rows) {
       if (!assigned.has(r._idx)) {
         assignment.set(r._idx, { seq, strategy, r551 });
         assigned.add(r._idx);
         strategyStats[strategy]++;
         if (r551?._551idx !== undefined) used551.add(r551._551idx);
-
-        const corrs = [...extraCorrections];
-        if (r551) {
-          // Corrección automática de PaisOrigen: llena si está vacío o difiere del 551
-          const pais551 = String(r551[S_PAIS] ?? "").trim();
-          const paisL   = String(r[L_PAIS]   ?? "").trim();
-          if (pais551 && paisL !== pais551 &&
-              !corrs.some((c) => c.field === "PaisOrigen")) {
-            corrs.push({ field: "PaisOrigen", original: paisL, corrected: pais551 });
-          }
-          // Corrección automática de FraccionNico: llena si está vacío o difiere (normalizada)
-          const frac551raw = String(r551[S_FRAC] ?? "").trim();
-          const fracLraw   = String(r[L_FRAC]   ?? "").trim();
-          if (frac551raw && nFrac(fracLraw) !== nFrac(frac551raw) &&
-              !corrs.some((c) => c.field === "FraccionNico")) {
-            corrs.push({ field: "FraccionNico", original: fracLraw, corrected: frac551raw });
-          }
-          // Corrección automática de Descripcion: llena si está vacío o difiere del 551
-          const desc551 = String(r551["DescripcionMercancia"] ?? "").trim();
-          const descL   = String(r["Descripcion"]             ?? "").trim();
-          if (desc551 && descL !== desc551 &&
-              !corrs.some((c) => c.field === "Descripcion")) {
-            corrs.push({ field: "Descripcion", original: descL, corrected: desc551 });
-          }
-        }
-        if (corrs.length > 0) correctionMap.set(r._idx, corrs);
       }
     }
   };
@@ -362,12 +334,12 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── E1: Pedimento + Fracción + País, cantidades exactas (±1 ud / ±2 USD) ──
+  // ── E1: Pedimento + Fracción + País, cantidades exactas (±1 ud / ±4 USD) ──
   for (const g of groupBy(layout, [L_PED, "_frac", L_PAIS])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const cands = lookupPFP.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatch(cands, cant, vcusd, 1, 2);
+    const match = tryMatch(cands, cant, vcusd, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E1", match.r551);
   }
 
@@ -376,7 +348,7 @@ function runCascade(layoutRows, s551Rows) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const cands = lookupPFP.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatch(cands, cant, vcusd, 1, 2);
+    const match = tryMatch(cands, cant, vcusd, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E2", match.r551);
   }
 
@@ -385,7 +357,7 @@ function runCascade(layoutRows, s551Rows) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatch(cands, cant, vcusd, 1, 2);
+    const match = tryMatch(cands, cant, vcusd, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E3", match.r551);
   }
 
@@ -394,24 +366,22 @@ function runCascade(layoutRows, s551Rows) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatch(cands, cant, vcusd, 1, 2);
+    const match = tryMatch(cands, cant, vcusd, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E4", match.r551);
   }
 
-  // ── E5: Tolerancia ampliada ±5% ──────────────────────────────────────────
+  // ── E5: Tolerancia estricta ±1 ud / ±4 USD (igual que E1-E4) ──────────────
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const tolCant  = Math.max(2, cant  * 0.05);
-    const tolVCUSD = Math.max(5, vcusd * 0.05);
-    const match = tryMatch(cands, cant, vcusd, tolCant, tolVCUSD);
+    const match = tryMatch(cands, cant, vcusd, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E5", match.r551);
   }
 
   // ── E6: Suma de combinaciones (2 o 3 secuencias del 551) ──────────────────
   // Resuelve cuando el mismo material ingresó en múltiples lotes del mismo pedimento
-  // y la suma de 2 o 3 entradas del 551 iguala la suma del grupo Layout (±2%).
+  // y la suma de 2 o 3 entradas del 551 iguala la suma del grupo Layout (±1 cant / ±4 val).
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
     const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
@@ -420,7 +390,7 @@ function runCascade(layoutRows, s551Rows) {
     const cands    = pfpCands.length >= 2 ? pfpCands : (lookupPF.get(kPF) || []);
     if (cands.length < 2) continue;
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const combo = tryMatchCombination(cands, cant, vcusd);
+    const combo = tryMatchCombination(cands, cant, vcusd, 1, 4);
     if (!combo) continue;
 
     // Particionar filas del Layout entre los candidatos: greedy por quota restante
@@ -445,9 +415,7 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── E7: Precio unitario ($/pieza) como discriminador ──────────────────────
-  // Cuando los totales no coinciden, el precio por unidad identifica el material.
-  // Tolerancia ±15%. Agrupa por SecuenciaPed existente para sub-grupos más finos.
+  // ── E7: Precio unitario ($/pieza) como discriminador — solo si Cant±1 y Val±4 ──
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
     const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
@@ -455,62 +423,46 @@ function runCascade(layoutRows, s551Rows) {
       ? lookupPFP.get(kPFP)
       : (lookupPF.get(kPF) || []);
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatchUnitPrice(cands, cant, vcusd, 0.15);
+    const match = tryMatchUnitPrice(cands, cant, vcusd, 0.15, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E7", match.r551);
   }
 
-  // ── E8: Asignación por eliminación ────────────────────────────────────────
-  // Último recurso: filtra candidatos del 551 ya usados y asigna el único restante
-  // (o el de precio unitario más cercano con tolerancia ampliada ±30%).
+  // ── E8: Asignación por eliminación — solo si Cant±1 y Val±4 ───────────────
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac"])) {
     const k     = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = (lookupPF.get(k) || []).filter((r) => !used551.has(r._551idx));
     if (cands.length === 0) continue;
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = cands.length === 1
+    const match = cands.length === 1 && Math.abs(cant - (parseFloat(cands[0]["CantidadUMComercial"])||0)) <= 1 && Math.abs(vcusd - (parseFloat(cands[0]["ValorDolares"])||0)) <= 4
       ? { seq: cands[0][S_SEQ], r551: cands[0] }
-      : tryMatchUnitPrice(cands, cant, vcusd, 0.30);
+      : tryMatchUnitPrice(cands, cant, vcusd, 0.30, 1, 4);
     if (match) assignRows(g.rows, match.seq, "E8", match.r551);
   }
 
-  // ── E9: Mismo capítulo arancelario (4 dígitos) — corrige FraccionNico ─────
-  // El 551 es la fuente oficial: si el material encaja por pedimento + mismos 4 dígitos
-  // de fracción + precio unitario, la fracción del Layout se corrige por la del 551.
+  // ── E9: Mismo capítulo arancelario (4 dígitos) — sin modificar Layout ─────
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
     const chap  = String(g.keyVals[1]).slice(0, 4);
     const kPC   = `${g.keyVals[0]}|||${chap}`;
     const cands = (lookupPChap.get(kPC) || []).filter((r) => !used551.has(r._551idx));
     if (!cands.length) continue;
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const match = tryMatch(cands, cant, vcusd, 2, 5) || tryMatchUnitPrice(cands, cant, vcusd, 0.20);
-    if (!match) continue;
-    const corrFrac = String(g.keyVals[1]) !== match.r551._frac
-      ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: match.r551._frac }]
-      : [];
-    assignRows(g.rows, match.seq, "E9", match.r551, corrFrac);
+    const match = tryMatch(cands, cant, vcusd, 1, 4) || tryMatchUnitPrice(cands, cant, vcusd, 0.20, 1, 4);
+    if (match) assignRows(g.rows, match.seq, "E9", match.r551);
   }
 
-  // ── E10: Solo Pedimento + precio unitario — corrige Fracción y País ────────
-  // Último fallback por pedimento completo. Usa precio por pieza como discriminador
-  // con tolerancia ±25%. Si solo queda 1 candidato sin usar, lo asigna directamente.
+  // ── E10: Solo Pedimento + precio unitario — solo si Cant±1 y Val±4 ────────
   for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
     const kP    = String(g.keyVals[0]);
     const cands = (lookupP.get(kP) || []).filter((r) => !used551.has(r._551idx));
     if (!cands.length) continue;
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
-    const matchUP = tryMatchUnitPrice(cands, cant, vcusd, 0.25);
-    const match   = matchUP || (cands.length === 1 ? { seq: cands[0][S_SEQ], r551: cands[0] } : null);
-    if (!match) continue;
-    const corrFrac = String(g.keyVals[1]) !== match.r551._frac
-      ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: match.r551._frac }]
-      : [];
-    assignRows(g.rows, match.seq, "E10", match.r551, corrFrac);
+    const matchUP = tryMatchUnitPrice(cands, cant, vcusd, 0.25, 1, 4);
+    const match   = matchUP || (cands.length === 1 && Math.abs(cant - (parseFloat(cands[0]["CantidadUMComercial"])||0)) <= 1 && Math.abs(vcusd - (parseFloat(cands[0]["ValorDolares"])||0)) <= 4
+      ? { seq: cands[0][S_SEQ], r551: cands[0] } : null);
+    if (match) assignRows(g.rows, match.seq, "E10", match.r551);
   }
 
-  // ── E11: Fuerza 1:1 greedy por precio unitario dentro del pedimento ────────
-  // Para los que quedan: empareja grupos Layout con secuencias 551 no usadas
-  // del mismo pedimento, ordenando por precio unitario más cercano (±sin límite).
-  // Marca todas las correcciones de fracción/país que sean necesarias.
+  // ── E11: Fuerza 1:1 greedy por precio unitario — solo si Cant±1 y Val±4 ───
   {
     const pendGrps = groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS]);
     const pedMap   = new Map();
@@ -532,19 +484,20 @@ function runCascade(layoutRows, s551Rows) {
       for (const grp of grps) {
         const unassigned = grp.rows.filter((r) => !assigned.has(r._idx));
         if (!unassigned.length) continue;
+        const { cant, vcusd } = sumGroup(grp.rows, L_CANT, L_VCUSD);
         let best = null, bestDiff = Infinity;
         for (let si = 0; si < avail.length; si++) {
           if (usedInE11.has(si)) continue;
+          const r = avail[si].r551;
+          const c551 = parseFloat(r["CantidadUMComercial"]) || 0;
+          const v551 = parseFloat(r["ValorDolares"]) || 0;
+          if (Math.abs(cant - c551) > 1 || Math.abs(vcusd - v551) > 4) continue;
           const diff = Math.abs(avail[si].up - grp.up) / Math.max(grp.up, 0.0001);
           if (diff < bestDiff) { bestDiff = diff; best = si; }
         }
         if (best === null) continue;
         usedInE11.add(best);
-        const r551m    = avail[best].r551;
-        const corrFrac = String(grp.keyVals[1]) !== r551m._frac
-          ? [{ field: "FraccionNico", original: String(grp.keyVals[1]), corrected: r551m._frac }]
-          : [];
-        assignRows(unassigned, r551m[S_SEQ], "E11", r551m, corrFrac);
+        assignRows(unassigned, avail[best].r551[S_SEQ], "E11", avail[best].r551);
       }
     }
   }
@@ -1921,10 +1874,35 @@ function readLayout2020Sheet(sheet) {
   return { layoutRows, headerRowIdx: hdrI, colIdx };
 }
 
-/** Cascade 2020: verifica secuencias existentes y asigna las que faltan. */
+/** Cascade 2020: verifica secuencias existentes y asigna las que faltan.
+ *
+ *  PRINCIPIO (como consultor de comercio exterior):
+ *  Cada secuencia del DS tiene Fraccion + Descripcion + PaisOrigenDestino +
+ *  CantidadUMComercial + ValorDolares. En el Layout, las filas con la misma
+ *  fracción y descripción (normalizada) forman el grupo que debe coincidir con
+ *  esa secuencia DS, SIN importar si el país difiere — el DS puede registrar
+ *  país MEX mientras el Layout tiene MEX+CHN+USA+TWN (todos entran con ese país
+ *  de la sec, no se corrige el país).
+ *
+ *  Tolerancia permitida: ±1 unidad en Cantidad, ±4 USD en Valor.
+ *  Si los totales globales DS = Layout cuadran, todas las filas deben asignarse.
+ */
 function runCascade2020(layoutRows, dsRows) {
   const nFrac = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
   const normStr = (v) => String(v ?? "").trim();
+  // Normaliza descripción: lowercase, collapse whitespace, quita paréntesis redundantes
+  const nDesc = (s) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+
+  const dsTotalC = dsRows.reduce((a,r)=>a+(parseFloat(r["CantidadUMComercial"])||0),0);
+  const dsTotalV = dsRows.reduce((a,r)=>a+(parseFloat(r["ValorDolares"])||0),0);
+  const lyTotalC = layoutRows.filter(r=>!r.noIncluir).reduce((a,r)=>a+r.Cantidad,0);
+  const lyTotalV = layoutRows.filter(r=>!r.noIncluir).reduce((a,r)=>a+r.ValorUSD,0);
+  const diffC = Math.abs(lyTotalC - dsTotalC);
+  const diffV = Math.abs(lyTotalV - dsTotalV);
+  const globalCuadra = diffC <= 1 && diffV <= 5;
+  if (diffC > 1 || diffV > 5) {
+    console.warn("[Cascade2020] Total global: Layout Cant=", lyTotalC, "Val=", lyTotalV, "| DS Cant=", dsTotalC, "Val=", dsTotalV, "| diff Cant=", diffC, "Val=", diffV);
+  }
   // Una secuencia es "real" si es un número válido (no ".", no vacío)
   const isRealSec = (v) => {
     const s = normStr(v);
@@ -1935,6 +1913,7 @@ function runCascade2020(layoutRows, dsRows) {
   const dsByCandado  = new Map(); // "Candado 551" → dsRow
   const dsByPFP      = new Map(); // Pedimento2|||Fraccion|||Pais → [dsRow]
   const dsByPF       = new Map(); // Pedimento2|||Fraccion → [dsRow]
+  const dsByPFDesc   = new Map(); // Pedimento2|||Fraccion|||DescNorm → [dsRow]
   const usedDS       = new Set();
 
   for (const r of dsRows) {
@@ -1944,6 +1923,7 @@ function runCascade2020(layoutRows, dsRows) {
     const ped2 = normStr(r["Pedimento2"]);
     const frac = nFrac(normStr(r["Fraccion"]));
     const pais = normStr(r["PaisOrigenDestino"]);
+    const desc = nDesc(r["DescripcionMercancia"]);
 
     const kPFP = `${ped2}|||${frac}|||${pais}`;
     if (!dsByPFP.has(kPFP)) dsByPFP.set(kPFP, []);
@@ -1952,10 +1932,14 @@ function runCascade2020(layoutRows, dsRows) {
     const kPF = `${ped2}|||${frac}`;
     if (!dsByPF.has(kPF)) dsByPF.set(kPF, []);
     dsByPF.get(kPF).push(r);
+
+    const kPFD = `${ped2}|||${frac}|||${desc}`;
+    if (!dsByPFDesc.has(kPFD)) dsByPFDesc.set(kPFD, []);
+    dsByPFDesc.get(kPFD).push(r);
   }
 
-  // Función de match por cantidades (tolerancia ±1 ud / ±2 USD)
-  const tryMatchQty = (cands, sumCant, sumVal, tolC = 1, tolV = 2) => {
+  // Match por cantidades: tolerancia estricta ±1 ud / ±4 USD (comercio exterior)
+  const tryMatchQty = (cands, sumCant, sumVal, tolC = 1, tolV = 4) => {
     for (const r of cands) {
       if (usedDS.has(r._dsIdx)) continue;
       const c = parseFloat(r["CantidadUMComercial"]) || 0;
@@ -1980,11 +1964,45 @@ function runCascade2020(layoutRows, dsRows) {
     return best;
   };
 
-  // Suma de 2 o 3 secuencias DS que coincida con total (para E6 multi-sec)
-  const tryMatchCombo = (cands, sumCant, sumVal, tolPct = 0.005) => {
+  // findSubset: busca un subconjunto de filas que sume exactamente (dsCant, dsVal)
+  // Ordena por cant ascendente para las secs pequeñas, desc para las grandes
+  const findSubset = (rows, dsCant, dsVal, tolC = 1, tolV = 4) => {
+    if (rows.length === 0) return null;
+    const totalC = rows.reduce((a,r)=>a+r.Cantidad,0);
+    if (Math.abs(totalC - dsCant) <= tolC) {
+      const totalV = rows.reduce((a,r)=>a+r.ValorUSD,0);
+      if (Math.abs(totalV - dsVal) <= tolV) return rows; // el grupo completo coincide
+    }
+    // Buscar subconjunto: ordenar por cant asc, acumular hasta llegar a dsCant
+    const sorted = [...rows].sort((a,b) => a.Cantidad - b.Cantidad);
+    for (let start = 0; start < Math.min(sorted.length, 150); start++) {
+      let sumC = 0, sumV = 0, subset = [];
+      for (let j = start; j < sorted.length; j++) {
+        if (sumC + sorted[j].Cantidad > dsCant + tolC) break;
+        subset.push(sorted[j]);
+        sumC += sorted[j].Cantidad;
+        sumV += sorted[j].ValorUSD;
+        if (Math.abs(sumC - dsCant) <= tolC && Math.abs(sumV - dsVal) <= tolV) return subset;
+      }
+    }
+    // También probar orden descendente (secs grandes)
+    const sortedDesc = [...rows].sort((a,b) => b.Cantidad - a.Cantidad);
+    for (let start = 0; start < Math.min(sortedDesc.length, 150); start++) {
+      let sumC = 0, sumV = 0, subset = [];
+      for (let j = start; j < sortedDesc.length; j++) {
+        if (sumC + sortedDesc[j].Cantidad > dsCant + tolC && subset.length > 0) break;
+        subset.push(sortedDesc[j]);
+        sumC += sortedDesc[j].Cantidad;
+        sumV += sortedDesc[j].ValorUSD;
+        if (Math.abs(sumC - dsCant) <= tolC && Math.abs(sumV - dsVal) <= tolV) return subset;
+      }
+    }
+    return null;
+  };
+
+  // Suma de 2 o 3 secuencias DS que coincida con total (tolerancia ±1 cant, ±4 val)
+  const tryMatchCombo = (cands, sumCant, sumVal, tolC = 1, tolV = 4) => {
     const pool = cands.filter(r => !usedDS.has(r._dsIdx)).slice(0, 12);
-    const tolC = Math.max(5, sumCant * tolPct);
-    const tolV = Math.max(5, sumVal * tolPct);
     for (let i = 0; i < pool.length - 1; i++) {
       for (let j = i + 1; j < pool.length; j++) {
         const c = (parseFloat(pool[i]["CantidadUMComercial"]) || 0) + (parseFloat(pool[j]["CantidadUMComercial"]) || 0);
@@ -2016,270 +2034,252 @@ function runCascade2020(layoutRows, dsRows) {
     const dsRow = dsByCandado.get(candado);
     if (dsRow) {
       usedDS.add(dsRow._dsIdx);
-      // Verificar también coherencia de campos (pais, frac, desc)
-      const corrs = [];
-      const pais551 = normStr(dsRow["PaisOrigenDestino"]);
-      const frac551 = nFrac(normStr(dsRow["Fraccion"]));
-      if (pais551 && normStr(row.PaisOrigen) !== pais551)
-        corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
-      if (frac551 && nFrac(row.FraccionNico) !== frac551)
-        corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(dsRow["Fraccion"]) });
-      assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: corrs,
+      assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: [],
         reason: "OK — Secuencia verificada contra DS 2020" });
     }
     // Si no matchea, se procesa en la segunda pasada
   }
 
-  // ── E1–E5: Asignar filas sin secuencia o cuya secuencia no coincidió ─────
-  // Agrupar por Pedimento + FraccionNico + PaisOrigen
-  const groups = new Map();
+  // ── E1–E7: Asignar filas sin secuencia (o cuya sec no coincidió en E0) ────
+  // Agrupamos por DOS criterios en paralelo:
+  //   1. Ped+Frac+Pais  (tradicional, para casos exactos por país)
+  //   2. Ped+Frac+DescNorm  (nuevo, para casos donde DS agrupa por descripción
+  //      y el Layout mezcla países con la misma descripción)
+
+  const groupsByPais = new Map(); // Ped|||Frac|||Pais → rows
+  const groupsByDesc = new Map(); // Ped|||Frac|||DescNorm → rows
   for (const row of layoutRows) {
-    if (row.noIncluir) continue;          // filas "NO INCLUIR" → no asignar
+    if (row.noIncluir) continue;
     const a = assignment.get(row._idx);
-    if (a?.status === "ok") continue;     // ya verificada en E0
-    const key = `${row.Pedimento}|||${nFrac(row.FraccionNico)}|||${normStr(row.PaisOrigen)}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(row);
+    if (a?.status === "ok") continue;
+    const ped  = row.Pedimento;
+    const frac = nFrac(row.FraccionNico);
+    const pais = normStr(row.PaisOrigen);
+    const desc = nDesc(row.Descripcion);
+    const kP  = `${ped}|||${frac}|||${pais}`;
+    const kD  = `${ped}|||${frac}|||${desc}`;
+    if (!groupsByPais.has(kP)) groupsByPais.set(kP, []);
+    groupsByPais.get(kP).push(row);
+    if (!groupsByDesc.has(kD)) groupsByDesc.set(kD, []);
+    groupsByDesc.get(kD).push(row);
   }
 
-  // E6: Agregado por Ped+Frac — cuando Layout tiene varios Pais pero DS tiene uno (o suma)
-  // Ej: DS 85322999 MEX 1,039,360 | Layout 85322999 JPN+CHN+TWN+THA = 1,039,360
-  const aggregatesPF = new Map(); // Ped|||Frac → { sumCant, sumVal, keys[] }
-  for (const [key, rows] of groups) {
-    const [ped, frac] = key.split("|||").slice(0, 2);
-    const kPF = `${ped}|||${frac}`;
-    if (!aggregatesPF.has(kPF)) aggregatesPF.set(kPF, { sumCant: 0, sumVal: 0, keys: [] });
-    const ag = aggregatesPF.get(kPF);
-    ag.sumCant += rows.reduce((a, r) => a + r.Cantidad, 0);
-    ag.sumVal  += rows.reduce((a, r) => a + r.ValorUSD, 0);
-    ag.keys.push(key);
+  // ── Helper: asignar un subconjunto de filas a una secuencia DS ───────────
+  const assignRows = (rows, dsRow, estrategia) => {
+    const newSec = normStr(dsRow["SecuenciaFraccion"]);
+    const sumC = rows.reduce((a,r)=>a+r.Cantidad,0);
+    const sumV = rows.reduce((a,r)=>a+r.ValorUSD,0);
+    const dsCant = parseFloat(dsRow["CantidadUMComercial"])||0;
+    const dsVal  = parseFloat(dsRow["ValorDolares"])||0;
+    usedDS.add(dsRow._dsIdx);
+    for (const row of rows) {
+      assignment.set(row._idx, {
+        status: isRealSec(row.SecCalc) ? "corrected" : "new",
+        newSec, dsRow, corrections: [], estrategia,
+        reason: `[${estrategia}] Sec=${newSec} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`,
+      });
+    }
+  };
+
+  // ── FASE A: Para cada DS row, buscar Layout por Ped+Frac+Desc ────────────
+  // Esto resuelve el caso PRUEBA 1: DS 85049099/CAJA vs Layout 85049099/CAJA MEX+CHN+USA+TWN
+  // Ordena secuencias DS de menor a mayor cant (asigna las más pequeñas primero)
+  const dsSorted = [...dsRows].filter(r => !usedDS.has(r._dsIdx))
+    .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
+
+  for (const dsRow of dsSorted) {
+    if (usedDS.has(dsRow._dsIdx)) continue;
+    const ped2  = normStr(dsRow["Pedimento2"]);
+    const frac  = nFrac(normStr(dsRow["Fraccion"]));
+    const desc  = nDesc(dsRow["DescripcionMercancia"]);
+    const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+    const dsVal  = parseFloat(dsRow["ValorDolares"])        || 0;
+
+    // --- A1: Grupo Layout cuya suma Ped+Frac+Desc coincida exactamente ---
+    const kD = `${ped2}|||${frac}|||${desc}`;
+    const grpDesc = (groupsByDesc.get(kD) || []).filter(r => !assignment.has(r._idx));
+    if (grpDesc.length > 0) {
+      const sumC = grpDesc.reduce((a,r)=>a+r.Cantidad,0);
+      const sumV = grpDesc.reduce((a,r)=>a+r.ValorUSD,0);
+      if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
+        assignRows(grpDesc, dsRow, "A1");
+        continue;
+      }
+      // Quizá solo es un subconjunto (misma desc pero DS tiene varias secs)
+      // → ver si un subconjunto de grpDesc suma exactamente (búsqueda greedy)
+      const subset = findSubset(grpDesc, dsCant, dsVal, 1, 4);
+      if (subset) { assignRows(subset, dsRow, "A1b"); continue; }
+    }
+
+    // --- A2: Grupo Layout por Ped+Frac+Pais exacto ---
+    const pais = normStr(dsRow["PaisOrigenDestino"]);
+    const kP   = `${ped2}|||${frac}|||${pais}`;
+    const grpPais = (groupsByPais.get(kP) || []).filter(r => !assignment.has(r._idx));
+    if (grpPais.length > 0) {
+      const sumC = grpPais.reduce((a,r)=>a+r.Cantidad,0);
+      const sumV = grpPais.reduce((a,r)=>a+r.ValorUSD,0);
+      if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
+        assignRows(grpPais, dsRow, "A2");
+        continue;
+      }
+      const subset = findSubset(grpPais, dsCant, dsVal, 1, 4);
+      if (subset) { assignRows(subset, dsRow, "A2b"); continue; }
+    }
+
+    // --- A3: Ped+Frac sin restricción (total o subconjunto = DS) ---
+    const kPF  = `${ped2}|||${frac}`;
+    const allPFRows = [...groupsByPais.entries()]
+      .filter(([k]) => k.startsWith(kPF + "|||"))
+      .flatMap(([,rows]) => rows)
+      .filter(r => !assignment.has(r._idx));
+    if (allPFRows.length > 0) {
+      const sumC = allPFRows.reduce((a,r)=>a+r.Cantidad,0);
+      const sumV = allPFRows.reduce((a,r)=>a+r.ValorUSD,0);
+      if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
+        assignRows(allPFRows, dsRow, "A3");
+        continue;
+      }
+      const subset = findSubset(allPFRows, dsCant, dsVal, 1, 4);
+      if (subset) { assignRows(subset, dsRow, "A3b"); continue; }
+    }
+
+    // --- A1_fuzzy: Desc parcial — primer 50% de la desc DS coincide ---
+    // Para casos donde DS tiene desc corta y Layout tiene desc más larga
+    const descKey50 = desc.slice(0, Math.max(8, Math.floor(desc.length * 0.6)));
+    for (const [k, grp] of groupsByDesc) {
+      if (!k.startsWith(`${ped2}|||${frac}|||`)) continue;
+      const lyDesc = k.split("|||")[2] || "";
+      if (!lyDesc.startsWith(descKey50) && !descKey50.startsWith(lyDesc.slice(0, descKey50.length))) continue;
+      const rows2 = grp.filter(r => !assignment.has(r._idx));
+      if (!rows2.length) continue;
+      const sumC = rows2.reduce((a,r)=>a+r.Cantidad,0);
+      const sumV = rows2.reduce((a,r)=>a+r.ValorUSD,0);
+      if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
+        assignRows(rows2, dsRow, "A1f");
+        break;
+      }
+      const subset = findSubset(rows2, dsCant, dsVal, 1, 4);
+      if (subset) { assignRows(subset, dsRow, "A1fb"); break; }
+    }
+    if (usedDS.has(dsRow._dsIdx)) continue;
   }
 
-  for (const [key, rows] of groups) {
-    if (rows.every(r => assignment.has(r._idx))) continue; // ya asignado por E6 u otro
-    const [ped, frac, pais] = key.split("|||");
-    const sumCant = rows.reduce((a, r) => a + r.Cantidad, 0);
-    const sumVal  = rows.reduce((a, r) => a + r.ValorUSD, 0);
+  // ── FASE A2: Segundo paso — DS aún no usadas, buscar por Ped+Frac total con combo ──
+  // Para casos donde Layout total Ped+Frac = suma de 2-3 DS secs
+  const dsSortedB = [...dsRows].filter(r => !usedDS.has(r._dsIdx))
+    .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
 
-    let matched = null;
-    let estrategia = "";
+  // Agrupar DS no usadas por Ped+Frac
+  const unusedByPF = new Map();
+  for (const dsRow of dsSortedB) {
+    const kPF = `${normStr(dsRow["Pedimento2"])}|||${nFrac(normStr(dsRow["Fraccion"]))}`;
+    if (!unusedByPF.has(kPF)) unusedByPF.set(kPF, []);
+    unusedByPF.get(kPF).push(dsRow);
+  }
 
-    // E1: Ped+Frac+Pais exacto, tolerancia ±1/±2
-    const candsE1 = (dsByPFP.get(`${ped}|||${frac}|||${pais}`) || []);
-    matched = tryMatchQty(candsE1, sumCant, sumVal, 1, 2);
-    if (matched) estrategia = "E1";
+  for (const [kPF, dsList] of unusedByPF) {
+    const allPFRows = [...groupsByPais.entries()]
+      .filter(([k]) => k.startsWith(kPF + "|||"))
+      .flatMap(([,rows]) => rows)
+      .filter(r => !assignment.has(r._idx));
+    if (!allPFRows.length) continue;
 
-    // E2: Sin pais, Ped+Frac ±1/±2
-    if (!matched) {
-      const candsE2 = (dsByPF.get(`${ped}|||${frac}`) || []);
-      matched = tryMatchQty(candsE2, sumCant, sumVal, 1, 2);
-      if (matched) estrategia = "E2";
+    if (dsList.length === 1) {
+      // Ya fue intentado en Fase A, si llegó aquí no hay match exacto — forzar si totales globales coinciden
+      const dsR = dsList[0];
+      const dsCant = parseFloat(dsR["CantidadUMComercial"])||0;
+      const sumC = allPFRows.reduce((a,r)=>a+r.Cantidad,0);
+      const sumV = allPFRows.reduce((a,r)=>a+r.ValorUSD,0);
+      // Si los totales cuadran globalmente, asignar de todas formas
+      if (globalCuadra && Math.abs(sumC - dsCant) <= dsCant * 0.01 + 1) {
+        assignRows(allPFRows, dsR, "A_forzado");
+      }
+      continue;
     }
 
-    // E3: Ped+Frac+Pais, tolerancia ±5%
-    if (!matched) {
-      const tolC = Math.max(2, sumCant * 0.05);
-      const tolV = Math.max(5, sumVal  * 0.05);
-      matched = tryMatchQty(candsE1, sumCant, sumVal, tolC, tolV);
-      if (matched) estrategia = "E3";
-    }
+    // Múltiples DS secs: distribuir filas por descripción o por subconjunto
+    const dsSort = [...dsList].sort((a,b)=>(parseFloat(a["CantidadUMComercial"])||0)-(parseFloat(b["CantidadUMComercial"])||0));
+    let remaining = [...allPFRows];
+    for (let i = 0; i < dsSort.length; i++) {
+      const m = dsSort[i];
+      const dsCant = parseFloat(m["CantidadUMComercial"])||0;
+      const dsVal  = parseFloat(m["ValorDolares"])||0;
+      const dsDescNorm = nDesc(m["DescripcionMercancia"]);
 
-    // E4: Precio unitario ±15%
-    if (!matched) {
-      const candsE4 = (dsByPF.get(`${ped}|||${frac}`) || []);
-      matched = tryMatchUP(candsE4, sumCant, sumVal, 0.15);
-      if (matched) estrategia = "E4";
-    }
-
-    // E5: Único candidato disponible en Ped+Frac (sin restricción)
-    if (!matched) {
-      const candsE5 = (dsByPF.get(`${ped}|||${frac}`) || []).filter(r => !usedDS.has(r._dsIdx));
-      if (candsE5.length === 1) { matched = candsE5[0]; estrategia = "E5"; }
-    }
-
-    // E6: Agregado Ped+Frac — Layout tiene varios Pais, DS tiene uno o suma que coincide
-    // Ej: DS 85322999 MEX 1,039,360 | Layout JPN+CHN+TWN+THA = 1,039,360 → asignar sec a todos
-    if (!matched) {
-      const ag = aggregatesPF.get(`${ped}|||${frac}`);
-      if (ag && ag.keys.length >= 1) {
-        const candsE6 = (dsByPF.get(`${ped}|||${frac}`) || []).filter(r => !usedDS.has(r._dsIdx));
-        const tolE6c = Math.max(5, Math.ceil(ag.sumCant * 0.002));
-        const tolE6v = Math.max(5, Math.ceil(ag.sumVal * 0.002));
-        const allRowsE6 = ag.keys.flatMap(k => groups.get(k) || []);
-
-        // E6a: Una sola sec DS que coincide con el total agregado
-        let dsMatched = tryMatchQty(candsE6, ag.sumCant, ag.sumVal, tolE6c, tolE6v);
-        let dsList = dsMatched ? [dsMatched] : null;
-
-        // E6b: Suma de 2 o 3 sec DS que coincide con el total
-        if (!dsList) dsList = tryMatchCombo(candsE6, ag.sumCant, ag.sumVal, 0.005);
-
-        if (dsList && dsList.length > 0) {
-          // Asignar: si 1 sec → a todos; si 2-3 sec → distribuir por proporción (greedy)
-          if (dsList.length === 1) {
-            const m = dsList[0];
-            usedDS.add(m._dsIdx);
-            const newSec = normStr(m["SecuenciaFraccion"]);
-            const pais551 = normStr(m["PaisOrigenDestino"]);
-            const frac551 = nFrac(normStr(m["Fraccion"]));
-            const desc551 = normStr(m["DescripcionMercancia"]);
-            for (const row of allRowsE6) {
-              const corrs = [];
-              if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
-              if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(m["Fraccion"]) });
-              if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
-              assignment.set(row._idx, { status: "new", newSec, dsRow: m, corrections: corrs, estrategia: "E6",
-                reason: `[E6] Secuencia asignada por total agregado Ped+Frac (Layout multi-país)` });
-            }
-          } else {
-            // Múltiples sec: greedy — asignar cada DS al grupo Layout más cercano en cantidad
-            const layoutGrps = ag.keys.map(k => ({ key: k, rows: groups.get(k) || [], cant: (groups.get(k)||[]).reduce((a,r)=>a+r.Cantidad,0), val: (groups.get(k)||[]).reduce((a,r)=>a+r.ValorUSD,0) })).sort((a,b)=>b.cant-a.cant);
-            const dsSorted = [...dsList].sort((a,b)=>(parseFloat(b["CantidadUMComercial"])||0)-(parseFloat(a["CantidadUMComercial"])||0));
-            const grpToDs = new Map(); // key -> dsRow
-            for (const m of dsSorted) {
-              let bestG = null, bestDiff = Infinity;
-              for (const g of layoutGrps) {
-                if (grpToDs.has(g.key)) continue;
-                const diff = Math.abs(g.cant - (parseFloat(m["CantidadUMComercial"])||0));
-                if (diff < bestDiff) { bestDiff = diff; bestG = g; }
-              }
-              if (bestG) grpToDs.set(bestG.key, m);
-            }
-            // Grupos sin asignar → asignar al DS con mayor cant (puede absorber)
-            const dsFallback = dsSorted[0];
-            for (const g of layoutGrps) {
-              if (!grpToDs.has(g.key)) grpToDs.set(g.key, dsFallback);
-            }
-            for (const g of layoutGrps) {
-              const m = grpToDs.get(g.key);
-              usedDS.add(m._dsIdx);
-              const newSec = normStr(m["SecuenciaFraccion"]);
-              const pais551 = normStr(m["PaisOrigenDestino"]);
-              const frac551 = nFrac(normStr(m["Fraccion"]));
-              const desc551 = normStr(m["DescripcionMercancia"]);
-              for (const row of g.rows) {
-                const corrs = [];
-                if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
-                if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(m["Fraccion"]) });
-                if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
-                assignment.set(row._idx, { status: "new", newSec, dsRow: m, corrections: corrs, estrategia: "E6",
-                  reason: `[E6] Secuencia asignada por total agregado Ped+Frac (combo ${dsList.length} sec)` });
-              }
-            }
-          }
+      // Primero: buscar por descripción dentro de remaining
+      const byDescRows = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm);
+      if (byDescRows.length > 0) {
+        const sumC = byDescRows.reduce((a,r)=>a+r.Cantidad,0);
+        const sumV = byDescRows.reduce((a,r)=>a+r.ValorUSD,0);
+        if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
+          assignRows(byDescRows, m, "A2m");
+          const assignedIdx = new Set(byDescRows.map(r=>r._idx));
+          remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
           continue;
         }
       }
-    }
-
-    // E5b: Grupo no matchea pero filas individuales sí — asignar fila por fila
-    // Ej: DS sec3=20,000; Layout tiene 8 filas (15k,25k,20k,5k,5k,15k,25k,20k) total 130k.
-    // La fila de 20k coincide con DS sec3 → asignar solo esa fila.
-    if (!matched) {
-      const candsE5b = (dsByPFP.get(`${ped}|||${frac}|||${pais}`) || []).concat(dsByPF.get(`${ped}|||${frac}`) || [])
-        .filter((r, i, arr) => arr.findIndex(x => x._dsIdx === r._dsIdx) === i && !usedDS.has(r._dsIdx));
-      let anyE5b = false;
-      for (const row of rows) {
-        if (assignment.has(row._idx)) continue;
-        const r = tryMatchQty(candsE5b, row.Cantidad, row.ValorUSD, 1, 2)
-          || tryMatchUP(candsE5b, row.Cantidad, row.ValorUSD, 0.15);
-        if (r) {
-          anyE5b = true;
-          usedDS.add(r._dsIdx);
-          const newSec = normStr(r["SecuenciaFraccion"]);
-          const pais551 = normStr(r["PaisOrigenDestino"]);
-          const frac551 = nFrac(normStr(r["Fraccion"]));
-          const desc551 = normStr(r["DescripcionMercancia"]);
-          const corrs = [];
-          if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
-          if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(r["Fraccion"]) });
-          if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
-          assignment.set(row._idx, { status: "new", newSec, dsRow: r, corrections: corrs, estrategia: "E5b",
-            reason: `[E5b] Secuencia asignada por fila individual: ${newSec}` });
+      // Luego: subconjunto de remaining
+      if (i === dsSort.length - 1) {
+        if (remaining.length > 0) assignRows(remaining, m, "A2m_last");
+        remaining = [];
+      } else {
+        const subset = findSubset(remaining, dsCant, dsVal, 1, 4);
+        if (subset) {
+          assignRows(subset, m, "A2m_sub");
+          const assignedIdx = new Set(subset.map(r=>r._idx));
+          remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
         }
       }
-      if (anyE5b) {
-        for (const row of rows) {
+    }
+    // Si quedan filas restantes, asignar a la DS de mayor cant
+    if (remaining.length > 0) {
+      const dsLast = dsSort[dsSort.length - 1];
+      if (!usedDS.has(dsLast._dsIdx)) assignRows(remaining, dsLast, "A2m_rest");
+      else {
+        for (const row of remaining) {
           if (!assignment.has(row._idx)) {
-            assignment.set(row._idx, { status: "unmatched", newSec: row.SecCalc || "", dsRow: null, corrections: [],
-              reason: `Sin match en DS para Ped ${ped} / Frac ${frac} (fila individual)` });
+            assignment.set(row._idx, { status:"unmatched", newSec:row.SecCalc||"", dsRow:null, corrections:[],
+              reason: `Sin match (resto tras distribución por desc/subconjunto)` });
           }
-        }
-        continue;
-      }
-    }
-
-    // E0b: Completar una secuencia parcialmente verificada en E0 ──────────────
-    // Se aplica cuando E1-E5 no encuentran candidato disponible (la secuencia
-    // fue marcada como "usada" en E0), PERO el grupo actual encaja dentro del
-    // remanente de la secuencia DS (total proyectado ≤ DS_cant × 1.05).
-    // Ej: DS sec3=6,018,000 → E0 verificó 141 filas MEX (6,017,300) →
-    //     queda remanente ~700 ud → fila USA (700) encaja → asigna sec3.
-    if (!matched) {
-      // Construir mapa de totales ya verificados en E0 por ped|||frac
-      // (se recalcula inline para no necesitar un pre-pass global)
-      const dsCands = (dsByPF.get(`${ped}|||${frac}`) || []);
-      for (const dsR of dsCands) {
-        if (!usedDS.has(dsR._dsIdx)) continue; // solo candidatos ya usados
-        const dsCant = parseFloat(dsR["CantidadUMComercial"]) || 0;
-        // Cuánto ya verificamos de esta DS row en E0
-        let verifiedCant = 0;
-        for (const lRow of layoutRows) {
-          const a0 = assignment.get(lRow._idx);
-          if (a0?.status === "ok" && a0.dsRow?._dsIdx === dsR._dsIdx) {
-            verifiedCant += lRow.Cantidad;
-          }
-        }
-        const remanente  = dsCant - verifiedCant;
-        const proyectado = verifiedCant + sumCant;
-        // Asigna si el grupo completa el remanente (dentro de 5% del total DS)
-        if (sumCant > 0 && proyectado <= dsCant * 1.05) {
-          matched = dsR;
-          estrategia = "E0b";
-          break;
-        }
-      }
-    }
-
-    if (matched) {
-      usedDS.add(matched._dsIdx);
-      const newSec = normStr(matched["SecuenciaFraccion"]);
-      const pais551 = normStr(matched["PaisOrigenDestino"]);
-      const frac551 = nFrac(normStr(matched["Fraccion"]));
-      const desc551 = normStr(matched["DescripcionMercancia"]);
-
-      for (const row of rows) {
-        const wasEmpty = !isRealSec(row.SecCalc);
-        const corrs = [];
-        if (pais551 && normStr(row.PaisOrigen) !== pais551)
-          corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
-        if (frac551 && nFrac(row.FraccionNico) !== frac551)
-          corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(matched["Fraccion"]) });
-        if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion)
-          corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
-
-        const prevSec = row.SecCalc;
-        assignment.set(row._idx, {
-          status: wasEmpty ? "new" : "corrected",
-          newSec, dsRow: matched, corrections: corrs, estrategia,
-          reason: wasEmpty
-            ? `[${estrategia}] Secuencia asignada: ${newSec}`
-            : `[${estrategia}] Secuencia corregida: ${prevSec} → ${newSec}`,
-        });
-      }
-    } else {
-      for (const row of rows) {
-        if (!assignment.has(row._idx)) {
-          assignment.set(row._idx, {
-            status: "unmatched", newSec: row.SecCalc || "", dsRow: null, corrections: [],
-            reason: `Sin match en DS para Ped ${ped} / Frac ${frac}`,
-          });
         }
       }
     }
   }
 
-  // Secuencias DS no usadas (ni E0 ni E0b ni E1-E5)
+  // ── FASE B: E0b — completar remanente de sec ya verificada en E0 ─────────
+  for (const [kP, rows] of groupsByPais) {
+    const pendingRows = rows.filter(r => !assignment.has(r._idx));
+    if (pendingRows.length === 0) continue;
+    const [ped, frac] = kP.split("|||").slice(0,2);
+    const sumCant = pendingRows.reduce((a,r)=>a+r.Cantidad,0);
+    for (const dsR of (dsByPF.get(`${ped}|||${frac}`) || [])) {
+      if (!usedDS.has(dsR._dsIdx)) continue;
+      const dsCant = parseFloat(dsR["CantidadUMComercial"]) || 0;
+      let verifiedCant = 0;
+      for (const lRow of layoutRows) {
+        const a0 = assignment.get(lRow._idx);
+        if (a0?.dsRow?._dsIdx === dsR._dsIdx) verifiedCant += lRow.Cantidad;
+      }
+      const proyectado = verifiedCant + sumCant;
+      if (sumCant > 0 && Math.abs(proyectado - dsCant) <= 1) {
+        assignRows(pendingRows, dsR, "E0b");
+        break;
+      }
+    }
+  }
+
+  // ── FASE C: Marcar sin match las filas que quedaron sin asignar ──────────
+  for (const row of layoutRows) {
+    if (row.noIncluir || assignment.has(row._idx)) continue;
+    assignment.set(row._idx, {
+      status: "unmatched", newSec: row.SecCalc || "", dsRow: null, corrections: [],
+      reason: `Sin match en DS para Ped ${row.Pedimento} / Frac ${row.FraccionNico} / Desc "${(row.Descripcion||"").slice(0,30)}"`,
+    });
+  }
+
+
+  // ── Totales asignados por sec (para verificación) ────────────────────────
+  // Secuencias DS no usadas
   const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx));
   const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
   for (const a of assignment.values()) {
@@ -2347,14 +2347,16 @@ function runCascade2020(layoutRows, dsRows) {
       if (diffCant > tolCant || diffVal > tolVal) {
         const pctC = dsCant > 0 ? ((asg.cant - dsCant) / dsCant * 100).toFixed(1) : "∞";
         const pctV = dsVal  > 0 ? ((asg.val  - dsVal)  / dsVal  * 100).toFixed(1) : "∞";
+        const signo = (v) => v >= 0 ? "+" : "";
         mismatchReasons.set(dsRow._dsIdx,
-          `⚠ DISCREPANCIA — Cant.Layout=${fmt(asg.cant)} vs DS=${fmt(dsCant)} (${pctC}%) | Valor Layout=$${fmt(asg.val)} vs DS=$${fmt(dsVal)} (${pctV}%)`
+          `⚠ DISCREPANCIA — Cant.Layout=${fmt(asg.cant)} vs DS=${fmt(dsCant)} (${signo((asg.cant-dsCant))}${pctC}%) | Valor Layout=$${fmt(asg.val)} vs DS=$${fmt(dsVal)} (${signo((asg.val-dsVal))}${pctV}%)`
         );
       }
     }
   }
 
-  return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons };
+  return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons,
+    globalTotals: { dsCant: dsTotalC, dsVal: dsTotalV, lyCant: lyTotalC, lyVal: lyTotalV, cuadra: globalCuadra } };
 }
 
 /** Construye el Excel 2020 de salida: modifica celdas específicas del Layout. */
@@ -2418,20 +2420,10 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         const styleSec = esDup ? styleAmarillo : (isOk ? S_OK_SEC : S_NEW_SEC);
         setCell(ws, r, colIdx.sec, newSecVal, styleSec);
 
-        // NOTAS (amarillo si es fila repetida)
-        const nota = a.reason + (a.corrections?.length
-          ? " | " + a.corrections.map(c2 => `[CORR ${c2.field.toUpperCase()}] '${c2.original}'→'${c2.corrected}'`).join(" | ")
-          : "");
+        // NOTAS (sin correcciones de país/fracción — no se modifican)
+        const nota = a.reason;
         const styleNota = esDup ? styleAmarilloNota : (isOk ? S_OK_NOTA : S_NEW_NOTA);
         setCell(ws, r, colIdx.notas, nota, styleNota);
-
-        // Correcciones de campo (FraccionNico, PaisOrigen, Descripcion)
-        for (const corr of (a.corrections || [])) {
-          const ci = corr.field === "pais" ? colIdx.pais
-                   : corr.field === "frac" ? colIdx.frac
-                   : corr.field === "desc" ? colIdx.desc : -1;
-          setCell(ws, r, ci, corr.corrected, esDup ? styleAmarillo : S_CORR_FLD);
-        }
       } else if (esDup) {
         // Fila repetida sin match: pintar SEC CALC y NOTAS en amarillo para visibilidad
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
@@ -2521,10 +2513,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     ["Rojo en SEC CALC",  "Secuencia asignada o corregida por la app"],
     [],
     ["LEYENDA DE COLORES"],
-    ["Verde (celda SEC CALC)", "Secuencia existente verificada — coincide exactamente con DS"],
-    ["Rojo (celda SEC CALC)", "Secuencia nueva asignada o corregida por la app"],
+    ["Verde (celda SEC CALC)", "Secuencia verificada — coincide con DS"],
+    ["Rojo (celda SEC CALC)", "Secuencia asignada — Cant±1, Val±4 = DS (sin modificar país/fracción)"],
     ["Amarillo (celda)", "Fila repetida — mismo Ped+Frac+Pais+Cant+Val que otra(s)"],
-    ["Naranja (celda campo)", "Campo corregido (PaisOrigen, FraccionNico, Descripcion) — fuente: DS"],
     [],
     ["DETALLE POR FILA"],
     ["Pedimento","FraccionNico","PaisOrigen","Cantidad","ValorUSD","SEC CALC anterior","SEC CALC nuevo","Estado","Notas / Razón"],
@@ -2582,13 +2573,13 @@ function App2020() {
         getPedimentosFromRows(layout2020.layoutRows, "Pedimento", "pedimento")
       );
 
-      const { assignment, stats, unusedDS, mismatchReasons } = runCascade2020(layout2020.layoutRows, dsRows);
+      const { assignment, stats, unusedDS, mismatchReasons, globalTotals: gt2020 } = runCascade2020(layout2020.layoutRows, dsRows);
       setProgress2020(80);
 
       const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment, mismatchReasons);
       setProgress2020(100);
 
-      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName, pedMismatch });
+      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName, pedMismatch, globalTotals: gt2020 });
       setOutputWb2020(newWb);
       setTimeout(() => setPhase2020("results"), 400);
     } catch (e) {
@@ -2660,7 +2651,7 @@ function App2020() {
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA por la app"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Naranja en celda","Campo corregido (PaisOrigen / FraccionNico / Descripcion) — fuente DS"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada (Cant±1, Val±4 = DS)"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
@@ -2705,7 +2696,44 @@ function App2020() {
               { label:"Sin match",         value: results2020.stats.unmatched,   accent:"#64748b",  sub:"Revisar manualmente" },
             ].map(c => <StatCard key={c.label} label={c.label} value={c.value} sub={c.sub} accent={c.accent} />)}
           </div>
-          <div style={{background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:6,padding:"16px 20px",marginBottom:24,fontSize:13,color:"#94a3b8"}}>
+          {results2020.globalTotals && (() => {
+            const gt = results2020.globalTotals;
+            const cuadra = gt.cuadra;
+            const fmt = n => Number(n).toLocaleString("es-MX", {maximumFractionDigits:0});
+            const fmtV = n => Number(n).toLocaleString("es-MX", {maximumFractionDigits:2});
+            return (
+              <div style={{background: cuadra ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.12)", border:`1px solid ${cuadra?"rgba(34,197,94,0.3)":"#ef4444"}`, borderRadius:6, padding:"16px 20px", marginBottom:16, fontSize:13}}>
+                <div style={{fontWeight:700, marginBottom:10, color: cuadra ? "#22c55e" : "#ef4444", fontSize:14}}>
+                  {cuadra ? "✓ Totales globales coinciden — todas las filas deben asignarse" : "⚠ Totales globales NO coinciden — puede haber filas sin asignar"}
+                </div>
+                <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
+                  {[
+                    {label:"DS — Cantidad", val:fmt(gt.dsCant), color:"#94a3b8"},
+                    {label:"Layout — Cantidad", val:fmt(gt.lyCant), color: Math.abs(gt.lyCant-gt.dsCant)<=1?"#22c55e":"#ef4444"},
+                    {label:"DS — Valor USD", val:`$${fmtV(gt.dsVal)}`, color:"#94a3b8"},
+                    {label:"Layout — Valor USD", val:`$${fmtV(gt.lyVal)}`, color: Math.abs(gt.lyVal-gt.dsVal)<=5?"#22c55e":"#ef4444"},
+                  ].map(item=>(
+                    <div key={item.label}>
+                      <div style={{color:"#475569",fontSize:10,fontFamily:"DM Mono, monospace",marginBottom:4}}>{item.label}</div>
+                      <div style={{color:item.color,fontFamily:"DM Mono, monospace",fontSize:14,fontWeight:700}}>{item.val}</div>
+                    </div>
+                  ))}
+                </div>
+                {!cuadra && (
+                  <div style={{marginTop:10,color:"#fca5a5",fontSize:12}}>
+                    Diferencia — Cant: {(gt.lyCant - gt.dsCant).toLocaleString("es-MX")} | Val: ${(gt.lyVal - gt.dsVal).toFixed(2)}
+                    {" · "}Si los totales no coinciden, puede que falten pedimentos o haya filas duplicadas.
+                  </div>
+                )}
+                {cuadra && (
+                  <div style={{marginTop:10,color:"#86efac",fontSize:12}}>
+                    Los totales cuadran exactamente. Si hay filas sin secuencia, revisar descripciones o fracciones en Layout que difieran del DS.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+          <div style={{background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:6,padding:"12px 20px",marginBottom:24,fontSize:13,color:"#94a3b8"}}>
             Total filas Layout: <b style={{color:"#f8fafc"}}>{results2020.total}</b> &nbsp;·&nbsp;
             Secuencias DS no usadas: <b style={{color: results2020.unusedDSCount>0?"#ef4444":"#22c55e"}}>{results2020.unusedDSCount}</b>
           </div>
