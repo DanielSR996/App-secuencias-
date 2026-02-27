@@ -196,6 +196,30 @@ function tryMatchUnitPrice(candidates, sumCant, sumVCUSD, tolPct = 0.15) {
   return best ? { seq: best["SecuenciaFraccion"], r551: best } : null;
 }
 
+/** Detecta si DS y Layout tienen pedimentos distintos (sin intersección).
+ *  Retorna { ds, layout } con muestras si no hay match; null si hay coincidencia. */
+function checkPedimentoMismatch(dsPedimentos, layoutPedimentos) {
+  const norm = (p) => String(p ?? "").trim();
+  const dsSet = new Set(dsPedimentos.map(norm).filter(Boolean));
+  const laySet = new Set(layoutPedimentos.map(norm).filter(Boolean));
+  const intersection = [...dsSet].filter((p) => laySet.has(p));
+  if (intersection.length === 0 && dsSet.size > 0 && laySet.size > 0) {
+    return { ds: [...dsSet].slice(0, 5), layout: [...laySet].slice(0, 5) };
+  }
+  return null;
+}
+
+function getPedimentosFromRows(rows, ...keys) {
+  const out = new Set();
+  for (const r of rows) {
+    for (const k of keys) {
+      const v = String(r[k] ?? "").trim();
+      if (v) out.add(v);
+    }
+  }
+  return [...out];
+}
+
 function runCascade(layoutRows, s551Rows) {
   // ── Columnas del Layout (ya vienen normalizadas por readLayoutSheet) ─────
   const L_PED   = "Pedimento";
@@ -1868,12 +1892,11 @@ function readLayout2020Sheet(sheet) {
     return cell ? (parseFloat(cell.v) || 0) : 0;
   };
 
-  // ── 5. Leer filas de datos celda-por-celda ────────────────────────────────
+  // ── 5. Leer filas de datos celda-por-celda (incluir todas, no saltar) ─────
   const layoutRows = [];
   for (let r = hdrI + 1; r <= range.e.r; r++) {
     const pedVal  = cellVal(r, colIdx.pedimento);
     const fracVal = cellVal(r, colIdx.frac);
-    if (!pedVal && !fracVal) continue;
 
     const notasInVal = cellVal(r, colIdx.notasIn).toUpperCase();
     const noIncluir  = notasInVal.includes("NO INCLUIR");
@@ -1957,6 +1980,30 @@ function runCascade2020(layoutRows, dsRows) {
     return best;
   };
 
+  // Suma de 2 o 3 secuencias DS que coincida con total (para E6 multi-sec)
+  const tryMatchCombo = (cands, sumCant, sumVal, tolPct = 0.005) => {
+    const pool = cands.filter(r => !usedDS.has(r._dsIdx)).slice(0, 12);
+    const tolC = Math.max(5, sumCant * tolPct);
+    const tolV = Math.max(5, sumVal * tolPct);
+    for (let i = 0; i < pool.length - 1; i++) {
+      for (let j = i + 1; j < pool.length; j++) {
+        const c = (parseFloat(pool[i]["CantidadUMComercial"]) || 0) + (parseFloat(pool[j]["CantidadUMComercial"]) || 0);
+        const v = (parseFloat(pool[i]["ValorDolares"]) || 0) + (parseFloat(pool[j]["ValorDolares"]) || 0);
+        if (Math.abs(c - sumCant) <= tolC && Math.abs(v - sumVal) <= tolV) return [pool[i], pool[j]];
+      }
+    }
+    for (let i = 0; i < pool.length - 2; i++) {
+      for (let j = i + 1; j < pool.length - 1; j++) {
+        for (let k = j + 1; k < pool.length; k++) {
+          const c = (parseFloat(pool[i]["CantidadUMComercial"]) || 0) + (parseFloat(pool[j]["CantidadUMComercial"]) || 0) + (parseFloat(pool[k]["CantidadUMComercial"]) || 0);
+          const v = (parseFloat(pool[i]["ValorDolares"]) || 0) + (parseFloat(pool[j]["ValorDolares"]) || 0) + (parseFloat(pool[k]["ValorDolares"]) || 0);
+          if (Math.abs(c - sumCant) <= tolC && Math.abs(v - sumVal) <= tolV) return [pool[i], pool[j], pool[k]];
+        }
+      }
+    }
+    return null;
+  };
+
   // assignment: _idx → { status, newSec, dsRow, corrections[], reason }
   // status: "ok"|"corrected"|"new"|"unmatched"
   const assignment = new Map();
@@ -1995,7 +2042,21 @@ function runCascade2020(layoutRows, dsRows) {
     groups.get(key).push(row);
   }
 
+  // E6: Agregado por Ped+Frac — cuando Layout tiene varios Pais pero DS tiene uno (o suma)
+  // Ej: DS 85322999 MEX 1,039,360 | Layout 85322999 JPN+CHN+TWN+THA = 1,039,360
+  const aggregatesPF = new Map(); // Ped|||Frac → { sumCant, sumVal, keys[] }
   for (const [key, rows] of groups) {
+    const [ped, frac] = key.split("|||").slice(0, 2);
+    const kPF = `${ped}|||${frac}`;
+    if (!aggregatesPF.has(kPF)) aggregatesPF.set(kPF, { sumCant: 0, sumVal: 0, keys: [] });
+    const ag = aggregatesPF.get(kPF);
+    ag.sumCant += rows.reduce((a, r) => a + r.Cantidad, 0);
+    ag.sumVal  += rows.reduce((a, r) => a + r.ValorUSD, 0);
+    ag.keys.push(key);
+  }
+
+  for (const [key, rows] of groups) {
+    if (rows.every(r => assignment.has(r._idx))) continue; // ya asignado por E6 u otro
     const [ped, frac, pais] = key.split("|||");
     const sumCant = rows.reduce((a, r) => a + r.Cantidad, 0);
     const sumVal  = rows.reduce((a, r) => a + r.ValorUSD, 0);
@@ -2034,6 +2095,118 @@ function runCascade2020(layoutRows, dsRows) {
     if (!matched) {
       const candsE5 = (dsByPF.get(`${ped}|||${frac}`) || []).filter(r => !usedDS.has(r._dsIdx));
       if (candsE5.length === 1) { matched = candsE5[0]; estrategia = "E5"; }
+    }
+
+    // E6: Agregado Ped+Frac — Layout tiene varios Pais, DS tiene uno o suma que coincide
+    // Ej: DS 85322999 MEX 1,039,360 | Layout JPN+CHN+TWN+THA = 1,039,360 → asignar sec a todos
+    if (!matched) {
+      const ag = aggregatesPF.get(`${ped}|||${frac}`);
+      if (ag && ag.keys.length >= 1) {
+        const candsE6 = (dsByPF.get(`${ped}|||${frac}`) || []).filter(r => !usedDS.has(r._dsIdx));
+        const tolE6c = Math.max(5, Math.ceil(ag.sumCant * 0.002));
+        const tolE6v = Math.max(5, Math.ceil(ag.sumVal * 0.002));
+        const allRowsE6 = ag.keys.flatMap(k => groups.get(k) || []);
+
+        // E6a: Una sola sec DS que coincide con el total agregado
+        let dsMatched = tryMatchQty(candsE6, ag.sumCant, ag.sumVal, tolE6c, tolE6v);
+        let dsList = dsMatched ? [dsMatched] : null;
+
+        // E6b: Suma de 2 o 3 sec DS que coincide con el total
+        if (!dsList) dsList = tryMatchCombo(candsE6, ag.sumCant, ag.sumVal, 0.005);
+
+        if (dsList && dsList.length > 0) {
+          // Asignar: si 1 sec → a todos; si 2-3 sec → distribuir por proporción (greedy)
+          if (dsList.length === 1) {
+            const m = dsList[0];
+            usedDS.add(m._dsIdx);
+            const newSec = normStr(m["SecuenciaFraccion"]);
+            const pais551 = normStr(m["PaisOrigenDestino"]);
+            const frac551 = nFrac(normStr(m["Fraccion"]));
+            const desc551 = normStr(m["DescripcionMercancia"]);
+            for (const row of allRowsE6) {
+              const corrs = [];
+              if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
+              if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(m["Fraccion"]) });
+              if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
+              assignment.set(row._idx, { status: "new", newSec, dsRow: m, corrections: corrs, estrategia: "E6",
+                reason: `[E6] Secuencia asignada por total agregado Ped+Frac (Layout multi-país)` });
+            }
+          } else {
+            // Múltiples sec: greedy — asignar cada DS al grupo Layout más cercano en cantidad
+            const layoutGrps = ag.keys.map(k => ({ key: k, rows: groups.get(k) || [], cant: (groups.get(k)||[]).reduce((a,r)=>a+r.Cantidad,0), val: (groups.get(k)||[]).reduce((a,r)=>a+r.ValorUSD,0) })).sort((a,b)=>b.cant-a.cant);
+            const dsSorted = [...dsList].sort((a,b)=>(parseFloat(b["CantidadUMComercial"])||0)-(parseFloat(a["CantidadUMComercial"])||0));
+            const grpToDs = new Map(); // key -> dsRow
+            for (const m of dsSorted) {
+              let bestG = null, bestDiff = Infinity;
+              for (const g of layoutGrps) {
+                if (grpToDs.has(g.key)) continue;
+                const diff = Math.abs(g.cant - (parseFloat(m["CantidadUMComercial"])||0));
+                if (diff < bestDiff) { bestDiff = diff; bestG = g; }
+              }
+              if (bestG) grpToDs.set(bestG.key, m);
+            }
+            // Grupos sin asignar → asignar al DS con mayor cant (puede absorber)
+            const dsFallback = dsSorted[0];
+            for (const g of layoutGrps) {
+              if (!grpToDs.has(g.key)) grpToDs.set(g.key, dsFallback);
+            }
+            for (const g of layoutGrps) {
+              const m = grpToDs.get(g.key);
+              usedDS.add(m._dsIdx);
+              const newSec = normStr(m["SecuenciaFraccion"]);
+              const pais551 = normStr(m["PaisOrigenDestino"]);
+              const frac551 = nFrac(normStr(m["Fraccion"]));
+              const desc551 = normStr(m["DescripcionMercancia"]);
+              for (const row of g.rows) {
+                const corrs = [];
+                if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
+                if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(m["Fraccion"]) });
+                if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
+                assignment.set(row._idx, { status: "new", newSec, dsRow: m, corrections: corrs, estrategia: "E6",
+                  reason: `[E6] Secuencia asignada por total agregado Ped+Frac (combo ${dsList.length} sec)` });
+              }
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // E5b: Grupo no matchea pero filas individuales sí — asignar fila por fila
+    // Ej: DS sec3=20,000; Layout tiene 8 filas (15k,25k,20k,5k,5k,15k,25k,20k) total 130k.
+    // La fila de 20k coincide con DS sec3 → asignar solo esa fila.
+    if (!matched) {
+      const candsE5b = (dsByPFP.get(`${ped}|||${frac}|||${pais}`) || []).concat(dsByPF.get(`${ped}|||${frac}`) || [])
+        .filter((r, i, arr) => arr.findIndex(x => x._dsIdx === r._dsIdx) === i && !usedDS.has(r._dsIdx));
+      let anyE5b = false;
+      for (const row of rows) {
+        if (assignment.has(row._idx)) continue;
+        const r = tryMatchQty(candsE5b, row.Cantidad, row.ValorUSD, 1, 2)
+          || tryMatchUP(candsE5b, row.Cantidad, row.ValorUSD, 0.15);
+        if (r) {
+          anyE5b = true;
+          usedDS.add(r._dsIdx);
+          const newSec = normStr(r["SecuenciaFraccion"]);
+          const pais551 = normStr(r["PaisOrigenDestino"]);
+          const frac551 = nFrac(normStr(r["Fraccion"]));
+          const desc551 = normStr(r["DescripcionMercancia"]);
+          const corrs = [];
+          if (pais551 && normStr(row.PaisOrigen) !== pais551) corrs.push({ field: "pais", original: row.PaisOrigen, corrected: pais551 });
+          if (frac551 && nFrac(row.FraccionNico) !== frac551) corrs.push({ field: "frac", original: row.FraccionNico, corrected: normStr(r["Fraccion"]) });
+          if (desc551 && normStr(row.Descripcion) !== desc551 && !row.Descripcion) corrs.push({ field: "desc", original: row.Descripcion, corrected: desc551 });
+          assignment.set(row._idx, { status: "new", newSec, dsRow: r, corrections: corrs, estrategia: "E5b",
+            reason: `[E5b] Secuencia asignada por fila individual: ${newSec}` });
+        }
+      }
+      if (anyE5b) {
+        for (const row of rows) {
+          if (!assignment.has(row._idx)) {
+            assignment.set(row._idx, { status: "unmatched", newSec: row.SecCalc || "", dsRow: null, corrections: [],
+              reason: `Sin match en DS para Ped ${ped} / Frac ${frac} (fila individual)` });
+          }
+        }
+        continue;
+      }
     }
 
     // E0b: Completar una secuencia parcialmente verificada en E0 ──────────────
@@ -2206,6 +2379,22 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   const S_OK_NOTA  = { font:{italic:true,sz:10,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true} };
   const S_NEW_NOTA = { font:{bold:true,sz:10,color:{rgb:"641E16"}}, fill:{patternType:"solid",fgColor:{rgb:"FADBD8"}}, alignment:{wrapText:true} };
   const S_CORR_FLD = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center",wrapText:true} };
+  const styleAmarillo = { font:{bold:true,color:{rgb:"7D6608"}}, fill:{patternType:"solid",fgColor:{rgb:"FCF3CF"}}, alignment:{horizontal:"center"} };
+  const styleAmarilloNota = { font:{italic:true,sz:10,color:{rgb:"7D6608"}}, fill:{patternType:"solid",fgColor:{rgb:"FCF3CF"}}, alignment:{wrapText:true} };
+
+  // Filas repetidas (mismo Ped+Frac+Pais+Cant+Val) → pintar amarillo (solo si tienen datos)
+  const keyDup = (row) => `${row.Pedimento}|||${(row.FraccionNico||"").trim()}|||${row.PaisOrigen}|||${row.Cantidad}|||${row.ValorUSD}`;
+  const keyCounts = new Map();
+  for (const row of layoutRows) {
+    if (!row.Pedimento && !row.FraccionNico) continue; // no marcar filas vacías como duplicadas
+    const k = keyDup(row);
+    keyCounts.set(k, (keyCounts.get(k) || 0) + 1);
+  }
+  const dupIdx = new Set();
+  for (const row of layoutRows) {
+    if (!row.Pedimento && !row.FraccionNico) continue;
+    if (keyCounts.get(keyDup(row)) > 1) dupIdx.add(row._idx);
+  }
 
   const setCell = (ws, r, c, val, style) => {
     if (c < 0 || !ws) return;
@@ -2218,27 +2407,36 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   if (ws) {
     for (const row of layoutRows) {
       const a = assignment.get(row._idx);
-      if (!a || a.status === "unmatched") continue;
-
+      const esDup = dupIdx.has(row._idx);
       const r = row._rowI;
-      const newSecVal = isNaN(parseFloat(a.newSec)) ? a.newSec : parseFloat(a.newSec);
-      const isOk = a.status === "ok";
 
-      // SEC CALC
-      setCell(ws, r, colIdx.sec, newSecVal, isOk ? S_OK_SEC : S_NEW_SEC);
+      if (a && a.status !== "unmatched") {
+        const newSecVal = isNaN(parseFloat(a.newSec)) ? a.newSec : parseFloat(a.newSec);
+        const isOk = a.status === "ok";
 
-      // NOTAS
-      const nota = a.reason + (a.corrections?.length
-        ? " | " + a.corrections.map(c2 => `[CORR ${c2.field.toUpperCase()}] '${c2.original}'→'${c2.corrected}'`).join(" | ")
-        : "");
-      setCell(ws, r, colIdx.notas, nota, isOk ? S_OK_NOTA : S_NEW_NOTA);
+        // SEC CALC (amarillo si es fila repetida)
+        const styleSec = esDup ? styleAmarillo : (isOk ? S_OK_SEC : S_NEW_SEC);
+        setCell(ws, r, colIdx.sec, newSecVal, styleSec);
 
-      // Correcciones de campo (FraccionNico, PaisOrigen, Descripcion)
-      for (const corr of (a.corrections || [])) {
-        const ci = corr.field === "pais" ? colIdx.pais
-                 : corr.field === "frac" ? colIdx.frac
-                 : corr.field === "desc" ? colIdx.desc : -1;
-        setCell(ws, r, ci, corr.corrected, S_CORR_FLD);
+        // NOTAS (amarillo si es fila repetida)
+        const nota = a.reason + (a.corrections?.length
+          ? " | " + a.corrections.map(c2 => `[CORR ${c2.field.toUpperCase()}] '${c2.original}'→'${c2.corrected}'`).join(" | ")
+          : "");
+        const styleNota = esDup ? styleAmarilloNota : (isOk ? S_OK_NOTA : S_NEW_NOTA);
+        setCell(ws, r, colIdx.notas, nota, styleNota);
+
+        // Correcciones de campo (FraccionNico, PaisOrigen, Descripcion)
+        for (const corr of (a.corrections || [])) {
+          const ci = corr.field === "pais" ? colIdx.pais
+                   : corr.field === "frac" ? colIdx.frac
+                   : corr.field === "desc" ? colIdx.desc : -1;
+          setCell(ws, r, ci, corr.corrected, esDup ? styleAmarillo : S_CORR_FLD);
+        }
+      } else if (esDup) {
+        // Fila repetida sin match: pintar SEC CALC y NOTAS en amarillo para visibilidad
+        setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
+        const notaUnmatched = a?.reason || `Sin match en DS para Ped ${row.Pedimento} / Frac ${row.FraccionNico}`;
+        setCell(ws, r, colIdx.notas, notaUnmatched, styleAmarilloNota);
       }
     }
   }
@@ -2246,7 +2444,21 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   // ── Escribir motivos de no-match en columna REVISADO del DS ──────────────
   const dsWsOut = workbook.Sheets[dsSheetName];
   const dsRows  = layout2020Data.dsRows;  // las filas del DS con _rowI y _dsIdx
-  const revCol  = dsRows?._revisadoCol ?? -1;
+  let revCol    = dsRows?._revisadoCol ?? -1;
+
+  // Si no existe columna REVISADO, crearla al final del encabezado
+  if (dsWsOut && dsRows && revCol < 0) {
+    const range = dsWsOut["!ref"] ? XLSX.utils.decode_range(dsWsOut["!ref"]) : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+    revCol = range.e.c + 1;
+    const hdrI = dsRows._hdrI ?? 0;
+    const addrHdr = XLSX.utils.encode_cell({ r: hdrI, c: revCol });
+    const styleRevisadoHdr = { font: { bold: true }, fill: { patternType: "solid", fgColor: { rgb: "E8DAEF" } } };
+    dsWsOut[addrHdr] = { t: "s", v: "REVISADO", s: styleRevisadoHdr };
+    if (!dsWsOut["!cols"]) dsWsOut["!cols"] = [];
+    dsWsOut["!cols"][revCol] = { wch: 80 };
+    range.e.c = revCol;
+    dsWsOut["!ref"] = XLSX.utils.encode_range(range);
+  }
 
   const S_REVISADO_FAIL = {
     font:  { bold: true, color: { rgb: "7B241C" }, sz: 10 },
@@ -2263,9 +2475,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     for (const dsRow of dsRows) {
       if (typeof dsRow._rowI !== "number") continue;
       const addr = XLSX.utils.encode_cell({ r: dsRow._rowI, c: revCol });
-      const reason = mismatchReasons?.get(dsRow._dsIdx);
+      let reason = mismatchReasons?.get(dsRow._dsIdx);
       if (reason) {
-        // Fila DS sin match: escribir motivo en rojo
+        // Fila DS sin match o con discrepancia: escribir motivo en rojo
         dsWsOut[addr] = { t: "s", v: reason, s: S_REVISADO_FAIL };
       } else {
         // Fila DS sí fue usada: marcar OK en verde (solo si estaba vacía)
@@ -2311,6 +2523,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     ["LEYENDA DE COLORES"],
     ["Verde (celda SEC CALC)", "Secuencia existente verificada — coincide exactamente con DS"],
     ["Rojo (celda SEC CALC)", "Secuencia nueva asignada o corregida por la app"],
+    ["Amarillo (celda)", "Fila repetida — mismo Ped+Frac+Pais+Cant+Val que otra(s)"],
     ["Naranja (celda campo)", "Campo corregido (PaisOrigen, FraccionNico, Descripcion) — fuente: DS"],
     [],
     ["DETALLE POR FILA"],
@@ -2364,13 +2577,18 @@ function App2020() {
       layout2020.dsRows = dsRows; // pasar ref al DS para que buildOutput pueda leer _rowI y _revisadoCol
       setProgress2020(60);
 
+      const pedMismatch = checkPedimentoMismatch(
+        getPedimentosFromRows(dsRows, "Pedimento2"),
+        getPedimentosFromRows(layout2020.layoutRows, "Pedimento", "pedimento")
+      );
+
       const { assignment, stats, unusedDS, mismatchReasons } = runCascade2020(layout2020.layoutRows, dsRows);
       setProgress2020(80);
 
       const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment, mismatchReasons);
       setProgress2020(100);
 
-      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName });
+      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName, pedMismatch });
       setOutputWb2020(newWb);
       setTimeout(() => setPhase2020("results"), 400);
     } catch (e) {
@@ -2442,7 +2660,7 @@ function App2020() {
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA por la app"],["Naranja en celda","Campo corregido (PaisOrigen / FraccionNico / Descripcion) — fuente DS"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA por la app"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Naranja en celda","Campo corregido (PaisOrigen / FraccionNico / Descripcion) — fuente DS"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
@@ -2468,6 +2686,17 @@ function App2020() {
           <div style={{color:"#94a3b8",fontSize:12,marginBottom:16,fontFamily:"monospace"}}>
             DS: <span style={{color:"#22c55e"}}>{results2020.dsName}</span> · Layout: <span style={{color:"#22c55e"}}>{results2020.layName}</span>
           </div>
+          {results2020.pedMismatch && (
+            <div style={{background:"rgba(245,158,11,0.12)",border:"1px solid #f59e0b",borderRadius:6,padding:"14px 18px",marginBottom:24,fontSize:13,color:"#fcd34d"}}>
+              <strong>⚠ Pedimentos distintos entre DS y Layout</strong>
+              <p style={{margin:"8px 0 0",color:"#fde68a",lineHeight:1.5}}>
+                El DS tiene pedimentos que no aparecen en el Layout (y viceversa). Por eso no hay match.
+                <br />DS: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results2020.pedMismatch.ds.join(", ")}</code>
+                <br />Layout: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results2020.pedMismatch.layout.join(", ")}</code>
+                <br /><span style={{fontSize:12,opacity:0.9}}>Verifica que ambas hojas correspondan al mismo pedimento o incluyan los mismos pedimentos.</span>
+              </p>
+            </div>
+          )}
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:32}}>
             {[
               { label:"Verificadas (OK)", value: results2020.stats.verified,    accent:"#22c55e",  sub:"Verde en Excel" },
@@ -2523,13 +2752,18 @@ export default function App() {
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
+      const pedMismatch551 = checkPedimentoMismatch(
+        getPedimentosFromRows(s551Rows, "Pedimento"),
+        getPedimentosFromRows(layoutRows, "Pedimento", "pedimento")
+      );
+
       const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
       const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap);
       setProgress(100);
 
-      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals });
+      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals, pedMismatch: pedMismatch551 });
       setOutputWb(newWb);
 
       setTimeout(() => setPhase("results"), 400);
@@ -2760,6 +2994,17 @@ export default function App() {
         {/* RESULTS PHASE */}
         {phase === "results" && results && (
           <div style={{ animation: "fadeUp 0.5s ease" }}>
+            {results.pedMismatch && (
+              <div style={{background:"rgba(245,158,11,0.12)",border:"1px solid #f59e0b",borderRadius:6,padding:"14px 18px",marginBottom:24,fontSize:13,color:"#fcd34d"}}>
+                <strong>⚠ Pedimentos distintos entre 551 y Layout</strong>
+                <p style={{margin:"8px 0 0",color:"#fde68a",lineHeight:1.5}}>
+                  El 551 tiene pedimentos que no aparecen en el Layout (y viceversa). Por eso no hay match.
+                  <br />551: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results.pedMismatch.ds.join(", ")}</code>
+                  <br />Layout: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results.pedMismatch.layout.join(", ")}</code>
+                  <br /><span style={{fontSize:12,opacity:0.9}}>Verifica que ambas hojas correspondan al mismo pedimento o incluyan los mismos pedimentos.</span>
+                </p>
+              </div>
+            )}
             {/* Headline stats */}
             <div style={{ marginBottom: 32 }}>
               <div style={{ color: "#475569", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 12 }}>
