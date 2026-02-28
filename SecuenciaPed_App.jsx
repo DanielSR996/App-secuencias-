@@ -2567,6 +2567,91 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
+  // ── FASE B4: Búsqueda cruzada de fracciones (cross-fraction) ────────────
+  // Algunos Layout tienen la fracción incorrecta respecto al DS.
+  // Ej: DS sec `85332101` no tiene Layout, pero `85332999` tiene 46k extra que
+  //     en el DS corresponden a `85332101`.
+  // Estrategia: para DS secs sin Layout en su fracción, buscar en cualquier
+  //             fila del MISMO pedimento que esté sin asignar.
+  //             Solo si cantidad global coincide (no inventamos unidades).
+  if (globalCantCuadra) {
+    const dsPendB4 = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+      .sort((a,b) => (parseFloat(b["CantidadUMComercial"])||0) - (parseFloat(a["CantidadUMComercial"])||0)); // desc: primero los más grandes
+
+    for (const dsRow of dsPendB4) {
+      if (usedDS.has(dsRow._dsIdx)) continue;
+      const dsCant     = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      const dsVal      = parseFloat(dsRow["ValorDolares"])        || 0;
+      const ped2       = normStr(dsRow["Pedimento2"]);
+      const frac       = nFrac(normStr(dsRow["Fraccion"]));
+      const dsDescNorm = nDesc(dsRow["DescripcionMercancia"]);
+      const dsPaisNorm = normStr(dsRow["PaisOrigenDestino"]);
+      if (dsCant === 0) continue;
+
+      // Verificar cuántas filas tiene en su propia fracción (sin asignar)
+      const ownFracRows = layoutRows.filter(r =>
+        !r.noIncluir && !assignment.has(r._idx) &&
+        normStr(r.Pedimento) === ped2 && nFrac(r.FraccionNico) === frac
+      );
+      // Solo hacer cross-fraction si en su fracción tiene muy pocas o ninguna fila
+      // (si tiene suficientes es problema de matching, no de fracción)
+      const ownFracSum = ownFracRows.reduce((a,r)=>a+r.Cantidad, 0);
+      if (ownFracSum >= dsCant - 1) continue; // ya hay suficiente en su frac (problema de otro tipo)
+
+      // Buscar en TODO el pedimento (cualquier fracción), sin asignar
+      const lyAllPed = layoutRows.filter(r =>
+        !r.noIncluir && !assignment.has(r._idx) &&
+        normStr(r.Pedimento) === ped2
+      );
+      if (!lyAllPed.length) continue;
+
+      let matched = false;
+
+      // 1. desc exacta + país
+      if (!matched) {
+        const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B4_dp"); matched = true; }
+        }
+      }
+      // 2. solo descripción exacta
+      if (!matched) {
+        const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B4_d"); matched = true; }
+        }
+      }
+      // 3. descripción parcial (prefijo 60%) + país
+      if (!matched) {
+        const pref = dsDescNorm.slice(0, Math.max(8, Math.floor(dsDescNorm.length * 0.6)));
+        const pool = lyAllPed.filter(r => {
+          const ld = nDesc(r.Descripcion);
+          return normStr(r.PaisOrigen) === dsPaisNorm &&
+                 (ld.startsWith(pref) || pref.startsWith(ld.slice(0, pref.length)));
+        });
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B4_fp"); matched = true; }
+        }
+      }
+      // 4. solo país + cantidad
+      if (!matched) {
+        const pool = lyAllPed.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B4_p"); matched = true; }
+        }
+      }
+      // 5. cualquier fila del pedimento (solo cantidad) — último recurso
+      if (!matched) {
+        const sub = findSubsetCantOnly(lyAllPed, dsCant);
+        if (sub) { assignRows(sub, dsRow, "B4_any"); matched = true; }
+      }
+    }
+  }
+
   // ── FASE C: Marcar sin match las filas que quedaron sin asignar ──────────
   for (const row of layoutRows) {
     if (row.noIncluir || assignment.has(row._idx)) continue;
