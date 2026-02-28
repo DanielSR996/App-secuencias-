@@ -1718,15 +1718,7 @@ function readDS2020Sheet(sheet) {
   };
   const knownNorms = new Set(Object.values(DS_COL_MAP).flat().map(nH2020));
 
-  // Limitar columnas a las primeras 120 para evitar lentitud con archivos que tienen
-  // miles de columnas vacías por fórmulas expandidas en Excel
-  const sheetRange = sheet["!ref"] ? XLSX.utils.decode_range(sheet["!ref"]) : null;
-  const readOpts = { header: 1, defval: "" };
-  if (sheetRange && sheetRange.e.c > 119) {
-    const limitedRange = { s: sheetRange.s, e: { r: sheetRange.e.r, c: 119 } };
-    readOpts.range = limitedRange;
-  }
-  const rows = XLSX.utils.sheet_to_json(sheet, readOpts);
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return [];
 
   // Detectar fila header: la que tenga más columnas conocidas
@@ -1784,10 +1776,8 @@ function readLayout2020Sheet(sheet) {
   const range = XLSX.utils.decode_range(sheet["!ref"]);
   console.log("[Layout2020] ref:", sheet["!ref"], "filas totales:", range.e.r + 1, "cols:", range.e.c + 1);
 
-  // ── 1. Primeras 15 filas con sheet_to_json — limitar columnas a 120 máximo ─
-  // Archivos con miles de columnas vacías (fórmulas expandidas) harían esto lentísimo
-  const maxCol = Math.min(range.e.c, 119);
-  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: maxCol } };
+  // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
+  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: range.e.c } };
   const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
   console.log("[Layout2020] sampleRows leídas:", sampleRows.length);
 
@@ -1979,7 +1969,7 @@ function runCascade2020(layoutRows, dsRows) {
   };
 
   // findSubset: busca un subconjunto de filas que sume exactamente (dsCant, dsVal)
-  // Ordena por cant ascendente para las secs pequeñas, desc para las grandes
+  // Estrategia: greedy rápido primero, luego backtracking con poda de sufijo.
   const findSubset = (rows, dsCant, dsVal, tolC = 1, tolV = 4) => {
     if (rows.length === 0) return null;
 
@@ -1989,6 +1979,8 @@ function runCascade2020(layoutRows, dsRows) {
       const totalV = rows.reduce((a,r)=>a+r.ValorUSD,0);
       if (Math.abs(totalV - dsVal) <= tolV) return rows;
     }
+    // Si la suma total es menor que el objetivo, imposible
+    if (totalC < dsCant - tolC) return null;
 
     // 2. Greedy consecutivo (rápido para casos simples)
     const sorted = [...rows].sort((a,b) => a.Cantidad - b.Cantidad);
@@ -2014,11 +2006,18 @@ function runCascade2020(layoutRows, dsRows) {
       }
     }
 
-    // 3. Backtracking (resuelve subconjuntos discontinuos como 128k + 1k = 129k)
-    //    Orden descendente para podar ramas grandes primero.
+    // 3. Backtracking con poda de sufijo (branch & bound).
+    //    sortedDesc ya calculado arriba.
+    //    Precalcular sufijos: suffixC[i] = suma Cantidad desde i hasta el final.
+    //    Si sumC + suffixC[i] < dsCant - tolC → imposible llegar → podar.
+    const suffixC = new Array(sortedDesc.length + 1).fill(0);
+    for (let i = sortedDesc.length - 1; i >= 0; i--) {
+      suffixC[i] = suffixC[i + 1] + sortedDesc[i].Cantidad;
+    }
+
     let btResult = null;
     let btNodes  = 0;
-    const MAX_BT  = 300000;
+    const MAX_BT = 500000;
 
     const bt = (idx, sumC, sumV, current) => {
       if (btResult || btNodes > MAX_BT) return;
@@ -2028,21 +2027,68 @@ function runCascade2020(layoutRows, dsRows) {
         return;
       }
       if (idx >= sortedDesc.length) return;
-      if (sumC > dsCant + tolC) return; // poda: ya excedimos cant
+      if (sumC > dsCant + tolC) return;                       // poda superior
+      if (sumC + suffixC[idx] < dsCant - tolC) return;       // poda inferior (sufijo)
 
       const r = sortedDesc[idx];
-      // Incluir este elemento si no excede el tope de cant
       if (sumC + r.Cantidad <= dsCant + tolC) {
         current.push(r);
         bt(idx + 1, sumC + r.Cantidad, sumV + r.ValorUSD, current);
         current.pop();
       }
-      // Saltarlo
       if (!btResult) bt(idx + 1, sumC, sumV, current);
     };
 
     bt(0, 0, 0, []);
     return btResult;
+  };
+
+  // findSubsetCantOnly: igual que findSubset pero ignora valor USD (para fase B2).
+  // Mucho más rápido: solo necesita que la cantidad cuadre ±1.
+  const findSubsetCantOnly = (rows, dsCant, tolC = 1) => {
+    if (rows.length === 0) return null;
+    const totalC = rows.reduce((a,r)=>a+r.Cantidad,0);
+    if (Math.abs(totalC - dsCant) <= tolC) return rows;
+    if (totalC < dsCant - tolC) return null;
+
+    // Greedy ascendente
+    const sorted = [...rows].sort((a,b) => a.Cantidad - b.Cantidad);
+    for (let start = 0; start < Math.min(sorted.length, 60); start++) {
+      let sumC = 0, subset = [];
+      for (let j = start; j < sorted.length; j++) {
+        if (sumC + sorted[j].Cantidad > dsCant + tolC) break;
+        subset.push(sorted[j]);
+        sumC += sorted[j].Cantidad;
+        if (Math.abs(sumC - dsCant) <= tolC) return subset;
+      }
+    }
+    // Greedy descendente
+    const sortedDesc = [...rows].sort((a,b) => b.Cantidad - a.Cantidad);
+    for (let start = 0; start < Math.min(sortedDesc.length, 60); start++) {
+      let sumC = 0, subset = [];
+      for (let j = start; j < sortedDesc.length; j++) {
+        if (sumC + sortedDesc[j].Cantidad > dsCant + tolC && subset.length > 0) break;
+        subset.push(sortedDesc[j]);
+        sumC += sortedDesc[j].Cantidad;
+        if (Math.abs(sumC - dsCant) <= tolC) return subset;
+      }
+    }
+    // Backtracking con poda de sufijo
+    const suffixC = new Array(sortedDesc.length + 1).fill(0);
+    for (let i = sortedDesc.length - 1; i >= 0; i--) suffixC[i] = suffixC[i+1] + sortedDesc[i].Cantidad;
+    let result = null, nodes = 0;
+    const bt2 = (idx, sumC, cur) => {
+      if (result || nodes++ > 300000) return;
+      if (Math.abs(sumC - dsCant) <= tolC && cur.length > 0) { result = [...cur]; return; }
+      if (idx >= sortedDesc.length) return;
+      if (sumC > dsCant + tolC) return;
+      if (sumC + suffixC[idx] < dsCant - tolC) return;
+      const r = sortedDesc[idx];
+      if (sumC + r.Cantidad <= dsCant + tolC) { cur.push(r); bt2(idx+1, sumC+r.Cantidad, cur); cur.pop(); }
+      if (!result) bt2(idx+1, sumC, cur);
+    };
+    bt2(0, 0, []);
+    return result;
   };
 
   // Suma de 2 o 3 secuencias DS que coincida con total (tolerancia ±1 cant, ±4 val)
@@ -2243,62 +2289,91 @@ function runCascade2020(layoutRows, dsRows) {
       continue;
     }
 
-    // Múltiples DS secs: distribuir filas por descripción o por subconjunto
+    // Múltiples DS secs: distribuir filas por descripción/país → subconjunto → resto
     const dsSort = [...dsList].sort((a,b)=>(parseFloat(a["CantidadUMComercial"])||0)-(parseFloat(b["CantidadUMComercial"])||0));
     let remaining = [...allPFRows];
-    for (let i = 0; i < dsSort.length; i++) {
-      const m = dsSort[i];
-      const dsCant = parseFloat(m["CantidadUMComercial"])||0;
-      const dsVal  = parseFloat(m["ValorDolares"])||0;
-      const dsDescNorm = nDesc(m["DescripcionMercancia"]);
 
-      // Primero: buscar por descripción dentro de remaining
-      const byDescRows = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm);
-      if (byDescRows.length > 0) {
-        const sumC = byDescRows.reduce((a,r)=>a+r.Cantidad,0);
-        const sumV = byDescRows.reduce((a,r)=>a+r.ValorUSD,0);
-        if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
-          assignRows(byDescRows, m, "A2m");
-          const assignedIdx = new Set(byDescRows.map(r=>r._idx));
-          remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
-          continue;
+    for (let i = 0; i < dsSort.length; i++) {
+      if (!remaining.length) break;
+      const m = dsSort[i];
+      const dsCant     = parseFloat(m["CantidadUMComercial"])||0;
+      const dsVal      = parseFloat(m["ValorDolares"])||0;
+      const dsDescNorm = nDesc(m["DescripcionMercancia"]);
+      const dsPaisNorm = normStr(m["PaisOrigenDestino"]);
+      const esUltimo   = (i === dsSort.length - 1);
+
+      let matched = false;
+
+      // ── Estrategia 1: desc + país exacto ────────────────────────────────
+      const byDP = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
+      if (!matched && byDP.length > 0) {
+        const sC = byDP.reduce((a,r)=>a+r.Cantidad,0), sV = byDP.reduce((a,r)=>a+r.ValorUSD,0);
+        if (Math.abs(sC - dsCant) <= 1 && Math.abs(sV - dsVal) <= 4) {
+          assignRows(byDP, m, "A2m_dp"); matched = true;
+        } else {
+          const sub = findSubset(byDP, dsCant, dsVal, 1, 4);
+          if (sub) { assignRows(sub, m, "A2m_dp_sub"); matched = true; }
         }
       }
-      // Luego: subconjunto de remaining
-      if (i === dsSort.length - 1) {
-        // Último DS: solo asignar si cantidad y valor cuadran estrictamente ±1 / ±4
-        if (remaining.length > 0) {
-          const sumCR = remaining.reduce((a,r)=>a+r.Cantidad,0);
-          const sumVR = remaining.reduce((a,r)=>a+r.ValorUSD,0);
-          if (Math.abs(sumCR - dsCant) <= 1 && Math.abs(sumVR - dsVal) <= 4) {
-            assignRows(remaining, m, "A2m_last");
+
+      // ── Estrategia 2: solo descripción ───────────────────────────────────
+      if (!matched) {
+        const byD = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm);
+        if (byD.length > 0) {
+          const sC = byD.reduce((a,r)=>a+r.Cantidad,0), sV = byD.reduce((a,r)=>a+r.ValorUSD,0);
+          if (Math.abs(sC - dsCant) <= 1 && Math.abs(sV - dsVal) <= 4) {
+            assignRows(byD, m, "A2m_d"); matched = true;
           } else {
-            // Intentar subconjunto exacto del remanente
-            const subLast = findSubset(remaining, dsCant, dsVal, 1, 4);
-            if (subLast) {
-              assignRows(subLast, m, "A2m_last_sub");
-              const assignedIdx = new Set(subLast.map(r=>r._idx));
-              remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
-            }
+            const sub = findSubset(byD, dsCant, dsVal, 1, 4);
+            if (sub) { assignRows(sub, m, "A2m_d_sub"); matched = true; }
           }
-          remaining = [];
         }
-      } else {
-        const subset = findSubset(remaining, dsCant, dsVal, 1, 4);
-        if (subset) {
-          assignRows(subset, m, "A2m_sub");
-          const assignedIdx = new Set(subset.map(r=>r._idx));
-          remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
+      }
+
+      // ── Estrategia 3: solo país ──────────────────────────────────────────
+      if (!matched) {
+        const byP = remaining.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
+        if (byP.length > 0) {
+          const sC = byP.reduce((a,r)=>a+r.Cantidad,0), sV = byP.reduce((a,r)=>a+r.ValorUSD,0);
+          if (Math.abs(sC - dsCant) <= 1 && Math.abs(sV - dsVal) <= 4) {
+            assignRows(byP, m, "A2m_p"); matched = true;
+          } else {
+            const sub = findSubset(byP, dsCant, dsVal, 1, 4);
+            if (sub) { assignRows(sub, m, "A2m_p_sub"); matched = true; }
+          }
         }
+      }
+
+      // ── Estrategia 4: subconjunto del total remaining ───────────────────
+      if (!matched) {
+        if (esUltimo) {
+          // Último: si remaining cuadra exacto, asignar todo
+          const sC = remaining.reduce((a,r)=>a+r.Cantidad,0), sV = remaining.reduce((a,r)=>a+r.ValorUSD,0);
+          if (Math.abs(sC - dsCant) <= 1 && Math.abs(sV - dsVal) <= 4) {
+            assignRows(remaining, m, "A2m_last"); matched = true;
+          } else {
+            const sub = findSubset(remaining, dsCant, dsVal, 1, 4);
+            if (sub) { assignRows(sub, m, "A2m_last_sub"); matched = true; }
+          }
+        } else {
+          const sub = findSubset(remaining, dsCant, dsVal, 1, 4);
+          if (sub) { assignRows(sub, m, "A2m_sub"); matched = true; }
+        }
+      }
+
+      // Actualizar remaining quitando las filas asignadas
+      if (matched) {
+        remaining = remaining.filter(r => !assignment.has(r._idx));
       }
     }
-    // Si quedan filas restantes, intentar asignar al último DS solo si cuadra
+
+    // Si quedan filas sin asignar y hay DS sin usar, intentar asignar al último DS si cuadra
     if (remaining.length > 0) {
-      const dsLast = dsSort[dsSort.length - 1];
+      const dsLast  = dsSort[dsSort.length - 1];
       const dsCantL = parseFloat(dsLast["CantidadUMComercial"])||0;
       const dsValL  = parseFloat(dsLast["ValorDolares"])||0;
-      const sumCR = remaining.reduce((a,r)=>a+r.Cantidad,0);
-      const sumVR = remaining.reduce((a,r)=>a+r.ValorUSD,0);
+      const sumCR   = remaining.reduce((a,r)=>a+r.Cantidad,0);
+      const sumVR   = remaining.reduce((a,r)=>a+r.ValorUSD,0);
       if (!usedDS.has(dsLast._dsIdx) && Math.abs(sumCR - dsCantL) <= 1 && Math.abs(sumVR - dsValL) <= 4) {
         assignRows(remaining, dsLast, "A2m_rest");
       } else {
@@ -2334,17 +2409,23 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
-  // ── FASE B2: Fallback valor relajado (solo si cant global coincide) ──────
-  // Si la cantidad global cuadra pero quedan DS sin asignar por diferencias en USD,
-  // relajar tolerancia de valor (solo cantidad estricta ±1, valor ignorado).
-  // Esto cubre casos como PRUEBA 1 (3): cant global exacta pero USD difiere $7.
+  // ── FASE B2: Fallback cantidad-only (solo si cant global coincide) ───────
+  // Si la cantidad global cuadra pero quedan DS sin asignar (por diferencias en USD
+  // o backtracking con subconjuntos complejos), asignar priorizando cantidad ±1.
+  // Orden: primero desc+pais, luego desc, luego pais, luego PF completo.
   if (globalCantCuadra) {
-    const dsPendientes = dsRows.filter(r => !usedDS.has(r._dsIdx));
+    const dsPendientes = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+      .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
+
     for (const dsRow of dsPendientes) {
-      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      if (usedDS.has(dsRow._dsIdx)) continue;
+      const dsCant     = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      const dsVal      = parseFloat(dsRow["ValorDolares"])        || 0;
+      const ped2       = normStr(dsRow["Pedimento2"]);
+      const frac       = nFrac(normStr(dsRow["Fraccion"]));
+      const dsDescNorm = nDesc(dsRow["DescripcionMercancia"]);
+      const dsPaisNorm = normStr(dsRow["PaisOrigenDestino"]);
       if (dsCant === 0) continue;
-      const ped2 = normStr(dsRow["Pedimento2"]);
-      const frac = nFrac(normStr(dsRow["Fraccion"]));
 
       // Filas layout sin asignar del mismo Ped+Frac
       const lyPend = layoutRows.filter(r =>
@@ -2353,58 +2434,37 @@ function runCascade2020(layoutRows, dsRows) {
       );
       if (!lyPend.length) continue;
 
-      const sumC = lyPend.reduce((a,r)=>a+r.Cantidad,0);
-      // Primero: grupo completo coincide en cantidad
-      if (Math.abs(sumC - dsCant) <= 1) {
-        assignRows(lyPend, dsRow, "B2_cant");
-        continue;
-      }
-      // Segundo: subconjunto que coincida en cantidad (valor libre)
-      const sub = findSubset(lyPend, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
-      if (sub) assignRows(sub, dsRow, "B2_sub_cant");
-    }
-  }
+      let matched = false;
 
-  // ── FASE B3: Cross-fracción por descripción (solo si cant global coincide) ─
-  // Cuando una DS sec no tiene filas en su fracción exacta pero sí hay Layout rows
-  // con la misma descripción (y pedimento) que suman ±1 en cantidad.
-  // Cubre casos donde DS y Layout usan fracciones distintas para el mismo artículo.
-  if (globalCantCuadra) {
-    const dsPendB3 = dsRows.filter(r => !usedDS.has(r._dsIdx));
-    for (const dsRow of dsPendB3) {
-      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
-      if (dsCant === 0) continue;
-      const ped2    = normStr(dsRow["Pedimento2"]);
-      const dsDescN = nDesc(dsRow["DescripcionMercancia"]);
-      const dsPais  = normStr(dsRow["PaisOrigenDestino"]);
-
-      // Buscar filas Layout sin asignar, mismo Ped, desc ≈ DS, ignorando fracción
-      const lyByDesc = layoutRows.filter(r =>
-        !r.noIncluir && !assignment.has(r._idx) &&
-        normStr(r.Pedimento) === ped2 &&
-        nDesc(r.Descripcion) === dsDescN
-      );
-      if (!lyByDesc.length) continue;
-
-      const sumC = lyByDesc.reduce((a,r)=>a+r.Cantidad,0);
-      if (Math.abs(sumC - dsCant) <= 1) {
-        assignRows(lyByDesc, dsRow, "B3_xfrac");
-        continue;
-      }
-      // Intentar filtrar también por país si no hay coincidencia total
-      const lyByDescPais = lyByDesc.filter(r => normStr(r.PaisOrigen) === dsPais);
-      if (lyByDescPais.length) {
-        const sumCP = lyByDescPais.reduce((a,r)=>a+r.Cantidad,0);
-        if (Math.abs(sumCP - dsCant) <= 1) {
-          assignRows(lyByDescPais, dsRow, "B3_xfrac_pais");
-          continue;
+      // 1. desc + país, con val ±4
+      if (!matched) {
+        const pool = lyPend.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B2_dp"); matched = true; }
         }
-        const sub = findSubset(lyByDescPais, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
-        if (sub) { assignRows(sub, dsRow, "B3_xfrac_sub"); continue; }
       }
-      // Sin filtro de país
-      const sub = findSubset(lyByDesc, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
-      if (sub) assignRows(sub, dsRow, "B3_xfrac_sub2");
+      // 2. solo descripción
+      if (!matched) {
+        const pool = lyPend.filter(r => nDesc(r.Descripcion) === dsDescNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B2_d"); matched = true; }
+        }
+      }
+      // 3. solo país
+      if (!matched) {
+        const pool = lyPend.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B2_p"); matched = true; }
+        }
+      }
+      // 4. Ped+Frac completo (cantidad-only)
+      if (!matched) {
+        const sub = findSubset(lyPend, dsCant, dsVal, 1, 4) || findSubsetCantOnly(lyPend, dsCant);
+        if (sub) { assignRows(sub, dsRow, "B2_pf"); matched = true; }
+      }
     }
   }
 
