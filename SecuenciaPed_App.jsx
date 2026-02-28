@@ -1891,7 +1891,12 @@ function runCascade2020(layoutRows, dsRows) {
   const nFrac = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
   const normStr = (v) => String(v ?? "").trim();
   // Normaliza descripción: lowercase, collapse whitespace, quita paréntesis redundantes
-  const nDesc = (s) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  // nDesc: normaliza descripción — espacios, "/" sin espacios alrededor, paréntesis
+  const nDesc = (s) => String(s ?? "").trim().toLowerCase()
+    .replace(/\s*\/\s*/g, "/")   // "hoja / divisores" → "hoja/divisores"
+    .replace(/\s*\(\s*/g, "(")   // "resistencia ( las" → "resistencia (las"
+    .replace(/\s*\)\s*/g, ")")
+    .replace(/\s+/g, " ");
 
   const dsTotalC = dsRows.reduce((a,r)=>a+(parseFloat(r["CantidadUMComercial"])||0),0);
   const dsTotalV = dsRows.reduce((a,r)=>a+(parseFloat(r["ValorDolares"])||0),0);
@@ -2464,6 +2469,100 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const sub = findSubset(lyPend, dsCant, dsVal, 1, 4) || findSubsetCantOnly(lyPend, dsCant);
         if (sub) { assignRows(sub, dsRow, "B2_pf"); matched = true; }
+      }
+    }
+  }
+
+  // ── FASE B3: Partición PF-total cuando cant PF coincide exactamente ──────
+  // Para grupos donde el total del Ped+Frac entre DS y Layout coincide ±1 en
+  // cantidad, pero el backtracking no pudo dividir (ej: 85340004, 48081001).
+  // Estrategia: distribuir Layout rows entre DS secs por país, luego por greedy.
+  {
+    const dsPendB3 = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+      .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
+
+    // Agrupar DS pendientes por PF
+    const b3ByPF = new Map();
+    for(const ds of dsPendB3){
+      const k = `${normStr(ds["Pedimento2"])}|||${nFrac(normStr(ds["Fraccion"]))}`;
+      if(!b3ByPF.has(k)) b3ByPF.set(k,[]);
+      b3ByPF.get(k).push(ds);
+    }
+
+    for(const [kPF, dsList] of b3ByPF){
+      // Layout pendiente del mismo PF
+      const lyPend = layoutRows.filter(r =>
+        !r.noIncluir && !assignment.has(r._idx) &&
+        `${normStr(r.Pedimento)}|||${nFrac(r.FraccionNico)}` === kPF
+      );
+      if(!lyPend.length) continue;
+
+      const lySumC = lyPend.reduce((a,r)=>a+r.Cantidad,0);
+      const dsSumC = dsList.reduce((a,r)=>a+(parseFloat(r["CantidadUMComercial"])||0),0);
+      // Solo aplicar si el total del PF coincide ±1
+      if(Math.abs(lySumC - dsSumC) > 1) continue;
+
+      // Distribuir Layout rows entre DS secs: por país, luego greedy
+      let remaining = [...lyPend];
+      for(let i=0; i<dsList.length; i++){
+        if(!remaining.length) break;
+        const ds      = dsList[i];
+        const dsCant  = parseFloat(ds["CantidadUMComercial"])||0;
+        const dsVal   = parseFloat(ds["ValorDolares"])||0;
+        const dsPais  = normStr(ds["PaisOrigenDestino"]);
+        const isLast  = i === dsList.length - 1;
+
+        // Si es el último, asignar todo lo que queda si suma coincide ±1
+        if(isLast){
+          const remSum = remaining.reduce((a,r)=>a+r.Cantidad,0);
+          if(Math.abs(remSum - dsCant) <= 1) assignRows(remaining, ds, "B3_last");
+          break;
+        }
+
+        // Intentar asignar por país exacto primero
+        const byPais = remaining.filter(r => normStr(r.PaisOrigen) === dsPais);
+        if(byPais.length > 0){
+          const bpSum = byPais.reduce((a,r)=>a+r.Cantidad,0);
+          if(Math.abs(bpSum - dsCant) <= 1){
+            assignRows(byPais, ds, "B3_pais");
+            const used = new Set(byPais.map(r=>r._idx));
+            remaining = remaining.filter(r=>!used.has(r._idx));
+            continue;
+          }
+          // Subconjunto del grupo pais
+          const sub = findSubsetCantOnly(byPais, dsCant);
+          if(sub){
+            assignRows(sub, ds, "B3_pais_sub");
+            const used = new Set(sub.map(r=>r._idx));
+            remaining = remaining.filter(r=>!used.has(r._idx));
+            continue;
+          }
+        }
+
+        // Subconjunto del total remaining
+        const sub2 = findSubset(remaining, dsCant, dsVal, 1, 4) || findSubsetCantOnly(remaining, dsCant);
+        if(sub2){
+          assignRows(sub2, ds, "B3_sub");
+          const used = new Set(sub2.map(r=>r._idx));
+          remaining = remaining.filter(r=>!used.has(r._idx));
+          continue;
+        }
+
+        // Greedy: acumular filas hasta llenar la cuota de cantidad
+        // Solo si la cuota es factible (suma de las más pequeñas alcanza dsCant)
+        const sorted = [...remaining].sort((a,b)=>a.Cantidad-b.Cantidad);
+        let acc=0; const greedyRows=[];
+        for(const r of sorted){
+          if(acc + r.Cantidad > dsCant + 1) continue; // saltar si excede
+          greedyRows.push(r);
+          acc += r.Cantidad;
+          if(Math.abs(acc - dsCant) <= 1) break;
+        }
+        if(Math.abs(acc - dsCant) <= 1 && greedyRows.length > 0){
+          assignRows(greedyRows, ds, "B3_greedy");
+          const used = new Set(greedyRows.map(r=>r._idx));
+          remaining = remaining.filter(r=>!used.has(r._idx));
+        }
       }
     }
   }
