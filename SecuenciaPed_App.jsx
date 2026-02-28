@@ -2583,23 +2583,55 @@ function App2020() {
       setProgress2020(100);
 
       // Construir datos de tabla para vista in-app
-      const tRows = layout2020.layoutRows.map(r => {
-        const a = assignment.get(r._idx);
+      const nDescT = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+      const normT  = s => String(s ?? "").trim().toUpperCase();
+
+      // Paso 1: construir filas base con datos DS
+      const tRowsBase = layout2020.layoutRows.map(r => {
+        const a   = assignment.get(r._idx);
+        const ds  = a?.dsRow || null;
+        const pais = normT(r.PaisOrigen || r["Pais Origen"] || "");
+        const desc = String(r.Descripcion || r["DescripcionMercancia"] || "");
         return {
-          idx:       r._idx,
-          ped:       String(r.Pedimento  || ""),
-          frac:      String(r.FraccionNico || ""),
-          pais:      String(r.PaisOrigen  || r["Pais Origen"] || ""),
-          desc:      String(r.Descripcion || r["DescripcionMercancia"] || ""),
-          cant:      r.Cantidad || 0,
-          val:       r.ValorUSD  || 0,
-          secOrig:   String(r.SecCalc || ""),
-          secNueva:  a?.newSec  || "",
-          status:    a?.status  || "unmatched",
+          idx:        r._idx,
+          ped:        String(r.Pedimento  || ""),
+          frac:       String(r.FraccionNico || ""),
+          pais,
+          desc,
+          cant:       r.Cantidad || 0,
+          val:        r.ValorUSD  || 0,
+          secOrig:    String(r.SecCalc || ""),
+          secNueva:   a?.newSec  || "",
+          status:     a?.status  || "unmatched",
           estrategia: a?.estrategia || "",
-          reason:    a?.reason   || "Sin match",
+          reason:     a?.reason   || "Sin match",
+          // Datos del DS para comparación
+          dsCant:     ds ? (parseFloat(ds["CantidadUMComercial"]) || 0) : null,
+          dsVal:      ds ? (parseFloat(ds["ValorDolares"])        || 0) : null,
+          dsPais:     ds ? normT(ds["PaisOrigenDestino"] || "") : null,
+          dsDesc:     ds ? String(ds["DescripcionMercancia"] || "") : null,
+          // Clave de grupo para sumar cant/val de todas las filas con la misma secuencia asignada
+          groupKey:   a?.newSec ? `${r.Pedimento}||${r.FraccionNico}||${a.newSec}||${ds?._dsIdx ?? ""}` : null,
         };
       });
+
+      // Paso 2: calcular sumas por grupo
+      const groupSums = new Map();
+      for (const r of tRowsBase) {
+        if (!r.groupKey) continue;
+        if (!groupSums.has(r.groupKey)) groupSums.set(r.groupKey, { sumCant: 0, sumVal: 0 });
+        const g = groupSums.get(r.groupKey);
+        g.sumCant += r.cant;
+        g.sumVal  += r.val;
+      }
+
+      // Paso 3: añadir totales de grupo a cada fila
+      const tRows = tRowsBase.map(r => ({
+        ...r,
+        groupSumCant: r.groupKey ? (groupSums.get(r.groupKey)?.sumCant ?? null) : null,
+        groupSumVal:  r.groupKey ? (groupSums.get(r.groupKey)?.sumVal  ?? null) : null,
+      }));
+
       setTableData2020(tRows);
       setFilterPed2020("TODOS");
 
@@ -2771,6 +2803,41 @@ function App2020() {
             const statusLabel = s => s === "ok" ? "OK" : s === "new" ? "NUEVA" : s === "corrected" ? "CORR" : "—";
             const rowBg       = s => s === "ok" ? "rgba(34,197,94,0.06)" : s === "new" ? "rgba(245,158,11,0.07)" : s === "corrected" ? "rgba(251,146,60,0.07)" : "rgba(239,68,68,0.07)";
 
+            const nDescCmp = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+            const normCmp  = s => String(s ?? "").trim().toUpperCase();
+
+            // Helpers de comparación por pedimento (suma del grupo vs DS)
+            const cantInfo = r => {
+              if (r.dsCant === null || r.groupSumCant === null) return { color:"#64748b", label: Number(r.cant).toLocaleString("es-MX") };
+              const diff = r.groupSumCant - r.dsCant;
+              const absDiff = Math.abs(diff);
+              if (absDiff === 0) return { color:"#22c55e", label: Number(r.cant).toLocaleString("es-MX") };
+              if (absDiff <= 1)  return { color:"#22c55e", label: Number(r.cant).toLocaleString("es-MX") };
+              if (absDiff <= 10) return { color:"#f97316", label: `${Number(r.cant).toLocaleString("es-MX")} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
+              return { color:"#ef4444", label: `${Number(r.cant).toLocaleString("es-MX")} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
+            };
+            const valInfo = r => {
+              if (r.dsVal === null || r.groupSumVal === null) return { color:"#64748b", label: `$${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}` };
+              const diff = r.groupSumVal - r.dsVal;
+              const absDiff = Math.abs(diff);
+              const lbl = `$${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+              if (absDiff <= 4)  return { color:"#22c55e", label: lbl };
+              if (absDiff <= 50) return { color:"#f97316", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` };
+              return { color:"#ef4444", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` };
+            };
+            const paisInfo = r => {
+              if (!r.dsPais) return { color:"#94a3b8", label: r.pais };
+              const match = normCmp(r.pais) === normCmp(r.dsPais);
+              if (match) return { color:"#22c55e", label: r.pais };
+              return { color:"#fbbf24", label: `${r.pais}`, sub: `DS: ${r.dsPais}` };
+            };
+            const descInfo = r => {
+              if (!r.dsDesc) return { color:"#94a3b8", label: r.desc };
+              const match = nDescCmp(r.desc) === nDescCmp(r.dsDesc);
+              if (match) return { color:"#22c55e", label: r.desc };
+              return { color:"#fbbf24", label: r.desc, sub: `DS: ${r.dsDesc.slice(0,60)}${r.dsDesc.length>60?"…":""}` };
+            };
+
             const copyTSV = () => {
               const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tEstado";
               const body = filtered.map(r => [
@@ -2788,6 +2855,22 @@ function App2020() {
               navigator.clipboard.writeText(seqs).then(() => {
                 setCopiedMsg("¡Secuencias copiadas! Pega en Excel con Ctrl+V");
                 setTimeout(() => setCopiedMsg(""), 3000);
+              });
+            };
+
+            const copyPaises = () => {
+              // Cada línea: país del Layout · si difiere del DS, muestra "→ DS: <país DS>"
+              const lines = filtered.map(r => {
+                const lyP  = r.pais || "";
+                const dsP  = r.dsPais || "";
+                if (dsP && normCmp(lyP) !== normCmp(dsP)) {
+                  return `${lyP}\t→ DS: ${dsP}`;
+                }
+                return lyP;
+              }).join("\n");
+              navigator.clipboard.writeText(lines).then(() => {
+                setCopiedMsg("¡Países copiados! (Layout → DS si difieren). Pega en Excel con Ctrl+V");
+                setTimeout(() => setCopiedMsg(""), 3500);
               });
             };
 
@@ -2813,6 +2896,17 @@ function App2020() {
                   <button onClick={copySecs} style={{background:"#14532d",border:"none",color:"#86efac",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
                     # Copiar solo SECs
                   </button>
+                  {/* Botón copiar países */}
+                  <button onClick={copyPaises} style={{background:"#78350f",border:"none",color:"#fde68a",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
+                    🌐 Copiar países
+                  </button>
+                </div>
+
+                {/* Leyenda comparación */}
+                <div style={{display:"flex",gap:16,flexWrap:"wrap",marginBottom:10,fontSize:11,color:"#64748b"}}>
+                  {[["#22c55e","Coincide con DS"],["#f97316","Diferencia pequeña (±)"],["#ef4444","Diferencia grande"],["#fbbf24","País/Desc distinto al DS"]].map(([c,t])=>(
+                    <span key={t}><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:c,marginRight:4}} />{t}</span>
+                  ))}
                 </div>
 
                 {/* Mensaje de copiado */}
@@ -2823,35 +2917,53 @@ function App2020() {
                 )}
 
                 {/* Tabla */}
-                <div style={{overflowX:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:480,overflowY:"auto"}}>
+                <div style={{overflowX:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:500,overflowY:"auto"}}>
                   <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:"DM Mono, monospace"}}>
                     <thead>
                       <tr style={{background:"#0f172a",position:"sticky",top:0,zIndex:2}}>
                         {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Estado"].map(h => (
-                          <th key={h} style={{padding:"8px 10px",textAlign:"left",color:"#64748b",fontWeight:700,borderBottom:"1px solid #1e293b",whiteSpace:"nowrap",fontSize:11}}>{h}</th>
+                          <th key={h} style={{padding:"8px 10px",textAlign:["Cantidad","Valor USD"].includes(h)?"right":"left",color:"#64748b",fontWeight:700,borderBottom:"1px solid #1e293b",whiteSpace:"nowrap",fontSize:11}}>{h}</th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
-                      {filtered.map(r => (
-                        <tr key={r.idx} style={{background:rowBg(r.status),borderBottom:"1px solid rgba(30,41,59,0.8)"}}>
-                          {/* SEC CALC — columna principal */}
-                          <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:70}}>
-                            {r.secNueva || <span style={{color:"#475569"}}>—</span>}
-                          </td>
-                          <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
-                          <td style={{padding:"6px 10px",color:"#cbd5e1"}}>{r.frac}</td>
-                          <td style={{padding:"6px 10px",color:"#94a3b8"}}>{r.pais}</td>
-                          <td style={{padding:"6px 10px",color:"#94a3b8",maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.desc}>{r.desc.slice(0,55)}{r.desc.length>55?"…":""}</td>
-                          <td style={{padding:"6px 10px",color:"#cbd5e1",textAlign:"right"}}>{Number(r.cant).toLocaleString("es-MX")}</td>
-                          <td style={{padding:"6px 10px",color:"#cbd5e1",textAlign:"right"}}>${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
-                          <td style={{padding:"6px 10px"}}>
-                            <span style={{background:statusColor(r.status)+"22",color:statusColor(r.status),padding:"2px 7px",borderRadius:3,fontSize:10,fontWeight:700}}>
-                              {statusLabel(r.status)}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
+                      {filtered.map(r => {
+                        const ci = cantInfo(r);
+                        const vi = valInfo(r);
+                        const pi = paisInfo(r);
+                        const di = descInfo(r);
+                        return (
+                          <tr key={r.idx} style={{background:rowBg(r.status),borderBottom:"1px solid rgba(30,41,59,0.8)"}}>
+                            {/* SEC CALC */}
+                            <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:70}}>
+                              {r.secNueva || <span style={{color:"#475569"}}>—</span>}
+                            </td>
+                            <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
+                            <td style={{padding:"6px 10px",color:"#cbd5e1"}}>{r.frac}</td>
+                            {/* País — verde si coincide, amarillo si difiere */}
+                            <td style={{padding:"6px 10px",minWidth:60}}>
+                              <span style={{color:pi.color,fontWeight:pi.sub?700:400}}>{r.pais||"—"}</span>
+                              {pi.sub && <div style={{color:"#fbbf24",fontSize:10,opacity:0.8}}>{pi.sub}</div>}
+                            </td>
+                            {/* Descripción — verde si coincide, amarillo si difiere */}
+                            <td style={{padding:"6px 10px",maxWidth:260}} title={r.desc}>
+                              <div style={{color:di.color,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {r.desc.slice(0,55)}{r.desc.length>55?"…":""}
+                              </div>
+                              {di.sub && <div style={{color:"#fbbf24",fontSize:10,opacity:0.8,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{di.sub}</div>}
+                            </td>
+                            {/* Cantidad — color según diferencia grupo vs DS */}
+                            <td style={{padding:"6px 10px",textAlign:"right",color:ci.color,fontWeight:600,whiteSpace:"nowrap"}}>{ci.label}</td>
+                            {/* Valor USD — color según diferencia grupo vs DS */}
+                            <td style={{padding:"6px 10px",textAlign:"right",color:vi.color,fontWeight:600,whiteSpace:"nowrap"}}>{vi.label}</td>
+                            <td style={{padding:"6px 10px"}}>
+                              <span style={{background:statusColor(r.status)+"22",color:statusColor(r.status),padding:"2px 7px",borderRadius:3,fontSize:10,fontWeight:700}}>
+                                {statusLabel(r.status)}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                   {filtered.length === 0 && (
@@ -2859,7 +2971,7 @@ function App2020() {
                   )}
                 </div>
                 <div style={{marginTop:8,color:"#475569",fontSize:11}}>
-                  {filtered.length} filas mostradas · SEC verde=OK · amarillo=NUEVA · naranja=CORR · rojo=Sin match
+                  {filtered.length} filas · La diferencia en Cant/Val es la suma del grupo asignado vs el DS 551
                 </div>
               </div>
             );
