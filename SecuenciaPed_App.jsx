@@ -2545,6 +2545,9 @@ function App2020() {
   const [results2020, setResults2020] = useState(null);
   const [outputWb2020, setOutputWb2020] = useState(null);
   const [progress2020, setProgress2020] = useState(0);
+  const [tableData2020, setTableData2020] = useState(null);
+  const [filterPed2020, setFilterPed2020] = useState("TODOS");
+  const [copiedMsg, setCopiedMsg] = useState("");
   const inputRef2020 = useRef(null);
 
   const process2020 = useCallback(async (file) => {
@@ -2579,6 +2582,27 @@ function App2020() {
       const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment, mismatchReasons);
       setProgress2020(100);
 
+      // Construir datos de tabla para vista in-app
+      const tRows = layout2020.layoutRows.map(r => {
+        const a = assignment.get(r._idx);
+        return {
+          idx:       r._idx,
+          ped:       String(r.Pedimento  || ""),
+          frac:      String(r.FraccionNico || ""),
+          pais:      String(r.PaisOrigen  || r["Pais Origen"] || ""),
+          desc:      String(r.Descripcion || r["DescripcionMercancia"] || ""),
+          cant:      r.Cantidad || 0,
+          val:       r.ValorUSD  || 0,
+          secOrig:   String(r.SecCalc || ""),
+          secNueva:  a?.newSec  || "",
+          status:    a?.status  || "unmatched",
+          estrategia: a?.estrategia || "",
+          reason:    a?.reason   || "Sin match",
+        };
+      });
+      setTableData2020(tRows);
+      setFilterPed2020("TODOS");
+
       setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName, pedMismatch, globalTotals: gt2020 });
       setOutputWb2020(newWb);
       setTimeout(() => setPhase2020("results"), 400);
@@ -2603,7 +2627,7 @@ function App2020() {
     a.click(); URL.revokeObjectURL(url);
   };
 
-  const reset2020 = () => { setPhase2020("upload"); setResults2020(null); setOutputWb2020(null); setError2020(null); setProgress2020(0); };
+  const reset2020 = () => { setPhase2020("upload"); setResults2020(null); setOutputWb2020(null); setError2020(null); setProgress2020(0); setTableData2020(null); setFilterPed2020("TODOS"); setCopiedMsg(""); };
 
   return (
     <div>
@@ -2737,6 +2761,109 @@ function App2020() {
             Total filas Layout: <b style={{color:"#f8fafc"}}>{results2020.total}</b> &nbsp;·&nbsp;
             Secuencias DS no usadas: <b style={{color: results2020.unusedDSCount>0?"#ef4444":"#22c55e"}}>{results2020.unusedDSCount}</b>
           </div>
+
+          {/* ── TABLA IN-APP ───────────────────────────────────────────────── */}
+          {tableData2020 && (() => {
+            const pedList = ["TODOS", ...Array.from(new Set(tableData2020.map(r => r.ped).filter(Boolean))).sort()];
+            const filtered = filterPed2020 === "TODOS" ? tableData2020 : tableData2020.filter(r => r.ped === filterPed2020);
+
+            const statusColor = s => s === "ok" ? "#22c55e" : s === "new" ? "#f59e0b" : s === "corrected" ? "#fb923c" : "#ef4444";
+            const statusLabel = s => s === "ok" ? "OK" : s === "new" ? "NUEVA" : s === "corrected" ? "CORR" : "—";
+            const rowBg       = s => s === "ok" ? "rgba(34,197,94,0.06)" : s === "new" ? "rgba(245,158,11,0.07)" : s === "corrected" ? "rgba(251,146,60,0.07)" : "rgba(239,68,68,0.07)";
+
+            const copyTSV = () => {
+              const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tEstado";
+              const body = filtered.map(r => [
+                r.secNueva, r.ped, r.frac, r.pais,
+                r.desc, r.cant, r.val.toFixed(2), statusLabel(r.status)
+              ].join("\t")).join("\n");
+              navigator.clipboard.writeText(hdr + "\n" + body).then(() => {
+                setCopiedMsg("¡Tabla copiada! Pega en Excel con Ctrl+V");
+                setTimeout(() => setCopiedMsg(""), 3000);
+              });
+            };
+
+            const copySecs = () => {
+              const seqs = filtered.map(r => r.secNueva || "").join("\n");
+              navigator.clipboard.writeText(seqs).then(() => {
+                setCopiedMsg("¡Secuencias copiadas! Pega en Excel con Ctrl+V");
+                setTimeout(() => setCopiedMsg(""), 3000);
+              });
+            };
+
+            return (
+              <div style={{marginTop:8}}>
+                {/* Barra de herramientas */}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+                  <div style={{color:"#94a3b8",fontSize:12,fontWeight:700,letterSpacing:"0.08em"}}>TABLA DE SECUENCIAS IN-APP</div>
+                  <div style={{flex:1}} />
+                  {/* Filtro pedimento */}
+                  <select
+                    value={filterPed2020}
+                    onChange={e => setFilterPed2020(e.target.value)}
+                    style={{background:"#0f172a",color:"#f8fafc",border:"1px solid #334155",borderRadius:4,padding:"5px 10px",fontSize:12,cursor:"pointer"}}
+                  >
+                    {pedList.map(p => <option key={p} value={p}>{p === "TODOS" ? "Todos los pedimentos" : p}</option>)}
+                  </select>
+                  {/* Botón copiar tabla */}
+                  <button onClick={copyTSV} style={{background:"#1e40af",border:"none",color:"#bfdbfe",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
+                    📋 Copiar tabla (Excel)
+                  </button>
+                  {/* Botón copiar solo SECs */}
+                  <button onClick={copySecs} style={{background:"#14532d",border:"none",color:"#86efac",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
+                    # Copiar solo SECs
+                  </button>
+                </div>
+
+                {/* Mensaje de copiado */}
+                {copiedMsg && (
+                  <div style={{background:"rgba(34,197,94,0.15)",border:"1px solid #22c55e",borderRadius:4,padding:"8px 14px",marginBottom:10,color:"#86efac",fontSize:12}}>
+                    ✓ {copiedMsg}
+                  </div>
+                )}
+
+                {/* Tabla */}
+                <div style={{overflowX:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:480,overflowY:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:"DM Mono, monospace"}}>
+                    <thead>
+                      <tr style={{background:"#0f172a",position:"sticky",top:0,zIndex:2}}>
+                        {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Estado"].map(h => (
+                          <th key={h} style={{padding:"8px 10px",textAlign:"left",color:"#64748b",fontWeight:700,borderBottom:"1px solid #1e293b",whiteSpace:"nowrap",fontSize:11}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map(r => (
+                        <tr key={r.idx} style={{background:rowBg(r.status),borderBottom:"1px solid rgba(30,41,59,0.8)"}}>
+                          {/* SEC CALC — columna principal */}
+                          <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:70}}>
+                            {r.secNueva || <span style={{color:"#475569"}}>—</span>}
+                          </td>
+                          <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
+                          <td style={{padding:"6px 10px",color:"#cbd5e1"}}>{r.frac}</td>
+                          <td style={{padding:"6px 10px",color:"#94a3b8"}}>{r.pais}</td>
+                          <td style={{padding:"6px 10px",color:"#94a3b8",maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.desc}>{r.desc.slice(0,55)}{r.desc.length>55?"…":""}</td>
+                          <td style={{padding:"6px 10px",color:"#cbd5e1",textAlign:"right"}}>{Number(r.cant).toLocaleString("es-MX")}</td>
+                          <td style={{padding:"6px 10px",color:"#cbd5e1",textAlign:"right"}}>${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+                          <td style={{padding:"6px 10px"}}>
+                            <span style={{background:statusColor(r.status)+"22",color:statusColor(r.status),padding:"2px 7px",borderRadius:3,fontSize:10,fontWeight:700}}>
+                              {statusLabel(r.status)}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filtered.length === 0 && (
+                    <div style={{padding:"32px",textAlign:"center",color:"#475569",fontSize:13}}>Sin filas para el filtro seleccionado</div>
+                  )}
+                </div>
+                <div style={{marginTop:8,color:"#475569",fontSize:11}}>
+                  {filtered.length} filas mostradas · SEC verde=OK · amarillo=NUEVA · naranja=CORR · rojo=Sin match
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
