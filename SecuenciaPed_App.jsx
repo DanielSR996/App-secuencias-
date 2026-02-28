@@ -2859,17 +2859,14 @@ function App2020() {
             };
 
             const copyPaises = () => {
-              // Cada línea: país del Layout · si difiere del DS, muestra "→ DS: <país DS>"
+              // Copia el país "correcto": si el DS tiene país, usa ese; si no, usa el del Layout
               const lines = filtered.map(r => {
-                const lyP  = r.pais || "";
-                const dsP  = r.dsPais || "";
-                if (dsP && normCmp(lyP) !== normCmp(dsP)) {
-                  return `${lyP}\t→ DS: ${dsP}`;
-                }
-                return lyP;
+                const lyP = r.pais || "";
+                const dsP = r.dsPais || "";
+                return dsP ? dsP : lyP;
               }).join("\n");
               navigator.clipboard.writeText(lines).then(() => {
-                setCopiedMsg("¡Países copiados! (Layout → DS si difieren). Pega en Excel con Ctrl+V");
+                setCopiedMsg("¡Países copiados! (país del DS cuando existe, si no el del Layout). Pega en Excel con Ctrl+V");
                 setTimeout(() => setCopiedMsg(""), 3500);
               });
             };
