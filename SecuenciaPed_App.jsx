@@ -1899,9 +1899,13 @@ function runCascade2020(layoutRows, dsRows) {
   const lyTotalV = layoutRows.filter(r=>!r.noIncluir).reduce((a,r)=>a+r.ValorUSD,0);
   const diffC = Math.abs(lyTotalC - dsTotalC);
   const diffV = Math.abs(lyTotalV - dsTotalV);
-  const globalCuadra = diffC <= 1 && diffV <= 5;
-  if (diffC > 1 || diffV > 5) {
-    console.warn("[Cascade2020] Total global: Layout Cant=", lyTotalC, "Val=", lyTotalV, "| DS Cant=", dsTotalC, "Val=", dsTotalV, "| diff Cant=", diffC, "Val=", diffV);
+  // globalCuadra se basa SOLO en cantidad — si cant global coincide, todo layout debe asignarse
+  // El valor USD puede tener diferencias pequeñas por redondeos entre el DS y el Layout
+  const globalCantCuadra = diffC <= 1;
+  const globalValCuadra  = diffV <= 5;
+  const globalCuadra     = globalCantCuadra; // para lógica de asignación, solo cuenta cantidad
+  if (diffC > 1) {
+    console.warn("[Cascade2020] Cantidades globales NO coinciden: Layout=", lyTotalC, "DS=", dsTotalC, "diff=", diffC);
   }
   // Una secuencia es "real" si es un número válido (no ".", no vacío)
   const isRealSec = (v) => {
@@ -2320,6 +2324,37 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
+  // ── FASE B2: Fallback valor relajado (solo si cant global coincide) ──────
+  // Si la cantidad global cuadra pero quedan DS sin asignar por diferencias en USD,
+  // relajar tolerancia de valor (solo cantidad estricta ±1, valor ignorado).
+  // Esto cubre casos como PRUEBA 1 (3): cant global exacta pero USD difiere $7.
+  if (globalCantCuadra) {
+    const dsPendientes = dsRows.filter(r => !usedDS.has(r._dsIdx));
+    for (const dsRow of dsPendientes) {
+      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      if (dsCant === 0) continue;
+      const ped2 = normStr(dsRow["Pedimento2"]);
+      const frac = nFrac(normStr(dsRow["Fraccion"]));
+
+      // Filas layout sin asignar del mismo Ped+Frac
+      const lyPend = layoutRows.filter(r =>
+        !r.noIncluir && !assignment.has(r._idx) &&
+        normStr(r.Pedimento) === ped2 && nFrac(r.FraccionNico) === frac
+      );
+      if (!lyPend.length) continue;
+
+      const sumC = lyPend.reduce((a,r)=>a+r.Cantidad,0);
+      // Primero: grupo completo coincide en cantidad
+      if (Math.abs(sumC - dsCant) <= 1) {
+        assignRows(lyPend, dsRow, "B2_cant");
+        continue;
+      }
+      // Segundo: subconjunto que coincida en cantidad (valor libre)
+      const sub = findSubset(lyPend, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
+      if (sub) assignRows(sub, dsRow, "B2_sub_cant");
+    }
+  }
+
   // ── FASE C: Marcar sin match las filas que quedaron sin asignar ──────────
   for (const row of layoutRows) {
     if (row.noIncluir || assignment.has(row._idx)) continue;
@@ -2408,7 +2443,7 @@ function runCascade2020(layoutRows, dsRows) {
   }
 
   return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons,
-    globalTotals: { dsCant: dsTotalC, dsVal: dsTotalV, lyCant: lyTotalC, lyVal: lyTotalV, cuadra: globalCuadra } };
+    globalTotals: { dsCant: dsTotalC, dsVal: dsTotalV, lyCant: lyTotalC, lyVal: lyTotalV, cuadra: globalCantCuadra, cuadraVal: globalValCuadra } };
 }
 
 /** Construye el Excel 2020 de salida: modifica celdas específicas del Layout. */
@@ -2805,21 +2840,35 @@ function App2020() {
             ].map(c => <StatCard key={c.label} label={c.label} value={c.value} sub={c.sub} accent={c.accent} />)}
           </div>
           {results2020.globalTotals && (() => {
-            const gt = results2020.globalTotals;
-            const cuadra = gt.cuadra;
-            const fmt = n => Number(n).toLocaleString("es-MX", {maximumFractionDigits:0});
+            const gt    = results2020.globalTotals;
+            const cantOk = gt.cuadra;
+            const valOk  = gt.cuadraVal ?? (Math.abs(gt.lyVal - gt.dsVal) <= 5);
+            const fmt  = n => Number(n).toLocaleString("es-MX", {maximumFractionDigits:0});
             const fmtV = n => Number(n).toLocaleString("es-MX", {maximumFractionDigits:2});
+            const diffC = gt.lyCant - gt.dsCant;
+            const diffV = gt.lyVal  - gt.dsVal;
             return (
-              <div style={{background: cuadra ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.12)", border:`1px solid ${cuadra?"rgba(34,197,94,0.3)":"#ef4444"}`, borderRadius:6, padding:"16px 20px", marginBottom:16, fontSize:13}}>
-                <div style={{fontWeight:700, marginBottom:10, color: cuadra ? "#22c55e" : "#ef4444", fontSize:14}}>
-                  {cuadra ? "✓ Totales globales coinciden — todas las filas deben asignarse" : "⚠ Totales globales NO coinciden — puede haber filas sin asignar"}
+              <div style={{borderRadius:6, padding:"16px 20px", marginBottom:16, fontSize:13,
+                background: cantOk ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.12)",
+                border:`1px solid ${cantOk ? "rgba(34,197,94,0.3)" : "#ef4444"}`}}>
+                {/* Título cantidad */}
+                <div style={{fontWeight:700, marginBottom:6, fontSize:14,
+                  color: cantOk ? "#22c55e" : "#ef4444"}}>
+                  {cantOk ? "✓ Cantidad global coincide — todas las filas serán asignadas"
+                           : "⚠ Cantidad global NO coincide — habrá filas sin asignar"}
+                </div>
+                {/* Subtítulo valor */}
+                <div style={{marginBottom:12, fontSize:12,
+                  color: valOk ? "#86efac" : "#fbbf24"}}>
+                  {valOk ? "✓ Valor USD global también coincide"
+                          : `ℹ Valor USD difiere $${Math.abs(diffV).toFixed(2)} — aceptable por redondeos, las secuencias se asignarán por cantidad`}
                 </div>
                 <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
                   {[
-                    {label:"DS — Cantidad", val:fmt(gt.dsCant), color:"#94a3b8"},
-                    {label:"Layout — Cantidad", val:fmt(gt.lyCant), color: Math.abs(gt.lyCant-gt.dsCant)<=1?"#22c55e":"#ef4444"},
-                    {label:"DS — Valor USD", val:`$${fmtV(gt.dsVal)}`, color:"#94a3b8"},
-                    {label:"Layout — Valor USD", val:`$${fmtV(gt.lyVal)}`, color: Math.abs(gt.lyVal-gt.dsVal)<=5?"#22c55e":"#ef4444"},
+                    {label:"DS — Cantidad",      val: fmt(gt.dsCant),        color:"#94a3b8"},
+                    {label:"Layout — Cantidad",  val: fmt(gt.lyCant),        color: cantOk ? "#22c55e" : "#ef4444"},
+                    {label:"DS — Valor USD",     val: `$${fmtV(gt.dsVal)}`,  color:"#94a3b8"},
+                    {label:"Layout — Valor USD", val: `$${fmtV(gt.lyVal)}`,  color: valOk ? "#22c55e" : "#fbbf24"},
                   ].map(item=>(
                     <div key={item.label}>
                       <div style={{color:"#475569",fontSize:10,fontFamily:"DM Mono, monospace",marginBottom:4}}>{item.label}</div>
@@ -2827,15 +2876,15 @@ function App2020() {
                     </div>
                   ))}
                 </div>
-                {!cuadra && (
+                {!cantOk && (
                   <div style={{marginTop:10,color:"#fca5a5",fontSize:12}}>
-                    Diferencia — Cant: {(gt.lyCant - gt.dsCant).toLocaleString("es-MX")} | Val: ${(gt.lyVal - gt.dsVal).toFixed(2)}
-                    {" · "}Si los totales no coinciden, puede que falten pedimentos o haya filas duplicadas.
+                    Diferencia Cantidad: {diffC > 0 ? "+" : ""}{diffC.toLocaleString("es-MX")}
+                    {" · "}Verifica que ambas hojas correspondan al mismo pedimento y no falten filas.
                   </div>
                 )}
-                {cuadra && (
-                  <div style={{marginTop:10,color:"#86efac",fontSize:12}}>
-                    Los totales cuadran exactamente. Si hay filas sin secuencia, revisar descripciones o fracciones en Layout que difieran del DS.
+                {!valOk && cantOk && (
+                  <div style={{marginTop:10,color:"#fde68a",fontSize:12}}>
+                    Diferencia USD: {diffV > 0 ? "+" : ""}${diffV.toFixed(2)} global — cada secuencia se asigna por cantidad (±1); el valor puede tener pequeñas variaciones de redondeo.
                   </div>
                 )}
               </div>
