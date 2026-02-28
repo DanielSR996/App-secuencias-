@@ -2161,7 +2161,9 @@ function runCascade2020(layoutRows, dsRows) {
   }
 
   // ── Helper: asignar un subconjunto de filas a una secuencia DS ───────────
-  const assignRows = (rows, dsRow, estrategia) => {
+  // fracCorr: si se pasa, significa que la fracción en el Layout difiere del DS
+  //           y se debe corregir en el Excel de salida (cross-fraction B4).
+  const assignRows = (rows, dsRow, estrategia, fracCorr = null) => {
     const newSec = normStr(dsRow["SecuenciaFraccion"]);
     const sumC = rows.reduce((a,r)=>a+r.Cantidad,0);
     const sumV = rows.reduce((a,r)=>a+r.ValorUSD,0);
@@ -2169,10 +2171,16 @@ function runCascade2020(layoutRows, dsRows) {
     const dsVal  = parseFloat(dsRow["ValorDolares"])||0;
     usedDS.add(dsRow._dsIdx);
     for (const row of rows) {
+      const fracOriginal = nFrac(row.FraccionNico);
+      const dsFrac       = nFrac(normStr(dsRow["Fraccion"]));
+      // Detectar si la fracción del Layout difiere de la del DS
+      const isCrossFrac  = fracCorr !== null || fracOriginal !== dsFrac;
       assignment.set(row._idx, {
         status: isRealSec(row.SecCalc) ? "corrected" : "new",
         newSec, dsRow, corrections: [], estrategia,
-        reason: `[${estrategia}] Sec=${newSec} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`,
+        fracCorr: isCrossFrac ? (fracCorr || dsFrac) : null,
+        fracOrig: isCrossFrac ? fracOriginal : null,
+        reason: `[${estrategia}] Sec=${newSec}${isCrossFrac ? ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]` : ""} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`,
       });
     }
   };
@@ -2612,7 +2620,7 @@ function runCascade2020(layoutRows, dsRows) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
           const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
-          if (sub) { assignRows(sub, dsRow, "B4_dp"); matched = true; }
+          if (sub) { assignRows(sub, dsRow, "B4_dp", frac); matched = true; }
         }
       }
       // 2. solo descripción exacta
@@ -2620,7 +2628,7 @@ function runCascade2020(layoutRows, dsRows) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm);
         if (pool.length) {
           const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
-          if (sub) { assignRows(sub, dsRow, "B4_d"); matched = true; }
+          if (sub) { assignRows(sub, dsRow, "B4_d", frac); matched = true; }
         }
       }
       // 3. descripción parcial (prefijo 60%) + país
@@ -2633,7 +2641,7 @@ function runCascade2020(layoutRows, dsRows) {
         });
         if (pool.length) {
           const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
-          if (sub) { assignRows(sub, dsRow, "B4_fp"); matched = true; }
+          if (sub) { assignRows(sub, dsRow, "B4_fp", frac); matched = true; }
         }
       }
       // 4. solo país + cantidad
@@ -2641,13 +2649,13 @@ function runCascade2020(layoutRows, dsRows) {
         const pool = lyAllPed.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
           const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
-          if (sub) { assignRows(sub, dsRow, "B4_p"); matched = true; }
+          if (sub) { assignRows(sub, dsRow, "B4_p", frac); matched = true; }
         }
       }
       // 5. cualquier fila del pedimento (solo cantidad) — último recurso
       if (!matched) {
         const sub = findSubsetCantOnly(lyAllPed, dsCant);
-        if (sub) { assignRows(sub, dsRow, "B4_any"); matched = true; }
+        if (sub) { assignRows(sub, dsRow, "B4_any", frac); matched = true; }
       }
     }
   }
@@ -2767,6 +2775,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   const S_CORR_FLD = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center",wrapText:true} };
   const styleAmarillo = { font:{bold:true,color:{rgb:"7D6608"}}, fill:{patternType:"solid",fgColor:{rgb:"FCF3CF"}}, alignment:{horizontal:"center"} };
   const styleAmarilloNota = { font:{italic:true,sz:10,color:{rgb:"7D6608"}}, fill:{patternType:"solid",fgColor:{rgb:"FCF3CF"}}, alignment:{wrapText:true} };
+  // Estilo morado/azul para fracción corregida cross-fraction
+  const S_FRAC_CORR     = { font:{bold:true,color:{rgb:"4A235A"}}, fill:{patternType:"solid",fgColor:{rgb:"E8DAEF"}}, alignment:{horizontal:"center"} };
+  const S_FRAC_CORR_NOTA= { font:{italic:true,sz:10,color:{rgb:"4A235A"}}, fill:{patternType:"solid",fgColor:{rgb:"E8DAEF"}}, alignment:{wrapText:true} };
 
   // Filas repetidas (mismo Ped+Frac+Pais+Cant+Val) → pintar amarillo (solo si tienen datos)
   const keyDup = (row) => `${row.Pedimento}|||${(row.FraccionNico||"").trim()}|||${row.PaisOrigen}|||${row.Cantidad}|||${row.ValorUSD}`;
@@ -2797,17 +2808,30 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
       const r = row._rowI;
 
       if (a && a.status !== "unmatched") {
-        const newSecVal = isNaN(parseFloat(a.newSec)) ? a.newSec : parseFloat(a.newSec);
-        const isOk = a.status === "ok";
+        const newSecVal  = isNaN(parseFloat(a.newSec)) ? a.newSec : parseFloat(a.newSec);
+        const isOk       = a.status === "ok";
+        const isCrossFrac = !!a.fracCorr;
 
-        // SEC CALC (amarillo si es fila repetida)
-        const styleSec = esDup ? styleAmarillo : (isOk ? S_OK_SEC : S_NEW_SEC);
+        // Elegir estilo: morado=cross-fraction, amarillo=duplicado, verde=ok, rojo=nuevo
+        const styleSec  = isCrossFrac ? S_FRAC_CORR
+                        : esDup       ? styleAmarillo
+                        : isOk        ? S_OK_SEC
+                        :               S_NEW_SEC;
+        const styleNota = isCrossFrac ? S_FRAC_CORR_NOTA
+                        : esDup       ? styleAmarilloNota
+                        : isOk        ? S_OK_NOTA
+                        :               S_NEW_NOTA;
+
+        // SEC CALC
         setCell(ws, r, colIdx.sec, newSecVal, styleSec);
 
-        // NOTAS (sin correcciones de país/fracción — no se modifican)
-        const nota = a.reason;
-        const styleNota = esDup ? styleAmarilloNota : (isOk ? S_OK_NOTA : S_NEW_NOTA);
-        setCell(ws, r, colIdx.notas, nota, styleNota);
+        // Fracción corregida (cross-fraction B4): escribir la fracción del DS en la celda FraccionNico
+        if (isCrossFrac && colIdx.frac >= 0) {
+          setCell(ws, r, colIdx.frac, a.fracCorr, S_FRAC_CORR);
+        }
+
+        // NOTAS
+        setCell(ws, r, colIdx.notas, a.reason, styleNota);
       } else if (esDup) {
         // Fila repetida sin match: pintar SEC CALC y NOTAS en amarillo para visibilidad
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
@@ -2989,11 +3013,14 @@ function App2020() {
           status:     a?.status  || "unmatched",
           estrategia: a?.estrategia || "",
           reason:     a?.reason   || "Sin match",
+          fracCorr:   a?.fracCorr || null,   // fracción corregida (cross-fraction)
+          fracOrig:   a?.fracOrig || null,   // fracción original en Layout
           // Datos del DS para comparación
           dsCant:     ds ? (parseFloat(ds["CantidadUMComercial"]) || 0) : null,
           dsVal:      ds ? (parseFloat(ds["ValorDolares"])        || 0) : null,
           dsPais:     ds ? normT(ds["PaisOrigenDestino"] || "") : null,
           dsDesc:     ds ? String(ds["DescripcionMercancia"] || "") : null,
+          dsFrac:     ds ? String(ds["Fraccion"] || "") : null,
           // Clave de grupo para sumar cant/val de todas las filas con la misma secuencia asignada
           groupKey:   a?.newSec ? `${r.Pedimento}||${r.FraccionNico}||${a.newSec}||${ds?._dsIdx ?? ""}` : null,
         };
@@ -3091,7 +3118,7 @@ function App2020() {
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada (Cant±1, Val±4 = DS)"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada (Cant±1, Val±4 = DS)"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
@@ -3334,7 +3361,17 @@ function App2020() {
                               {r.secNueva || <span style={{color:"#475569"}}>—</span>}
                             </td>
                             <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
-                            <td style={{padding:"6px 10px",color:"#cbd5e1"}}>{r.frac}</td>
+                            {/* Fracción — morado si fue corregida cross-fraction */}
+                            <td style={{padding:"6px 10px",minWidth:80}}>
+                              {r.fracCorr ? (
+                                <span title={`Fracción original en Layout: ${r.fracOrig}`}>
+                                  <span style={{color:"#c084fc",fontWeight:700}}>{r.fracCorr}</span>
+                                  <div style={{color:"#9333ea",fontSize:10,opacity:0.8}}>orig: {r.fracOrig}</div>
+                                </span>
+                              ) : (
+                                <span style={{color:"#cbd5e1"}}>{r.frac}</span>
+                              )}
+                            </td>
                             {/* País — verde si coincide, amarillo si difiere */}
                             <td style={{padding:"6px 10px",minWidth:60}}>
                               <span style={{color:pi.color,fontWeight:pi.sub?700:400}}>{r.pais||"—"}</span>
