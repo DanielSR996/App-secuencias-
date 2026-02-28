@@ -2596,16 +2596,6 @@ function runCascade2020(layoutRows, dsRows) {
       const dsPaisNorm = normStr(dsRow["PaisOrigenDestino"]);
       if (dsCant === 0) continue;
 
-      // Verificar cuántas filas tiene en su propia fracción (sin asignar)
-      const ownFracRows = layoutRows.filter(r =>
-        !r.noIncluir && !assignment.has(r._idx) &&
-        normStr(r.Pedimento) === ped2 && nFrac(r.FraccionNico) === frac
-      );
-      // Solo hacer cross-fraction si en su fracción tiene muy pocas o ninguna fila
-      // (si tiene suficientes es problema de matching, no de fracción)
-      const ownFracSum = ownFracRows.reduce((a,r)=>a+r.Cantidad, 0);
-      if (ownFracSum >= dsCant - 1) continue; // ya hay suficiente en su frac (problema de otro tipo)
-
       // Buscar en TODO el pedimento (cualquier fracción), sin asignar
       const lyAllPed = layoutRows.filter(r =>
         !r.noIncluir && !assignment.has(r._idx) &&
@@ -2615,7 +2605,7 @@ function runCascade2020(layoutRows, dsRows) {
 
       let matched = false;
 
-      // 1. desc exacta + país
+      // 1. desc exacta + país (cualquier fracción)
       if (!matched) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
@@ -2623,7 +2613,7 @@ function runCascade2020(layoutRows, dsRows) {
           if (sub) { assignRows(sub, dsRow, "B4_dp", frac); matched = true; }
         }
       }
-      // 2. solo descripción exacta
+      // 2. solo descripción exacta (cualquier fracción, cualquier país)
       if (!matched) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm);
         if (pool.length) {
@@ -2644,7 +2634,19 @@ function runCascade2020(layoutRows, dsRows) {
           if (sub) { assignRows(sub, dsRow, "B4_fp", frac); matched = true; }
         }
       }
-      // 4. solo país + cantidad
+      // 4. descripción parcial (cualquier país)
+      if (!matched) {
+        const pref = dsDescNorm.slice(0, Math.max(8, Math.floor(dsDescNorm.length * 0.6)));
+        const pool = lyAllPed.filter(r => {
+          const ld = nDesc(r.Descripcion);
+          return ld.startsWith(pref) || pref.startsWith(ld.slice(0, pref.length));
+        });
+        if (pool.length) {
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          if (sub) { assignRows(sub, dsRow, "B4_fd", frac); matched = true; }
+        }
+      }
+      // 5. solo país + cantidad
       if (!matched) {
         const pool = lyAllPed.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
@@ -2652,7 +2654,7 @@ function runCascade2020(layoutRows, dsRows) {
           if (sub) { assignRows(sub, dsRow, "B4_p", frac); matched = true; }
         }
       }
-      // 5. cualquier fila del pedimento (solo cantidad) — último recurso
+      // 6. cualquier fila del pedimento (solo cantidad) — último recurso absoluto
       if (!matched) {
         const sub = findSubsetCantOnly(lyAllPed, dsCant);
         if (sub) { assignRows(sub, dsRow, "B4_any", frac); matched = true; }
