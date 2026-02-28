@@ -1968,14 +1968,17 @@ function runCascade2020(layoutRows, dsRows) {
   // Ordena por cant ascendente para las secs pequeñas, desc para las grandes
   const findSubset = (rows, dsCant, dsVal, tolC = 1, tolV = 4) => {
     if (rows.length === 0) return null;
+
+    // 1. El grupo completo coincide
     const totalC = rows.reduce((a,r)=>a+r.Cantidad,0);
     if (Math.abs(totalC - dsCant) <= tolC) {
       const totalV = rows.reduce((a,r)=>a+r.ValorUSD,0);
-      if (Math.abs(totalV - dsVal) <= tolV) return rows; // el grupo completo coincide
+      if (Math.abs(totalV - dsVal) <= tolV) return rows;
     }
-    // Buscar subconjunto: ordenar por cant asc, acumular hasta llegar a dsCant
+
+    // 2. Greedy consecutivo (rápido para casos simples)
     const sorted = [...rows].sort((a,b) => a.Cantidad - b.Cantidad);
-    for (let start = 0; start < Math.min(sorted.length, 150); start++) {
+    for (let start = 0; start < Math.min(sorted.length, 60); start++) {
       let sumC = 0, sumV = 0, subset = [];
       for (let j = start; j < sorted.length; j++) {
         if (sumC + sorted[j].Cantidad > dsCant + tolC) break;
@@ -1985,9 +1988,8 @@ function runCascade2020(layoutRows, dsRows) {
         if (Math.abs(sumC - dsCant) <= tolC && Math.abs(sumV - dsVal) <= tolV) return subset;
       }
     }
-    // También probar orden descendente (secs grandes)
     const sortedDesc = [...rows].sort((a,b) => b.Cantidad - a.Cantidad);
-    for (let start = 0; start < Math.min(sortedDesc.length, 150); start++) {
+    for (let start = 0; start < Math.min(sortedDesc.length, 60); start++) {
       let sumC = 0, sumV = 0, subset = [];
       for (let j = start; j < sortedDesc.length; j++) {
         if (sumC + sortedDesc[j].Cantidad > dsCant + tolC && subset.length > 0) break;
@@ -1997,7 +1999,36 @@ function runCascade2020(layoutRows, dsRows) {
         if (Math.abs(sumC - dsCant) <= tolC && Math.abs(sumV - dsVal) <= tolV) return subset;
       }
     }
-    return null;
+
+    // 3. Backtracking (resuelve subconjuntos discontinuos como 128k + 1k = 129k)
+    //    Orden descendente para podar ramas grandes primero.
+    let btResult = null;
+    let btNodes  = 0;
+    const MAX_BT  = 300000;
+
+    const bt = (idx, sumC, sumV, current) => {
+      if (btResult || btNodes > MAX_BT) return;
+      btNodes++;
+      if (Math.abs(sumC - dsCant) <= tolC && Math.abs(sumV - dsVal) <= tolV && current.length > 0) {
+        btResult = [...current];
+        return;
+      }
+      if (idx >= sortedDesc.length) return;
+      if (sumC > dsCant + tolC) return; // poda: ya excedimos cant
+
+      const r = sortedDesc[idx];
+      // Incluir este elemento si no excede el tope de cant
+      if (sumC + r.Cantidad <= dsCant + tolC) {
+        current.push(r);
+        bt(idx + 1, sumC + r.Cantidad, sumV + r.ValorUSD, current);
+        current.pop();
+      }
+      // Saltarlo
+      if (!btResult) bt(idx + 1, sumC, sumV, current);
+    };
+
+    bt(0, 0, 0, []);
+    return btResult;
   };
 
   // Suma de 2 o 3 secuencias DS que coincida con total (tolerancia ±1 cant, ±4 val)
