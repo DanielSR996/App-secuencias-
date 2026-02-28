@@ -1718,7 +1718,15 @@ function readDS2020Sheet(sheet) {
   };
   const knownNorms = new Set(Object.values(DS_COL_MAP).flat().map(nH2020));
 
-  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+  // Limitar columnas a las primeras 120 para evitar lentitud con archivos que tienen
+  // miles de columnas vacías por fórmulas expandidas en Excel
+  const sheetRange = sheet["!ref"] ? XLSX.utils.decode_range(sheet["!ref"]) : null;
+  const readOpts = { header: 1, defval: "" };
+  if (sheetRange && sheetRange.e.c > 119) {
+    const limitedRange = { s: sheetRange.s, e: { r: sheetRange.e.r, c: 119 } };
+    readOpts.range = limitedRange;
+  }
+  const rows = XLSX.utils.sheet_to_json(sheet, readOpts);
   if (!rows.length) return [];
 
   // Detectar fila header: la que tenga más columnas conocidas
@@ -1776,8 +1784,10 @@ function readLayout2020Sheet(sheet) {
   const range = XLSX.utils.decode_range(sheet["!ref"]);
   console.log("[Layout2020] ref:", sheet["!ref"], "filas totales:", range.e.r + 1, "cols:", range.e.c + 1);
 
-  // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
-  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: range.e.c } };
+  // ── 1. Primeras 15 filas con sheet_to_json — limitar columnas a 120 máximo ─
+  // Archivos con miles de columnas vacías (fórmulas expandidas) harían esto lentísimo
+  const maxCol = Math.min(range.e.c, 119);
+  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: maxCol } };
   const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
   console.log("[Layout2020] sampleRows leídas:", sampleRows.length);
 
@@ -2352,6 +2362,49 @@ function runCascade2020(layoutRows, dsRows) {
       // Segundo: subconjunto que coincida en cantidad (valor libre)
       const sub = findSubset(lyPend, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
       if (sub) assignRows(sub, dsRow, "B2_sub_cant");
+    }
+  }
+
+  // ── FASE B3: Cross-fracción por descripción (solo si cant global coincide) ─
+  // Cuando una DS sec no tiene filas en su fracción exacta pero sí hay Layout rows
+  // con la misma descripción (y pedimento) que suman ±1 en cantidad.
+  // Cubre casos donde DS y Layout usan fracciones distintas para el mismo artículo.
+  if (globalCantCuadra) {
+    const dsPendB3 = dsRows.filter(r => !usedDS.has(r._dsIdx));
+    for (const dsRow of dsPendB3) {
+      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      if (dsCant === 0) continue;
+      const ped2    = normStr(dsRow["Pedimento2"]);
+      const dsDescN = nDesc(dsRow["DescripcionMercancia"]);
+      const dsPais  = normStr(dsRow["PaisOrigenDestino"]);
+
+      // Buscar filas Layout sin asignar, mismo Ped, desc ≈ DS, ignorando fracción
+      const lyByDesc = layoutRows.filter(r =>
+        !r.noIncluir && !assignment.has(r._idx) &&
+        normStr(r.Pedimento) === ped2 &&
+        nDesc(r.Descripcion) === dsDescN
+      );
+      if (!lyByDesc.length) continue;
+
+      const sumC = lyByDesc.reduce((a,r)=>a+r.Cantidad,0);
+      if (Math.abs(sumC - dsCant) <= 1) {
+        assignRows(lyByDesc, dsRow, "B3_xfrac");
+        continue;
+      }
+      // Intentar filtrar también por país si no hay coincidencia total
+      const lyByDescPais = lyByDesc.filter(r => normStr(r.PaisOrigen) === dsPais);
+      if (lyByDescPais.length) {
+        const sumCP = lyByDescPais.reduce((a,r)=>a+r.Cantidad,0);
+        if (Math.abs(sumCP - dsCant) <= 1) {
+          assignRows(lyByDescPais, dsRow, "B3_xfrac_pais");
+          continue;
+        }
+        const sub = findSubset(lyByDescPais, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
+        if (sub) { assignRows(sub, dsRow, "B3_xfrac_sub"); continue; }
+      }
+      // Sin filtro de país
+      const sub = findSubset(lyByDesc, dsCant, parseFloat(dsRow["ValorDolares"])||0, 1, 999999);
+      if (sub) assignRows(sub, dsRow, "B3_xfrac_sub2");
     }
   }
 
