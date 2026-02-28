@@ -2427,7 +2427,7 @@ function runCascade2020(layoutRows, dsRows) {
   // o backtracking con subconjuntos complejos), asignar priorizando cantidad ±1.
   // Orden: primero desc+pais, luego desc, luego pais, luego PF completo.
   if (globalCantCuadra) {
-    const dsPendientes = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+    const dsPendientes = [...dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"])||0) > 0)]
       .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
 
     for (const dsRow of dsPendientes) {
@@ -2486,7 +2486,7 @@ function runCascade2020(layoutRows, dsRows) {
   // cantidad, pero el backtracking no pudo dividir (ej: 85340004, 48081001).
   // Estrategia: distribuir Layout rows entre DS secs por país, luego por greedy.
   {
-    const dsPendB3 = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+    const dsPendB3 = [...dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"])||0) > 0)]
       .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
 
     // Agrupar DS pendientes por PF
@@ -2583,7 +2583,7 @@ function runCascade2020(layoutRows, dsRows) {
   //             fila del MISMO pedimento que esté sin asignar.
   //             Solo si cantidad global coincide (no inventamos unidades).
   if (globalCantCuadra) {
-    const dsPendB4 = [...dsRows.filter(r => !usedDS.has(r._dsIdx))]
+    const dsPendB4 = [...dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"])||0) > 0)]
       .sort((a,b) => (parseFloat(b["CantidadUMComercial"])||0) - (parseFloat(a["CantidadUMComercial"])||0)); // desc: primero los más grandes
 
     for (const dsRow of dsPendB4) {
@@ -2673,8 +2673,8 @@ function runCascade2020(layoutRows, dsRows) {
 
 
   // ── Totales asignados por sec (para verificación) ────────────────────────
-  // Secuencias DS no usadas
-  const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx));
+  // Secuencias DS no usadas: solo contar las que tienen cantidad real (>0)
+  const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"]) || 0) > 0);
   const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
   for (const a of assignment.values()) {
     if (a.status === "ok")             stats.verified++;
@@ -2711,6 +2711,7 @@ function runCascade2020(layoutRows, dsRows) {
   // Para DS usadas: verificar si el total Layout coincide con DS
   for (const dsRow of dsRows) {
     const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+    if (dsCant === 0) continue; // ignorar filas sin cantidad (totales, vacíos)
     const dsVal  = parseFloat(dsRow["ValorDolares"])        || 0;
     const asg    = assignedTotalsByDS.get(dsRow._dsIdx);
 
@@ -2876,6 +2877,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   if (dsWsOut && revCol >= 0 && dsRows) {
     for (const dsRow of dsRows) {
       if (typeof dsRow._rowI !== "number") continue;
+      if ((parseFloat(dsRow["CantidadUMComercial"]) || 0) === 0) continue; // saltar filas sin cantidad
       const addr = XLSX.utils.encode_cell({ r: dsRow._rowI, c: revCol });
       let reason = mismatchReasons?.get(dsRow._dsIdx);
       if (reason) {
