@@ -2185,13 +2185,14 @@ function runCascade2020(layoutRows, dsRows) {
     if (!allPFRows.length) continue;
 
     if (dsList.length === 1) {
-      // Ya fue intentado en Fase A, si llegó aquí no hay match exacto — forzar si totales globales coinciden
+      // Ya fue intentado en Fase A, si llegó aquí no hay match exacto
       const dsR = dsList[0];
       const dsCant = parseFloat(dsR["CantidadUMComercial"])||0;
+      const dsVal  = parseFloat(dsR["ValorDolares"])||0;
       const sumC = allPFRows.reduce((a,r)=>a+r.Cantidad,0);
       const sumV = allPFRows.reduce((a,r)=>a+r.ValorUSD,0);
-      // Si los totales cuadran globalmente, asignar de todas formas
-      if (globalCuadra && Math.abs(sumC - dsCant) <= dsCant * 0.01 + 1) {
+      // Solo asignar si cantidad cuadra estrictamente ±1 y valor ±4
+      if (Math.abs(sumC - dsCant) <= 1 && Math.abs(sumV - dsVal) <= 4) {
         assignRows(allPFRows, dsR, "A_forzado");
       }
       continue;
@@ -2220,8 +2221,23 @@ function runCascade2020(layoutRows, dsRows) {
       }
       // Luego: subconjunto de remaining
       if (i === dsSort.length - 1) {
-        if (remaining.length > 0) assignRows(remaining, m, "A2m_last");
-        remaining = [];
+        // Último DS: solo asignar si cantidad y valor cuadran estrictamente ±1 / ±4
+        if (remaining.length > 0) {
+          const sumCR = remaining.reduce((a,r)=>a+r.Cantidad,0);
+          const sumVR = remaining.reduce((a,r)=>a+r.ValorUSD,0);
+          if (Math.abs(sumCR - dsCant) <= 1 && Math.abs(sumVR - dsVal) <= 4) {
+            assignRows(remaining, m, "A2m_last");
+          } else {
+            // Intentar subconjunto exacto del remanente
+            const subLast = findSubset(remaining, dsCant, dsVal, 1, 4);
+            if (subLast) {
+              assignRows(subLast, m, "A2m_last_sub");
+              const assignedIdx = new Set(subLast.map(r=>r._idx));
+              remaining = remaining.filter(r=>!assignedIdx.has(r._idx));
+            }
+          }
+          remaining = [];
+        }
       } else {
         const subset = findSubset(remaining, dsCant, dsVal, 1, 4);
         if (subset) {
@@ -2231,15 +2247,20 @@ function runCascade2020(layoutRows, dsRows) {
         }
       }
     }
-    // Si quedan filas restantes, asignar a la DS de mayor cant
+    // Si quedan filas restantes, intentar asignar al último DS solo si cuadra
     if (remaining.length > 0) {
       const dsLast = dsSort[dsSort.length - 1];
-      if (!usedDS.has(dsLast._dsIdx)) assignRows(remaining, dsLast, "A2m_rest");
-      else {
+      const dsCantL = parseFloat(dsLast["CantidadUMComercial"])||0;
+      const dsValL  = parseFloat(dsLast["ValorDolares"])||0;
+      const sumCR = remaining.reduce((a,r)=>a+r.Cantidad,0);
+      const sumVR = remaining.reduce((a,r)=>a+r.ValorUSD,0);
+      if (!usedDS.has(dsLast._dsIdx) && Math.abs(sumCR - dsCantL) <= 1 && Math.abs(sumVR - dsValL) <= 4) {
+        assignRows(remaining, dsLast, "A2m_rest");
+      } else {
         for (const row of remaining) {
           if (!assignment.has(row._idx)) {
             assignment.set(row._idx, { status:"unmatched", newSec:row.SecCalc||"", dsRow:null, corrections:[],
-              reason: `Sin match (resto tras distribución por desc/subconjunto)` });
+              reason: `Sin match estricto (Cant/Val no coinciden con ninguna sec DS restante)` });
           }
         }
       }
@@ -2809,21 +2830,21 @@ function App2020() {
             // Helpers de comparación por pedimento (suma del grupo vs DS)
             const cantInfo = r => {
               if (r.dsCant === null || r.groupSumCant === null) return { color:"#64748b", label: Number(r.cant).toLocaleString("es-MX") };
-              const diff = r.groupSumCant - r.dsCant;
+              const diff    = r.groupSumCant - r.dsCant;
               const absDiff = Math.abs(diff);
-              if (absDiff === 0) return { color:"#22c55e", label: Number(r.cant).toLocaleString("es-MX") };
-              if (absDiff <= 1)  return { color:"#22c55e", label: Number(r.cant).toLocaleString("es-MX") };
-              if (absDiff <= 10) return { color:"#f97316", label: `${Number(r.cant).toLocaleString("es-MX")} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
-              return { color:"#ef4444", label: `${Number(r.cant).toLocaleString("es-MX")} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
+              const lbl     = Number(r.cant).toLocaleString("es-MX");
+              if (absDiff <= 1) return { color:"#22c55e", label: lbl };
+              // Cualquier diferencia > 1 en cantidad es problema — mostrar en rojo con el delta
+              return { color:"#ef4444", label: `${lbl} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
             };
             const valInfo = r => {
               if (r.dsVal === null || r.groupSumVal === null) return { color:"#64748b", label: `$${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}` };
-              const diff = r.groupSumVal - r.dsVal;
+              const diff    = r.groupSumVal - r.dsVal;
               const absDiff = Math.abs(diff);
-              const lbl = `$${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
-              if (absDiff <= 4)  return { color:"#22c55e", label: lbl };
-              if (absDiff <= 50) return { color:"#f97316", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` };
-              return { color:"#ef4444", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` };
+              const lbl     = `$${Number(r.val).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+              if (absDiff <= 1)  return { color:"#22c55e", label: lbl };           // óptimo
+              if (absDiff <= 4)  return { color:"#f97316", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` }; // aceptable
+              return { color:"#ef4444", label: `${lbl} (${diff>0?"+":""}${diff.toFixed(2)})` }; // fuera de tolerancia
             };
             const paisInfo = r => {
               if (!r.dsPais) return { color:"#94a3b8", label: r.pais };
@@ -2901,7 +2922,7 @@ function App2020() {
 
                 {/* Leyenda comparación */}
                 <div style={{display:"flex",gap:16,flexWrap:"wrap",marginBottom:10,fontSize:11,color:"#64748b"}}>
-                  {[["#22c55e","Coincide con DS"],["#f97316","Diferencia pequeña (±)"],["#ef4444","Diferencia grande"],["#fbbf24","País/Desc distinto al DS"]].map(([c,t])=>(
+                  {[["#22c55e","Cant ±1 / Val ±1 (correcto)"],["#f97316","Val ±2 a ±4 (aceptable)"],["#ef4444","Cant >1 o Val >4 (fuera de tolerancia)"],["#fbbf24","País/Desc distinto al DS"]].map(([c,t])=>(
                     <span key={t}><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:c,marginRight:4}} />{t}</span>
                   ))}
                 </div>
