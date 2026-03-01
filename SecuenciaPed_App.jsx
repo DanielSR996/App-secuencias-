@@ -2873,7 +2873,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
         const notaUnmatched = a?.reason || `Sin match en DS para Ped ${row.Pedimento} / Frac ${row.FraccionNico}`;
         setCell(ws, r, colIdx.notas, notaUnmatched, styleAmarilloNota);
-      } else if (isRealSec(row.SecCalc)) {
+      } else if (row.SecCalc && String(row.SecCalc).trim() !== "" && String(row.SecCalc).trim() !== "." && !isNaN(parseFloat(String(row.SecCalc)))) {
         // Fila con secuencia existente que NO pudo verificarse ni corregirse
         // → marcar en naranja oscuro para que el usuario la revise manualmente
         const S_SEC_REVISAR  = { font:{bold:true,color:{rgb:"6E2C00"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{horizontal:"center"} };
