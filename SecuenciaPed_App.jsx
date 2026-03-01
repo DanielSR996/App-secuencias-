@@ -2190,14 +2190,21 @@ function runCascade2020(layoutRows, dsRows) {
     for (const row of rows) {
       const fracOriginal = nFrac(row.FraccionNico);
       const dsFrac       = nFrac(normStr(dsRow["Fraccion"]));
-      // Detectar si la fracción del Layout difiere de la del DS
       const isCrossFrac  = fracCorr !== null || fracOriginal !== dsFrac;
+      const secOriginal  = isRealSec(row.SecCalc) ? normStr(row.SecCalc) : null;
+      const isCorrected  = secOriginal !== null && secOriginal !== newSec;
+      // Construir nota con detalle de corrección
+      let reason = `[${estrategia}] Sec=${newSec}`;
+      if (isCorrected)  reason += ` (corregido de ${secOriginal})`;
+      if (isCrossFrac)  reason += ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]`;
+      reason += ` — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`;
       assignment.set(row._idx, {
-        status: isRealSec(row.SecCalc) ? "corrected" : "new",
+        status: secOriginal !== null ? "corrected" : "new",
         newSec, dsRow, corrections: [], estrategia,
+        secOrig: isCorrected ? secOriginal : null,  // secuencia original que fue reemplazada
         fracCorr: isCrossFrac ? (fracCorr || dsFrac) : null,
         fracOrig: isCrossFrac ? fracOriginal : null,
-        reason: `[${estrategia}] Sec=${newSec}${isCrossFrac ? ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]` : ""} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`,
+        reason,
       });
     }
   };
@@ -2842,16 +2849,25 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
                         : isOk        ? S_OK_NOTA
                         :               S_NEW_NOTA;
 
-        // SEC CALC
-        setCell(ws, r, colIdx.sec, newSecVal, styleSec);
+        // SEC CALC — si la sec fue corregida, mostrar "Nueva (antes: Vieja)"
+        let secDisplayVal = newSecVal;
+        if (a.secOrig && !isOk) {
+          // Escribir solo el número nuevo en la celda (el "antes" va en NOTAS)
+          secDisplayVal = newSecVal;
+        }
+        setCell(ws, r, colIdx.sec, secDisplayVal, styleSec);
 
-        // Fracción corregida (cross-fraction B4): escribir la fracción del DS en la celda FraccionNico
+        // Fracción corregida (cross-fraction B4)
         if (isCrossFrac && colIdx.frac >= 0) {
           setCell(ws, r, colIdx.frac, a.fracCorr, S_FRAC_CORR);
         }
 
-        // NOTAS
-        setCell(ws, r, colIdx.notas, a.reason, styleNota);
+        // NOTAS — incluir "(corregido de X)" si había secuencia previa incorrecta
+        let notaText = a.reason;
+        if (a.secOrig && !isOk && a.secOrig !== String(newSecVal)) {
+          notaText = `⚠ Sec anterior: ${a.secOrig} → Corregida a ${newSecVal} | ${a.reason}`;
+        }
+        setCell(ws, r, colIdx.notas, notaText, styleNota);
       } else if (esDup) {
         // Fila repetida sin match: pintar SEC CALC y NOTAS en amarillo para visibilidad
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
@@ -3039,6 +3055,7 @@ function App2020() {
           val:        r.ValorUSD  || 0,
           secOrig:    String(r.SecCalc || ""),
           secNueva:   a?.newSec  || "",
+          secPrevCorr: a?.secOrig || null,   // sec original que fue reemplazada
           status:     a?.status  || "unmatched",
           estrategia: a?.estrategia || "",
           reason:     a?.reason   || "Sin match",
@@ -3385,9 +3402,14 @@ function App2020() {
                         const di = descInfo(r);
                         return (
                           <tr key={r.idx} style={{background:rowBg(r.status),borderBottom:"1px solid rgba(30,41,59,0.8)"}}>
-                            {/* SEC CALC */}
-                            <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:70}}>
+                            {/* SEC CALC — muestra sec anterior si fue corregida */}
+                            <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:80}}>
                               {r.secNueva || <span style={{color:"#475569"}}>—</span>}
+                              {r.secPrevCorr && r.secPrevCorr !== r.secNueva && (
+                                <div style={{fontSize:10,fontWeight:400,color:"#f97316",marginTop:2}}>
+                                  antes: {r.secPrevCorr}
+                                </div>
+                              )}
                             </td>
                             <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
                             {/* Fracción — morado si fue corregida cross-fraction */}
