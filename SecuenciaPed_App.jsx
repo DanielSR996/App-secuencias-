@@ -2143,12 +2143,14 @@ function runCascade2020(layoutRows, dsRows) {
       dsRow = cands.find(ds => normStr(ds["SecuenciaFraccion"]) === sec) || null;
     }
 
-    if (dsRow) {
+    if (dsRow && !usedDS.has(dsRow._dsIdx)) {
+      // DS sec encontrada y aún no usada → verificar OK
       usedDS.add(dsRow._dsIdx);
       assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: [],
         reason: "OK — Secuencia verificada contra DS 2020" });
     }
-    // Si no matchea, la fila pasa a fases siguientes para encontrar la secuencia correcta
+    // Si la DS sec ya fue usada por otra fila (duplicado con misma sec), esta fila
+    // pasa a fases siguientes para encontrar su secuencia correcta (ej: Sec22→Sec23)
   }
 
   // ── E1–E7: Asignar filas sin secuencia (o cuya sec no coincidió en E0) ────
