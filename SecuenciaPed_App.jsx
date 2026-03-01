@@ -2122,18 +2122,33 @@ function runCascade2020(layoutRows, dsRows) {
   // status: "ok"|"corrected"|"new"|"unmatched"
   const assignment = new Map();
 
-  // ── E0: Verificar SEC CALC existente contra DS "Candado 551" ─────────────
+  // ── E0: Verificar SEC CALC existente contra DS ───────────────────────────
+  // Intento 1: por "Candado 551" exacto (Pedimento-Fraccion-Secuencia)
+  // Intento 2: por Ped+Frac+SecuenciaFraccion directamente (cubre formatos distintos de candado)
+  // Si la fila tiene secuencia pero no pasa verificación → sigue a fases siguientes para corrección
   for (const row of layoutRows) {
-    if (row.noIncluir) continue;         // filas marcadas "NO INCLUIR" → saltar
-    if (!isRealSec(row.SecCalc)) continue; // ".", vacío, no numérico → saltar
-    const candado = `${row.Pedimento}-${nFrac(row.FraccionNico)}-${row.SecCalc}`;
-    const dsRow = dsByCandado.get(candado);
+    if (row.noIncluir) continue;
+    if (!isRealSec(row.SecCalc)) continue;
+    const ped2 = normStr(row.Pedimento);
+    const frac = nFrac(row.FraccionNico);
+    const sec  = normStr(row.SecCalc);
+
+    // Intento 1: candado 551
+    const candado = `${row.Pedimento}-${frac}-${row.SecCalc}`;
+    let dsRow = dsByCandado.get(candado);
+
+    // Intento 2: buscar en DS por Ped+Frac+Sec directamente
+    if (!dsRow) {
+      const cands = dsByPF.get(`${ped2}|||${frac}`) || [];
+      dsRow = cands.find(ds => normStr(ds["SecuenciaFraccion"]) === sec) || null;
+    }
+
     if (dsRow) {
       usedDS.add(dsRow._dsIdx);
       assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: [],
         reason: "OK — Secuencia verificada contra DS 2020" });
     }
-    // Si no matchea, se procesa en la segunda pasada
+    // Si no matchea, la fila pasa a fases siguientes para encontrar la secuencia correcta
   }
 
   // ── E1–E7: Asignar filas sin secuencia (o cuya sec no coincidió en E0) ────
@@ -2840,6 +2855,14 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
         const notaUnmatched = a?.reason || `Sin match en DS para Ped ${row.Pedimento} / Frac ${row.FraccionNico}`;
         setCell(ws, r, colIdx.notas, notaUnmatched, styleAmarilloNota);
+      } else if (isRealSec(row.SecCalc)) {
+        // Fila con secuencia existente que NO pudo verificarse ni corregirse
+        // → marcar en naranja oscuro para que el usuario la revise manualmente
+        const S_SEC_REVISAR  = { font:{bold:true,color:{rgb:"6E2C00"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{horizontal:"center"} };
+        const S_NOTA_REVISAR = { font:{italic:true,sz:10,color:{rgb:"6E2C00"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{wrapText:true} };
+        setCell(ws, r, colIdx.sec, `${row.SecCalc} ⚠`, S_SEC_REVISAR);
+        const motivo = a?.reason || `Sec ${row.SecCalc} no coincide con DS — revisar manualmente`;
+        setCell(ws, r, colIdx.notas, `⚠ REVISAR: ${motivo}`, S_NOTA_REVISAR);
       }
     }
   }
@@ -3122,7 +3145,7 @@ function App2020() {
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada (Cant±1, Val±4 = DS)"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA (Cant±1, Val±4 = DS)"],["Naranja en SEC CALC ⚠","Secuencia existente NO verificada — revisar manualmente"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
