@@ -1918,6 +1918,28 @@ function runCascade2020(layoutRows, dsRows) {
     return s !== "" && s !== "." && !isNaN(parseFloat(s));
   };
 
+  // getDSFrac: obtiene la fracción del DS row.
+  // Algunos archivos tienen la columna Fraccion vacía pero la fracción está
+  // embebida en el Candado 551 con formato "Ped-Frac-Sec".
+  // Fallback: extraerla del candado cuando Fraccion está vacío.
+  const getDSFrac = (dsRow) => {
+    const fracDirect = nFrac(normStr(dsRow["Fraccion"]));
+    if (fracDirect) return fracDirect;
+    // Intentar extraer del candado: formato "PED-FRAC-SEC"
+    const candado = normStr(dsRow["Candado 551"]);
+    if (candado) {
+      // Separar por "-" y reconstruir: primer token = aduana, segundo = num, tercero = año, cuarto = frac, quinto = sec
+      // Formato real: "400-3459-0002178-85322999-104" → partes [400, 3459, 0002178, 85322999, 104]
+      const parts = candado.split("-");
+      // La fracción siempre es la parte de 8 dígitos (índice 3 en el formato estándar)
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i].replace(/\./g, "");
+        if (p.length === 8 && /^\d+$/.test(p)) return p;
+      }
+    }
+    return "";
+  };
+
   // ── Lookups del DS ────────────────────────────────────────────────────────
   const dsByCandado  = new Map(); // "Candado 551" → dsRow
   const dsByPFP      = new Map(); // Pedimento2|||Fraccion|||Pais → [dsRow]
@@ -1930,7 +1952,7 @@ function runCascade2020(layoutRows, dsRows) {
     if (candado) dsByCandado.set(candado, r);
 
     const ped2 = normStr(r["Pedimento2"]);
-    const frac = nFrac(normStr(r["Fraccion"]));
+    const frac = getDSFrac(r);
     const pais = normStr(r["PaisOrigenDestino"]);
     const desc = nDesc(r["DescripcionMercancia"]);
 
@@ -2189,7 +2211,7 @@ function runCascade2020(layoutRows, dsRows) {
     usedDS.add(dsRow._dsIdx);
     for (const row of rows) {
       const fracOriginal = nFrac(row.FraccionNico);
-      const dsFrac       = nFrac(normStr(dsRow["Fraccion"]));
+      const dsFrac       = getDSFrac(dsRow);
       const isCrossFrac  = fracCorr !== null || fracOriginal !== dsFrac;
       const secOriginal  = isRealSec(row.SecCalc) ? normStr(row.SecCalc) : null;
       const isCorrected  = secOriginal !== null && secOriginal !== newSec;
@@ -2218,7 +2240,7 @@ function runCascade2020(layoutRows, dsRows) {
   for (const dsRow of dsSorted) {
     if (usedDS.has(dsRow._dsIdx)) continue;
     const ped2  = normStr(dsRow["Pedimento2"]);
-    const frac  = nFrac(normStr(dsRow["Fraccion"]));
+    const frac  = getDSFrac(dsRow);
     const desc  = nDesc(dsRow["DescripcionMercancia"]);
     const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
     const dsVal  = parseFloat(dsRow["ValorDolares"])        || 0;
@@ -2300,7 +2322,7 @@ function runCascade2020(layoutRows, dsRows) {
   // Agrupar DS no usadas por Ped+Frac
   const unusedByPF = new Map();
   for (const dsRow of dsSortedB) {
-    const kPF = `${normStr(dsRow["Pedimento2"])}|||${nFrac(normStr(dsRow["Fraccion"]))}`;
+    const kPF = `${normStr(dsRow["Pedimento2"])}|||${getDSFrac(dsRow)}`;
     if (!unusedByPF.has(kPF)) unusedByPF.set(kPF, []);
     unusedByPF.get(kPF).push(dsRow);
   }
@@ -2459,7 +2481,7 @@ function runCascade2020(layoutRows, dsRows) {
       const dsCant     = parseFloat(dsRow["CantidadUMComercial"]) || 0;
       const dsVal      = parseFloat(dsRow["ValorDolares"])        || 0;
       const ped2       = normStr(dsRow["Pedimento2"]);
-      const frac       = nFrac(normStr(dsRow["Fraccion"]));
+      const frac       = getDSFrac(dsRow);
       const dsDescNorm = nDesc(dsRow["DescripcionMercancia"]);
       const dsPaisNorm = normStr(dsRow["PaisOrigenDestino"]);
       if (dsCant === 0) continue;
@@ -2615,7 +2637,7 @@ function runCascade2020(layoutRows, dsRows) {
       const dsCant     = parseFloat(dsRow["CantidadUMComercial"]) || 0;
       const dsVal      = parseFloat(dsRow["ValorDolares"])        || 0;
       const ped2       = normStr(dsRow["Pedimento2"]);
-      const frac       = nFrac(normStr(dsRow["Fraccion"]));
+      const frac       = getDSFrac(dsRow);
       const dsDescNorm = nDesc(dsRow["DescripcionMercancia"]);
       const dsPaisNorm = normStr(dsRow["PaisOrigenDestino"]);
       if (dsCant === 0) continue;
@@ -2741,7 +2763,7 @@ function runCascade2020(layoutRows, dsRows) {
 
     if (!usedDS.has(dsRow._dsIdx)) {
       // DS no usada → calcular motivo
-      const frac = nFrac(normStr(dsRow["Fraccion"]));
+      const frac = getDSFrac(dsRow);
       const k    = `${normStr(dsRow["Pedimento2"])}|||${frac}`;
       const g    = layoutTotals.get(k);
       let reason;
