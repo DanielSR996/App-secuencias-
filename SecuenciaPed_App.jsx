@@ -3364,6 +3364,24 @@ function App2020() {
               });
             };
 
+            const copyFracciones = () => {
+              // Copia la fracción "correcta": si hubo corrección (fracCorr), esa; si no, la del Layout
+              const lines = filtered.map(r => (r.fracCorr != null ? r.fracCorr : (r.frac || ""))).join("\n");
+              navigator.clipboard.writeText(lines).then(() => {
+                setCopiedMsg("¡Fracciones copiadas! (corregida cuando aplica, si no la del Layout). Pega en Excel con Ctrl+V");
+                setTimeout(() => setCopiedMsg(""), 3500);
+              });
+            };
+
+            const copyDescripciones = () => {
+              // Copia la descripción "correcta": si el DS tiene descripción, usa esa; si no, la del Layout
+              const lines = filtered.map(r => (r.dsDesc ? r.dsDesc : (r.desc || ""))).join("\n");
+              navigator.clipboard.writeText(lines).then(() => {
+                setCopiedMsg("¡Descripciones copiadas! (del DS cuando existe, si no la del Layout). Pega en Excel con Ctrl+V");
+                setTimeout(() => setCopiedMsg(""), 3500);
+              });
+            };
+
             return (
               <div style={{marginTop:8}}>
                 {/* Barra de herramientas */}
@@ -3389,6 +3407,14 @@ function App2020() {
                   {/* Botón copiar países */}
                   <button onClick={copyPaises} style={{background:"#78350f",border:"none",color:"#fde68a",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
                     🌐 Copiar países
+                  </button>
+                  {/* Botón copiar fracciones corregidas */}
+                  <button onClick={copyFracciones} style={{background:"#581c87",border:"none",color:"#e9d5ff",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
+                    📐 Copiar fracciones
+                  </button>
+                  {/* Botón copiar descripciones corregidas */}
+                  <button onClick={copyDescripciones} style={{background:"#4c1d95",border:"none",color:"#c4b5fd",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
+                    📝 Copiar descripciones
                   </button>
                 </div>
 
