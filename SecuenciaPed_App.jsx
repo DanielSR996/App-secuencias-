@@ -1699,7 +1699,7 @@ function resolveDS2020SheetNames(wb) {
 }
 
 /**
- * Lee la hoja DS 2020.
+ * Lee la hoja DS.
  * Soporta variantes de nombre de columna (ej. "Valor usd redondeado" en lugar de "ValorDolares").
  */
 function readDS2020Sheet(sheet) {
@@ -1712,9 +1712,9 @@ function readDS2020Sheet(sheet) {
     SecuenciaFraccion:    ["SecuenciaFraccion"],
     DescripcionMercancia: ["DescripcionMercancia"],
     CantidadUMComercial:  ["CantidadUMComercial"],
-    ValorDolares:         ["ValorDolares","Valor usd redondeado","ValorAduana","Valor Aduana Estadístico"],
+    ValorDolares:         ["ValorDolares","Valor usd redondeado","ValorAduana","Valor Aduana Estadístico","ValorAgregado"],
     PaisOrigenDestino:    ["PaisOrigenDestino"],
-    "Candado 551":        ["Candado 551","Candado DS 551"],
+    "Candado 551":        ["Candado 551","Candado DS 551","Candado","Clave","Secuencias"],
   };
   const knownNorms = new Set(Object.values(DS_COL_MAP).flat().map(nH2020));
 
@@ -1757,8 +1757,12 @@ function readDS2020Sheet(sheet) {
   }
   out._hdrI         = hdrI;
   out._revisadoCol  = revisadoColIdx;
+  // Columnas no encontradas (para avisar al usuario cómo deben nombrarse)
+  out._missingColumns = Object.entries(DS_COL_MAP)
+    .filter(([k]) => idx[k] === undefined)
+    .map(([name, aliases]) => ({ name, aceptados: aliases }));
   console.log("[DS2020] DS rows:", out.length, "REVISADO col:", revisadoColIdx,
-    "muestra:", out.slice(0,2).map(r=>({ped:r.Pedimento2,frac:r.Fraccion,sec:r.SecuenciaFraccion,candado:r["Candado 551"]})));
+    "missing:", out._missingColumns?.length, "muestra:", out.slice(0,2).map(r=>({ped:r.Pedimento2,frac:r.Fraccion,sec:r.SecuenciaFraccion,candado:r["Candado 551"]})));
   return out;
 }
 
@@ -1776,15 +1780,19 @@ function readLayout2020Sheet(sheet) {
   const range = XLSX.utils.decode_range(sheet["!ref"]);
   console.log("[Layout2020] ref:", sheet["!ref"], "filas totales:", range.e.r + 1, "cols:", range.e.c + 1);
 
+  // Asegurar que leemos suficientes columnas para encontrar candado (ej. AJ = col 35); si !ref es corto, extendemos
+  const MIN_COLS_CANDADO = 60;
+  const maxCol = Math.max(range.e.c, MIN_COLS_CANDADO - 1);
+
   // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
-  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: range.e.c } };
+  const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: maxCol } };
   const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
-  console.log("[Layout2020] sampleRows leídas:", sampleRows.length);
+  console.log("[Layout2020] sampleRows leídas:", sampleRows.length, "cols hasta:", maxCol + 1);
 
   // ── 2. Detectar fila de encabezado ────────────────────────────────────────
   const KNOWN = new Set(["pedimento","fraccionnico","seccalc","descripcion",
                          "paisorigen","valormpdolares","cantidadcomercial",
-                         "cantidad_comercial","notas","estado"]);
+                         "cantidad_comercial","notas","estado","candado","clave"]);
   let hdrI = 0, bestHits = 0;
   for (let i = 0; i < sampleRows.length; i++) {
     const hits = sampleRows[i].filter(c => KNOWN.has(nH2020(String(c ?? "")))).length;
@@ -1819,17 +1827,33 @@ function readLayout2020Sheet(sheet) {
     // (ej. "pedimento" en col 3 es "20-400-3459-..." pero col 174 es "400-3459-..." = formato DS)
     pedimento:  findLast("pedimento"),
     frac:       findLast("FraccionNico","fraccionnico"),
-    cant:       findLast("cantidad_comercial","cantidadcomercial","cantidadumc"),
+    // findFirst para cantidad: cuando hay varias "cantidad_comercial" la primera suele ser la columna principal de datos (la que cuadra con DS); la última puede ser un duplicado o subtotal
+    cant:       findFirst("cantidad_comercial","cantidadcomercial","cantidadumc"),
     notas:      findLast("NOTAS","notas"),    // última NOTAS = columna de salida
     // findFirst para columnas sin ambigüedad importante
     desc:       findFirst("descripcion","clase_descripcion","descripcionmercancia"),
     pais:       findFirst("pais_origen","paisorigen","paisorigendestino"),
     val:        findFirst("ValorMPDolares","valormpdolares","valordolares","valor_me","valorme"),
-    sec:        findFirst("SEC CALC","seccalc","secuenciaped"),
+    sec:        findFirst("SEC CALC","seccalc","secuenciaped","Secuencia","secuencia","SEC"),
     notasIn:    findFirst("NOTAS","notas"),   // primera NOTAS = flags de entrada ("NO INCLUIR")
     estado:     findFirst("ESTADO","estado"),
+    // Candado: priorizar "CANDADO 551" / "Candado 551" (columna que cuadra con DS); si no existe, usar findLast para evitar columna "Clave" con valor único.
+    candado:    (() => { const exact = findFirst("CANDADO 551","Candado 551","Candado DS 551"); return exact >= 0 ? exact : findLast("Candado","Clave","candado"); })(),
   };
-  console.log("[Layout2020] colIdx:", JSON.stringify(colIdx));
+  // Columnas esperadas y nombres aceptados (para avisar si no se encuentran)
+  const LAYOUT_COL_SPEC = [
+    { key: "pedimento", label: "Pedimento", aceptados: ["Pedimento", "pedimento"] },
+    { key: "frac", label: "FraccionNico", aceptados: ["FraccionNico", "fraccionnico"] },
+    { key: "sec", label: "SEC CALC / Secuencia", aceptados: ["SEC CALC", "seccalc", "secuenciaped", "Secuencia", "secuencia", "SEC"] },
+    { key: "desc", label: "Descripcion", aceptados: ["descripcion", "clase_descripcion", "descripcionmercancia"] },
+    { key: "pais", label: "PaisOrigen", aceptados: ["pais_origen", "paisorigen", "paisorigendestino"] },
+    { key: "cant", label: "Cantidad", aceptados: ["cantidad_comercial", "cantidadcomercial", "cantidadumc"] },
+    { key: "val", label: "Valor USD", aceptados: ["ValorMPDolares", "valormpdolares", "valordolares", "valor_me", "valorme"] },
+    { key: "notas", label: "NOTAS", aceptados: ["NOTAS", "notas"] },
+    // Candado 551 no se exige: el sistema lo usa si existe, pero no se avisa como faltante (se puede crear/calcular)
+  ];
+  const layoutMissing = LAYOUT_COL_SPEC.filter(({ key }) => colIdx[key] < 0).map(({ label, aceptados }) => ({ name: label, aceptados }));
+  console.log("[Layout2020] colIdx:", JSON.stringify(colIdx), "missing:", layoutMissing.length);
 
   // ── 4. Helpers lectura celda ──────────────────────────────────────────────
   const cellVal = (r, c) => {
@@ -1866,12 +1890,13 @@ function readLayout2020Sheet(sheet) {
       SecCalc:     cellVal(r, colIdx.sec),
       Notas:       cellVal(r, colIdx.notas),
       Estado:      cellVal(r, colIdx.estado),
+      Candado:     colIdx.candado >= 0 ? cellVal(r, colIdx.candado) : "",
       noIncluir,
     });
   }
   console.log("[Layout2020] layoutRows:", layoutRows.length,
     "muestra:", layoutRows.slice(0,3).map(r=>({ped:r.Pedimento,frac:r.FraccionNico,sec:r.SecCalc,noInc:r.noIncluir})));
-  return { layoutRows, headerRowIdx: hdrI, colIdx };
+  return { layoutRows, headerRowIdx: hdrI, colIdx, _missingColumns: layoutMissing };
 }
 
 /** Cascade 2020: verifica secuencias existentes y asigna las que faltan.
@@ -1947,6 +1972,8 @@ function runCascade2020(layoutRows, dsRows) {
   const dsByPFDesc   = new Map(); // Pedimento2|||Fraccion|||DescNorm → [dsRow]
   const usedDS       = new Set();
 
+  // Cadena de prioridad: Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado (para match explícito y mensaje "Coincide por cadena")
+  const dsByCadenaPrefix = new Map(); // ped|||frac|||desc|||pais → [dsRow]
   for (const r of dsRows) {
     const candado = normStr(r["Candado 551"]);
     if (candado) dsByCandado.set(candado, r);
@@ -1955,6 +1982,10 @@ function runCascade2020(layoutRows, dsRows) {
     const frac = getDSFrac(r);
     const pais = normStr(r["PaisOrigenDestino"]);
     const desc = nDesc(r["DescripcionMercancia"]);
+
+    const kCadena = `${ped2}|||${frac}|||${desc}|||${pais}`;
+    if (!dsByCadenaPrefix.has(kCadena)) dsByCadenaPrefix.set(kCadena, []);
+    dsByCadenaPrefix.get(kCadena).push(r);
 
     const kPFP = `${ped2}|||${frac}|||${pais}`;
     if (!dsByPFP.has(kPFP)) dsByPFP.set(kPFP, []);
@@ -2144,12 +2175,111 @@ function runCascade2020(layoutRows, dsRows) {
   // status: "ok"|"corrected"|"new"|"unmatched"
   const assignment = new Map();
 
+  // Helper: asignar filas a una secuencia DS (usado por Cadena, E0candado y fases siguientes)
+  const assignRows = (rows, dsRow, estrategia, fracCorr = null) => {
+    const newSec = normStr(dsRow["SecuenciaFraccion"]);
+    const sumC = rows.reduce((a,r)=>a+r.Cantidad,0);
+    const sumV = rows.reduce((a,r)=>a+r.ValorUSD,0);
+    const dsCant = parseFloat(dsRow["CantidadUMComercial"])||0;
+    const dsVal  = parseFloat(dsRow["ValorDolares"])||0;
+    usedDS.add(dsRow._dsIdx);
+    const CADENA_FIELDS = "Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado";
+    for (const row of rows) {
+      const fracOriginal = nFrac(row.FraccionNico);
+      const dsFrac       = getDSFrac(dsRow);
+      const isCrossFrac  = fracCorr !== null || fracOriginal !== dsFrac;
+      const secOriginal  = isRealSec(row.SecCalc) ? normStr(row.SecCalc) : null;
+      const isCorrected = secOriginal !== null && secOriginal !== newSec;
+      let reason = estrategia === "Cadena"
+        ? `Coincide por cadena (${CADENA_FIELDS}). [Cadena] Sec=${newSec} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`
+        : `[${estrategia}] Sec=${newSec}`;
+      if (!(estrategia === "Cadena") && isCorrected)  reason += ` (corregido de ${secOriginal})`;
+      if (!(estrategia === "Cadena") && isCrossFrac)  reason += ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]`;
+      if (estrategia !== "Cadena") reason += ` — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`;
+      if (estrategia !== "Cadena") reason = `Alternativa: ${reason}`;
+      assignment.set(row._idx, {
+        status: secOriginal !== null ? "corrected" : "new",
+        newSec, dsRow, corrections: [], estrategia,
+        secOrig: isCorrected ? secOriginal : null,
+        fracCorr: isCrossFrac ? (fracCorr || dsFrac) : null,
+        fracOrig: isCrossFrac ? fracOriginal : null,
+        reason,
+      });
+    }
+  };
+
+  // ── Prioridad por cadena: Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado ──
+  // Si los campos en Layout y DS coinciden (misma cadena + totales dentro de tolerancia), asignar y reportar "Coincide por cadena".
+  // Agrupar Layout por (Pedimento, FraccionNico, Descripcion norm, PaisOrigen); buscar en DS por la misma cadena y totales ±1 cant / ±5 USD.
+  const groupsByCadena = new Map();
+  for (const row of layoutRows) {
+    if (row.noIncluir) continue;
+    const ped  = normStr(row.Pedimento);
+    const frac = nFrac(row.FraccionNico);
+    const desc = nDesc(row.Descripcion ?? "");
+    const pais = normStr(row.PaisOrigen ?? "");
+    const k    = `${ped}|||${frac}|||${desc}|||${pais}`;
+    if (!groupsByCadena.has(k)) groupsByCadena.set(k, []);
+    groupsByCadena.get(k).push(row);
+  }
+  const tolCadenaC = 1, tolCadenaV = 5;
+  const tolCadenaPct = 0.005;
+  for (const [kCadena, rows] of groupsByCadena) {
+    if (rows.some(r => assignment.has(r._idx))) continue;
+    const sumC = rows.reduce((a, r) => a + r.Cantidad, 0);
+    const sumV = rows.reduce((a, r) => a + r.ValorUSD, 0);
+    const cands = dsByCadenaPrefix.get(kCadena) || [];
+    let dsRow = null;
+    for (const r of cands) {
+      if (usedDS.has(r._dsIdx)) continue;
+      const dsCant = parseFloat(r["CantidadUMComercial"]) || 0;
+      const dsVal  = parseFloat(r["ValorDolares"]) || 0;
+      const dsSinValor = dsVal === 0 || !Number.isFinite(dsVal);
+      const okC = Math.abs(sumC - dsCant) <= tolCadenaC || (dsCant > 1000 && Math.abs(sumC - dsCant) / dsCant <= tolCadenaPct);
+      const okV = Math.abs(sumV - dsVal) <= tolCadenaV || dsSinValor;
+      if (okC && okV) { dsRow = r; break; }
+    }
+    if (dsRow) assignRows(rows, dsRow, "Cadena");
+  }
+
+  // ── E0candado: Asignar por candado (Layout col AJ = DS col candado) ───────────
+  // Solo si el total del grupo Layout (cantidad + valor) cuadra con el DS (±1 ud / ±5 USD).
+  // Así se evita "sobrepasar por mucho": no asignar 54 filas Layout que suman 1M ud a un DS de 100 ud.
+  const layoutByCandado = new Map();
+  for (const row of layoutRows) {
+    if (row.noIncluir) continue;
+    const candadoVal = normStr(row.Candado ?? "");
+    if (!candadoVal) continue;
+    if (!layoutByCandado.has(candadoVal)) layoutByCandado.set(candadoVal, []);
+    layoutByCandado.get(candadoVal).push(row);
+  }
+  // Tolerancia: cantidad ±1 ud o ±0.5% cuando son grandes (redondeos); valor ±5 USD o no exigir si DS no tiene valor
+  const tolCandadoC = 1, tolCandadoV = 5;
+  const tolCandadoPct = 0.005; // 0.5% para cantidades grandes
+  for (const [candadoVal, rows] of layoutByCandado) {
+    const dsRow = dsByCandado.get(candadoVal);
+    if (!dsRow || usedDS.has(dsRow._dsIdx)) continue;
+    const sumC = rows.reduce((a, r) => a + r.Cantidad, 0);
+    const sumV = rows.reduce((a, r) => a + r.ValorUSD, 0);
+    const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+    const dsVal  = parseFloat(dsRow["ValorDolares"]) || 0;
+    const dsSinValor = dsVal === 0 || !Number.isFinite(dsVal);
+    const cuadraCant = Math.abs(sumC - dsCant) <= tolCandadoC
+      || (dsCant > 1000 && Math.abs(sumC - dsCant) / dsCant <= tolCandadoPct);
+    const cuadraVal  = Math.abs(sumV - dsVal) <= tolCandadoV || dsSinValor;
+    if (cuadraCant && cuadraVal) {
+      assignRows(rows, dsRow, "E0candado");
+    }
+    // Si no cuadra: las filas pasan a FASE A (A1, A2, findSubset, etc.)
+  }
+
   // ── E0: Verificar SEC CALC existente contra DS ───────────────────────────
   // Intento 1: por "Candado 551" exacto (Pedimento-Fraccion-Secuencia)
   // Intento 2: por Ped+Frac+SecuenciaFraccion directamente (cubre formatos distintos de candado)
-  // Si la fila tiene secuencia pero no pasa verificación → sigue a fases siguientes para corrección
+  // Solo para filas que aún no se asignaron por E0candado y que ya tienen secuencia en Layout.
   for (const row of layoutRows) {
     if (row.noIncluir) continue;
+    if (assignment.has(row._idx)) continue; // ya asignada por E0candado
     if (!isRealSec(row.SecCalc)) continue;
     const ped2 = normStr(row.Pedimento);
     const frac = nFrac(row.FraccionNico);
@@ -2169,7 +2299,7 @@ function runCascade2020(layoutRows, dsRows) {
       // DS sec encontrada y aún no usada → verificar OK
       usedDS.add(dsRow._dsIdx);
       assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: [],
-        reason: "OK — Secuencia verificada contra DS 2020" });
+        reason: "OK — Secuencia verificada contra DS" });
     }
     // Si la DS sec ya fue usada por otra fila (duplicado con misma sec), esta fila
     // pasa a fases siguientes para encontrar su secuencia correcta (ej: Sec22→Sec23)
@@ -2185,6 +2315,7 @@ function runCascade2020(layoutRows, dsRows) {
   const groupsByDesc = new Map(); // Ped|||Frac|||DescNorm → rows
   for (const row of layoutRows) {
     if (row.noIncluir) continue;
+    if (assignment.has(row._idx)) continue; // ya asignada (E0candado, E0, E1–E7, etc.)
     const a = assignment.get(row._idx);
     if (a?.status === "ok") continue;
     const ped  = row.Pedimento;
@@ -2198,38 +2329,6 @@ function runCascade2020(layoutRows, dsRows) {
     if (!groupsByDesc.has(kD)) groupsByDesc.set(kD, []);
     groupsByDesc.get(kD).push(row);
   }
-
-  // ── Helper: asignar un subconjunto de filas a una secuencia DS ───────────
-  // fracCorr: si se pasa, significa que la fracción en el Layout difiere del DS
-  //           y se debe corregir en el Excel de salida (cross-fraction B4).
-  const assignRows = (rows, dsRow, estrategia, fracCorr = null) => {
-    const newSec = normStr(dsRow["SecuenciaFraccion"]);
-    const sumC = rows.reduce((a,r)=>a+r.Cantidad,0);
-    const sumV = rows.reduce((a,r)=>a+r.ValorUSD,0);
-    const dsCant = parseFloat(dsRow["CantidadUMComercial"])||0;
-    const dsVal  = parseFloat(dsRow["ValorDolares"])||0;
-    usedDS.add(dsRow._dsIdx);
-    for (const row of rows) {
-      const fracOriginal = nFrac(row.FraccionNico);
-      const dsFrac       = getDSFrac(dsRow);
-      const isCrossFrac  = fracCorr !== null || fracOriginal !== dsFrac;
-      const secOriginal  = isRealSec(row.SecCalc) ? normStr(row.SecCalc) : null;
-      const isCorrected  = secOriginal !== null && secOriginal !== newSec;
-      // Construir nota con detalle de corrección
-      let reason = `[${estrategia}] Sec=${newSec}`;
-      if (isCorrected)  reason += ` (corregido de ${secOriginal})`;
-      if (isCrossFrac)  reason += ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]`;
-      reason += ` — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`;
-      assignment.set(row._idx, {
-        status: secOriginal !== null ? "corrected" : "new",
-        newSec, dsRow, corrections: [], estrategia,
-        secOrig: isCorrected ? secOriginal : null,  // secuencia original que fue reemplazada
-        fracCorr: isCrossFrac ? (fracCorr || dsFrac) : null,
-        fracOrig: isCrossFrac ? fracOriginal : null,
-        reason,
-      });
-    }
-  };
 
   // ── FASE A: Para cada DS row, buscar Layout por Ped+Frac+Desc ────────────
   // Esto resuelve el caso PRUEBA 1: DS 85049099/CAJA vs Layout 85049099/CAJA MEX+CHN+USA+TWN
@@ -2805,7 +2904,7 @@ function runCascade2020(layoutRows, dsRows) {
  * Modifica DIRECTAMENTE las celdas del worksheet original (sin reconstruirlo).
  * Luego crea un libro de salida con:
  *   - La hoja Layout modificada (celdas SEC CALC + NOTAS en verde/rojo)
- *   - La hoja DS 2020 sin cambios
+ *   - La hoja DS sin cambios
  *   - Una hoja "Reporte_2020" con el detalle
  *
  * Escribir celdas directamente es ~1000x más eficiente que sheet_to_json → aoa_to_sheet
@@ -2827,6 +2926,65 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   // Estilo morado/azul para fracción corregida cross-fraction
   const S_FRAC_CORR     = { font:{bold:true,color:{rgb:"4A235A"}}, fill:{patternType:"solid",fgColor:{rgb:"E8DAEF"}}, alignment:{horizontal:"center"} };
   const S_FRAC_CORR_NOTA= { font:{italic:true,sz:10,color:{rgb:"4A235A"}}, fill:{patternType:"solid",fgColor:{rgb:"E8DAEF"}}, alignment:{wrapText:true} };
+  // Cadena Layout vs DS: verde si coinciden tal cual, naranja si no
+  const S_CADENA_OK   = { font:{sz:9,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true,vertical:"top"} };
+  const S_CADENA_DIFF = { font:{sz:9,color:{rgb:"92400E"}}, fill:{patternType:"solid",fgColor:{rgb:"FFEDD5"}}, alignment:{wrapText:true,vertical:"top"} };
+
+  // Construir cadena (Pedimento2-Fraccion-Descripcion-Pais-Cantidad-Valor) para comparación Layout vs DS
+  const normStr = (v) => String(v ?? "").trim();
+  const nFrac = (v) => normStr(v).replace(/^0+/, "") || "0";
+  const nDesc = (s) => String(s ?? "").trim().toLowerCase().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ");
+  const getDSFrac = (dsRow) => {
+    const f = nFrac(dsRow["Fraccion"]);
+    if (f) return f;
+    const candado = normStr(dsRow["Candado 551"] ?? "");
+    if (!candado) return "";
+    const parts = candado.split("-");
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i].replace(/\./g, "");
+      if (p.length === 8 && /^\d+$/.test(p)) return p;
+    }
+    return "";
+  };
+  const buildCadenaLayout = (row) => {
+    const ped = normStr(row.Pedimento);
+    const frac = nFrac(row.FraccionNico ?? "");
+    const desc = nDesc(row.Descripcion ?? "");
+    const pais = normStr(row.PaisOrigen ?? "");
+    const cant = Math.round(parseFloat(row.Cantidad) || 0);
+    const val  = Math.round(parseFloat(row.ValorUSD) || 0);
+    return `${ped}|${frac}|${desc}|${pais}|${cant}|${val}`;
+  };
+  const buildCadenaDS = (dsRow) => {
+    const ped  = normStr(dsRow["Pedimento2"] ?? "");
+    const frac = getDSFrac(dsRow);
+    const desc = nDesc(dsRow["DescripcionMercancia"] ?? "");
+    const pais = normStr(dsRow["PaisOrigenDestino"] ?? "");
+    const cant = Math.round(parseFloat(dsRow["CantidadUMComercial"]) || 0);
+    const val  = Math.round(parseFloat(dsRow["ValorDolares"]) || 0);
+    return `${ped}|${frac}|${desc}|${pais}|${cant}|${val}`;
+  };
+
+  const cadenaCol = colIdx.val >= 0 ? colIdx.val + 1 : -1;
+  const notasModifCol = colIdx.notas >= 0 ? colIdx.notas + 1 : -1;
+  const hdrRowI = layoutRows.length > 0 ? layoutRows[0]._rowI - 1 : 0;
+
+  // Notas de modificaciones (igual que en la tabla del sistema): correcciones o "OK"
+  const normT = (s) => String(s ?? "").trim().toUpperCase();
+  const buildNotasModifExcel = (layoutRow, a) => {
+    if (!a || a.status === "unmatched" || !a.dsRow) return "OK";
+    const ds = a.dsRow;
+    const partes = [];
+    const paisLy = normT(layoutRow.PaisOrigen || "");
+    const paisDs = normT(ds["PaisOrigenDestino"] || "");
+    if (paisLy && paisDs && paisLy !== paisDs) partes.push(`Se corrigió país ${paisLy} a ${paisDs}`);
+    const descLy = String(layoutRow.Descripcion || "").trim();
+    const descDs = String(ds["DescripcionMercancia"] || "").trim();
+    if (descLy !== descDs && descDs) partes.push("En Descripción se hizo modificación");
+    if (a.fracCorr && a.fracOrig) partes.push(`Se corrigió fracción ${a.fracOrig} a ${a.fracCorr}`);
+    if (a.secOrig && a.newSec && String(a.secOrig) !== String(a.newSec)) partes.push(`Se corrigió secuencia ${a.secOrig} a ${a.newSec}`);
+    return partes.length ? partes.join("; ") : "OK";
+  };
 
   // Filas repetidas (mismo Ped+Frac+Pais+Cant+Val) → pintar amarillo (solo si tienen datos)
   const keyDup = (row) => `${row.Pedimento}|||${(row.FraccionNico||"").trim()}|||${row.PaisOrigen}|||${row.Cantidad}|||${row.ValorUSD}`;
@@ -2848,6 +3006,13 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     const t = (typeof val === "number") ? "n" : "s";
     ws[addr] = { t, v: val, s: style };
   };
+
+  if (ws && cadenaCol >= 0) {
+    setCell(ws, hdrRowI, cadenaCol, "Cadena (Layout vs DS)", { font: { bold: true, sz: 10 }, fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } }, alignment: { wrapText: true } });
+  }
+  if (ws && notasModifCol >= 0) {
+    setCell(ws, hdrRowI, notasModifCol, "Notas (modificaciones)", { font: { bold: true, sz: 10 }, fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } }, alignment: { wrapText: true } });
+  }
 
   // ── Modificar celdas en el worksheet original ─────────────────────────────
   if (ws) {
@@ -2890,11 +3055,27 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
           notaText = `⚠ Sec anterior: ${a.secOrig} → Corregida a ${newSecVal} | ${a.reason}`;
         }
         setCell(ws, r, colIdx.notas, notaText, styleNota);
+
+        // Cadena (Layout vs DS) al lado de Valor USD: verde si coinciden tal cual, naranja si no
+        if (cadenaCol >= 0) {
+          const cadenaLay = buildCadenaLayout(row);
+          const cadenaDs  = buildCadenaDS(a.dsRow);
+          const coinciden = cadenaLay === cadenaDs;
+          const txtCadena = `L: ${cadenaLay}\nDS: ${cadenaDs}`;
+          setCell(ws, r, cadenaCol, txtCadena, coinciden ? S_CADENA_OK : S_CADENA_DIFF);
+        }
+        // Notas (modificaciones): correcciones de país, descripción, fracción, secuencia o OK
+        if (notasModifCol >= 0) setCell(ws, r, notasModifCol, buildNotasModifExcel(row, a), S_OK_NOTA);
       } else if (esDup) {
         // Fila repetida sin match: pintar SEC CALC y NOTAS en amarillo para visibilidad
         setCell(ws, r, colIdx.sec, row.SecCalc || ".", styleAmarillo);
         const notaUnmatched = a?.reason || `Sin match en DS para Ped ${row.Pedimento} / Frac ${row.FraccionNico}`;
         setCell(ws, r, colIdx.notas, notaUnmatched, styleAmarilloNota);
+        if (cadenaCol >= 0) {
+          const cadenaLay = buildCadenaLayout(row);
+          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: —`, S_CADENA_DIFF);
+        }
+        if (notasModifCol >= 0) setCell(ws, r, notasModifCol, "OK", styleAmarilloNota);
       } else if (row.SecCalc && String(row.SecCalc).trim() !== "" && String(row.SecCalc).trim() !== "." && !isNaN(parseFloat(String(row.SecCalc)))) {
         // Fila con secuencia existente que NO pudo verificarse ni corregirse
         // → marcar en naranja oscuro para que el usuario la revise manualmente
@@ -2903,6 +3084,18 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         setCell(ws, r, colIdx.sec, `${row.SecCalc} ⚠`, S_SEC_REVISAR);
         const motivo = a?.reason || `Sec ${row.SecCalc} no coincide con DS — revisar manualmente`;
         setCell(ws, r, colIdx.notas, `⚠ REVISAR: ${motivo}`, S_NOTA_REVISAR);
+        if (cadenaCol >= 0) {
+          const cadenaLay = buildCadenaLayout(row);
+          const cadenaDs  = a?.dsRow ? buildCadenaDS(a.dsRow) : "—";
+          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: ${cadenaDs}`, S_CADENA_DIFF);
+        }
+        if (notasModifCol >= 0) setCell(ws, r, notasModifCol, buildNotasModifExcel(row, a) || "OK", S_NOTA_REVISAR);
+      } else {
+        if (cadenaCol >= 0) {
+          const cadenaLay = buildCadenaLayout(row);
+          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: —`, S_CADENA_DIFF);
+        }
+        if (notasModifCol >= 0) setCell(ws, r, notasModifCol, "OK", { font: { sz: 10 }, alignment: { wrapText: true } });
       }
     }
   }
@@ -2967,11 +3160,13 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     if (!ws["!cols"]) ws["!cols"] = [];
     if (colIdx.sec   >= 0) ws["!cols"][colIdx.sec]   = { wch: 14 };
     if (colIdx.notas >= 0) ws["!cols"][colIdx.notas] = { wch: 80 };
+    if (cadenaCol >= 0) ws["!cols"][cadenaCol] = { wch: 55 };
+    if (notasModifCol >= 0) ws["!cols"][notasModifCol] = { wch: 50 };
     const safeLayName = (layoutSheetName.slice(0, 17) + " (Actualiz.)").slice(0, 31);
     XLSX.utils.book_append_sheet(wb, ws, safeLayName);
   }
 
-  // Añadir DS 2020 sin cambios
+  // Añadir hoja DS sin cambios
   if (workbook.Sheets[dsSheetName]) {
     try { XLSX.utils.book_append_sheet(wb, workbook.Sheets[dsSheetName], dsSheetName.slice(0,31)); } catch(_){}
   }
@@ -3023,6 +3218,7 @@ function App2020() {
   const [tableData2020, setTableData2020] = useState(null);
   const [filterPed2020, setFilterPed2020] = useState("TODOS");
   const [copiedMsg, setCopiedMsg] = useState("");
+  const [showInstrucciones2020, setShowInstrucciones2020] = useState(false);
   const inputRef2020 = useRef(null);
 
   const process2020 = useCallback(async (file) => {
@@ -3044,6 +3240,25 @@ function App2020() {
       const dsRows      = readDS2020Sheet(wb.Sheets[dsName]);
       const layout2020  = readLayout2020Sheet(wb.Sheets[layName]);
       layout2020.dsRows = dsRows; // pasar ref al DS para que buildOutput pueda leer _rowI y _revisadoCol
+
+      // Avisar si faltan columnas: indicar cuáles no se encontraron y cómo deben nombrarse
+      const missingDS = dsRows._missingColumns || [];
+      const missingLy = layout2020._missingColumns || [];
+      if (missingDS.length > 0 || missingLy.length > 0) {
+        const parts = [];
+        if (missingDS.length > 0) {
+          parts.push("Hoja DS — columnas no encontradas:\n" + missingDS.map(m =>
+            `• ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
+          ).join("\n\n"));
+        }
+        if (missingLy.length > 0) {
+          parts.push("Hoja Layout — columnas no encontradas:\n" + missingLy.map(m =>
+            `• ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
+          ).join("\n\n"));
+        }
+        throw new Error(parts.join("\n\n") + "\n\nConsulte «Instrucciones» (botón arriba) para la lista completa de nombres requeridos.");
+      }
+
       setProgress2020(60);
 
       const pedMismatch = checkPedimentoMismatch(
@@ -3060,6 +3275,55 @@ function App2020() {
       // Construir datos de tabla para vista in-app
       const nDescT = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
       const normT  = s => String(s ?? "").trim().toUpperCase();
+      // Cadena Layout vs DS (mismo criterio que Excel: verde si coinciden, naranja si no)
+      const normStrCad = (v) => String(v ?? "").trim();
+      const nFracCad   = (v) => normStrCad(v).replace(/^0+/, "") || "0";
+      const nDescCad   = (s) => String(s ?? "").trim().toLowerCase().replace(/\s*\/\s*/g, "/").replace(/\s+/g, " ");
+      const getDSFracCad = (dsRow) => {
+        const f = nFracCad(dsRow["Fraccion"]);
+        if (f) return f;
+        const candado = normStrCad(dsRow["Candado 551"] ?? "");
+        if (!candado) return "";
+        const parts = candado.split("-");
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i].replace(/\./g, "");
+          if (p.length === 8 && /^\d+$/.test(p)) return p;
+        }
+        return "";
+      };
+      const buildCadenaLayoutRow = (row) => {
+        const ped = normStrCad(row.Pedimento);
+        const frac = nFracCad(row.FraccionNico ?? "");
+        const desc = nDescCad(row.Descripcion ?? "");
+        const pais = normStrCad(row.PaisOrigen ?? "");
+        const cant = Math.round(parseFloat(row.Cantidad) || 0);
+        const val  = Math.round(parseFloat(row.ValorUSD) || 0);
+        return `${ped}|${frac}|${desc}|${pais}|${cant}|${val}`;
+      };
+      const buildCadenaDSRow = (dsRow) => {
+        const ped  = normStrCad(dsRow["Pedimento2"] ?? "");
+        const frac = getDSFracCad(dsRow);
+        const desc = nDescCad(dsRow["DescripcionMercancia"] ?? "");
+        const pais = normStrCad(dsRow["PaisOrigenDestino"] ?? "");
+        const cant = Math.round(parseFloat(dsRow["CantidadUMComercial"]) || 0);
+        const val  = Math.round(parseFloat(dsRow["ValorDolares"]) || 0);
+        return `${ped}|${frac}|${desc}|${pais}|${cant}|${val}`;
+      };
+
+      // Helper: texto de notas de modificaciones (correcciones) o "OK"
+      const buildNotasModificaciones = (layoutRow, a, ds) => {
+        if (!a || a.status === "unmatched" || !ds) return "OK";
+        const partes = [];
+        const paisLy  = normT(layoutRow.PaisOrigen || "");
+        const paisDs  = normT(ds["PaisOrigenDestino"] || "");
+        if (paisLy && paisDs && paisLy !== paisDs) partes.push(`Se corrigió país ${paisLy} a ${paisDs}`);
+        const descLy  = String(layoutRow.Descripcion || "").trim();
+        const descDs  = String(ds["DescripcionMercancia"] || "").trim();
+        if (descLy !== descDs && descDs) partes.push("En Descripción se hizo modificación");
+        if (a.fracCorr && a.fracOrig) partes.push(`Se corrigió fracción ${a.fracOrig} a ${a.fracCorr}`);
+        if (a.secOrig && a.newSec && String(a.secOrig) !== String(a.newSec)) partes.push(`Se corrigió secuencia ${a.secOrig} a ${a.newSec}`);
+        return partes.length ? partes.join("; ") : "OK";
+      };
 
       // Paso 1: construir filas base con datos DS
       const tRowsBase = layout2020.layoutRows.map(r => {
@@ -3067,6 +3331,10 @@ function App2020() {
         const ds  = a?.dsRow || null;
         const pais = normT(r.PaisOrigen || r["Pais Origen"] || "");
         const desc = String(r.Descripcion || r["DescripcionMercancia"] || "");
+        const cadenaLay = buildCadenaLayoutRow(r);
+        const cadenaDs  = ds ? buildCadenaDSRow(ds) : "";
+        const cadenaCoincide = !!ds && cadenaLay === cadenaDs;
+        const notasModificaciones = buildNotasModificaciones(r, a, ds);
         return {
           idx:        r._idx,
           ped:        String(r.Pedimento  || ""),
@@ -3083,6 +3351,11 @@ function App2020() {
           reason:     a?.reason   || "Sin match",
           fracCorr:   a?.fracCorr || null,   // fracción corregida (cross-fraction)
           fracOrig:   a?.fracOrig || null,   // fracción original en Layout
+          notasModificaciones,
+          // Cadena Layout vs DS (verde si coinciden, naranja si no)
+          cadenaLayout:   cadenaLay,
+          cadenaDS:       cadenaDs,
+          cadenaCoincide,
           // Datos del DS para comparación
           dsCant:     ds ? (parseFloat(ds["CantidadUMComercial"]) || 0) : null,
           dsVal:      ds ? (parseFloat(ds["ValorDolares"])        || 0) : null,
@@ -3094,22 +3367,38 @@ function App2020() {
         };
       });
 
-      // Paso 2: calcular sumas por grupo
+      // Paso 2: calcular sumas por grupo y secuencias involucradas en cada grupo
       const groupSums = new Map();
+      const groupSecuencias = new Map(); // groupKey → [secNueva, secNueva, ...]
       for (const r of tRowsBase) {
         if (!r.groupKey) continue;
         if (!groupSums.has(r.groupKey)) groupSums.set(r.groupKey, { sumCant: 0, sumVal: 0 });
         const g = groupSums.get(r.groupKey);
         g.sumCant += r.cant;
         g.sumVal  += r.val;
+        if (!groupSecuencias.has(r.groupKey)) groupSecuencias.set(r.groupKey, []);
+        groupSecuencias.get(r.groupKey).push(String(r.secNueva || "").trim() || "—");
       }
 
-      // Paso 3: añadir totales de grupo a cada fila
-      const tRows = tRowsBase.map(r => ({
-        ...r,
-        groupSumCant: r.groupKey ? (groupSums.get(r.groupKey)?.sumCant ?? null) : null,
-        groupSumVal:  r.groupKey ? (groupSums.get(r.groupKey)?.sumVal  ?? null) : null,
-      }));
+      // Paso 3: añadir totales de grupo, cadena total (grupo sumado vs DS) y secuencias del grupo
+      const tRows = tRowsBase.map(r => {
+        const groupSumCant = r.groupKey ? (groupSums.get(r.groupKey)?.sumCant ?? null) : null;
+        const groupSumVal  = r.groupKey ? (groupSums.get(r.groupKey)?.sumVal  ?? null) : null;
+        const cadenaTotalLayout = (groupSumCant != null && groupSumVal != null)
+          ? `${normStrCad(r.ped)}|${nFracCad(r.frac)}|${nDescCad(r.desc)}|${normStrCad(r.pais)}|${Math.round(groupSumCant)}|${Math.round(groupSumVal)}`
+          : "";
+        const cadenaTotalCoincide = (r.dsCant != null && r.dsVal != null && groupSumCant != null && groupSumVal != null)
+          && (Math.round(groupSumCant) === Math.round(r.dsCant) && Math.round(groupSumVal) === Math.round(r.dsVal));
+        const secuenciasEnGrupo = r.groupKey ? (groupSecuencias.get(r.groupKey) || []) : [];
+        return {
+          ...r,
+          groupSumCant,
+          groupSumVal,
+          cadenaTotalLayout,
+          cadenaTotalCoincide: !!cadenaTotalCoincide,
+          secuenciasEnGrupo,
+        };
+      });
 
       setTableData2020(tRows);
       setFilterPed2020("TODOS");
@@ -3157,16 +3446,73 @@ function App2020() {
               MULTI-PEDIMENTO · VERIFICACIÓN + ASIGNACIÓN
             </div>
             <h2 style={{ fontSize:32,fontWeight:900,margin:"0 0 12px",letterSpacing:"-0.02em" }}>
-              Módulo <span style={{color:"#22c55e"}}>DS 2020</span> — Secuencias Multi-Pedimento
+              Módulo <span style={{color:"#22c55e"}}>DS</span> — Secuencias Multi-Pedimento
             </h2>
             <p style={{ color:"#64748b",fontSize:14,maxWidth:520,margin:"0 auto" }}>
               Sube un Excel con hojas <b style={{color:"#22c55e"}}>DS *</b> (Data Stage) y <b style={{color:"#22c55e"}}>Layout *</b>.
               La app verifica secuencias existentes y asigna las faltantes por pedimento.
             </p>
+            <button
+              type="button"
+              onClick={() => setShowInstrucciones2020(!showInstrucciones2020)}
+              style={{ marginTop:12, background:"transparent", border:"1px solid #334155", color:"#94a3b8", padding:"8px 16px", borderRadius:6, cursor:"pointer", fontSize:13, fontWeight:600 }}
+            >
+              {showInstrucciones2020 ? "▼ Ocultar instrucciones" : "📋 Instrucciones — requisitos del Excel"}
+            </button>
           </div>
 
+          {showInstrucciones2020 && (
+            <div style={{ marginBottom:24, padding:"20px 24px", background:"#0f172a", border:"1px solid #334155", borderRadius:8, textAlign:"left", maxWidth:720 }}>
+              <div style={{ color:"#22c55e", fontSize:14, fontWeight:800, marginBottom:16, letterSpacing:"0.05em" }}>REQUISITOS DEL ARCHIVO EXCEL</div>
+              <p style={{ color:"#94a3b8", fontSize:13, marginBottom:16 }}>El archivo debe tener <strong style={{color:"#f8fafc"}}>dos hojas</strong> con los nombres y columnas indicados. Use exactamente estos nombres de columnas (o los alternativos aceptados) para que el sistema lea correctamente los valores.</p>
+
+              <div style={{ marginBottom:20 }}>
+                <div style={{ color:"#f8fafc", fontSize:14, fontWeight:700, marginBottom:8 }}>1. Hoja DS (Data Stage)</div>
+                <p style={{ color:"#64748b", fontSize:12, marginBottom:8 }}>Nombre de la hoja: debe contener <strong>"DS"</strong> (ej. <code style={{background:"#1e293b",padding:"2px 6px",borderRadius:4}}>DS</code>).</p>
+                <div style={{ fontSize:12, color:"#cbd5e1" }}>
+                  <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+                    <thead><tr style={{ borderBottom:"1px solid #334155" }}><th style={{ padding:"6px 8px", textAlign:"left", color:"#64748b" }}>Columna (recomendado)</th><th style={{ padding:"6px 8px", textAlign:"left", color:"#64748b" }}>Nombres aceptados</th></tr></thead>
+                    <tbody>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Pedimento2</td><td style={{ padding:"6px 8px" }}>Pedimento2</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Fraccion</td><td style={{ padding:"6px 8px" }}>Fraccion</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>SecuenciaFraccion</td><td style={{ padding:"6px 8px" }}>SecuenciaFraccion</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>DescripcionMercancia</td><td style={{ padding:"6px 8px" }}>DescripcionMercancia</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>CantidadUMComercial</td><td style={{ padding:"6px 8px" }}>CantidadUMComercial</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>ValorDolares</td><td style={{ padding:"6px 8px" }}>ValorDolares, Valor usd redondeado, ValorAduana, Valor Aduana Estadístico, ValorAgregado</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>PaisOrigenDestino</td><td style={{ padding:"6px 8px" }}>PaisOrigenDestino</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Candado 551</td><td style={{ padding:"6px 8px" }}>Candado 551, Candado DS 551, Candado, Clave, Secuencias</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div>
+                <div style={{ color:"#f8fafc", fontSize:14, fontWeight:700, marginBottom:8 }}>2. Hoja Layout</div>
+                <p style={{ color:"#64748b", fontSize:12, marginBottom:8 }}>Nombre de la hoja: debe contener <strong>"Layout"</strong> o tener columnas típicas de Layout (Pedimento, FraccionNico, SEC CALC, etc.).</p>
+                <div style={{ fontSize:12, color:"#cbd5e1" }}>
+                  <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+                    <thead><tr style={{ borderBottom:"1px solid #334155" }}><th style={{ padding:"6px 8px", textAlign:"left", color:"#64748b" }}>Columna (recomendado)</th><th style={{ padding:"6px 8px", textAlign:"left", color:"#64748b" }}>Nombres aceptados</th></tr></thead>
+                    <tbody>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Pedimento</td><td style={{ padding:"6px 8px" }}>Pedimento</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>FraccionNico</td><td style={{ padding:"6px 8px" }}>FraccionNico, fraccionnico</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>SEC CALC / Secuencia</td><td style={{ padding:"6px 8px" }}>SEC CALC, seccalc, secuenciaped, Secuencia, secuencia, SEC</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Descripcion</td><td style={{ padding:"6px 8px" }}>descripcion, clase_descripcion, descripcionmercancia</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>PaisOrigen</td><td style={{ padding:"6px 8px" }}>pais_origen, paisorigen, paisorigendestino</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Cantidad</td><td style={{ padding:"6px 8px" }}>cantidad_comercial, cantidadcomercial, cantidadumc</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Valor USD</td><td style={{ padding:"6px 8px" }}>ValorMPDolares, valormpdolares, valordolares, valor_me, valorme</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>NOTAS</td><td style={{ padding:"6px 8px" }}>NOTAS, notas</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Candado 551</td><td style={{ padding:"6px 8px" }}>CANDADO 551, Candado 551, Candado DS 551, Candado, Clave, candado</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <p style={{ color:"#64748b", fontSize:11, marginTop:16 }}>La primera fila con la mayoría de estas columnas se toma como encabezado. Homologue los nombres en su Excel a uno de los aceptados para evitar errores de lectura.</p>
+            </div>
+          )}
+
           {error2020 && (
-            <div style={{ background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:4,padding:"12px 18px",marginBottom:20,color:"#fca5a5",fontSize:13 }}>
+            <div style={{ background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:4,padding:"12px 18px",marginBottom:20,color:"#fca5a5",fontSize:13,whiteSpace:"pre-wrap",textAlign:"left" }}>
               ⚠ {error2020}
             </div>
           )}
@@ -3181,12 +3527,12 @@ function App2020() {
             <input ref={inputRef2020} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e => e.target.files[0] && onFile2020(e.target.files[0])} />
             <div style={{fontSize:40,marginBottom:12}}>📊</div>
             <div style={{color:"#f8fafc",fontSize:16,fontWeight:700,marginBottom:8}}>Sube tu archivo Excel 2020</div>
-            <div style={{color:"#94a3b8",fontSize:12}}>Requiere hojas <span style={{color:"#22c55e",fontFamily:"monospace"}}>DS 2020</span> y <span style={{color:"#22c55e",fontFamily:"monospace"}}>Layout 2020</span></div>
+            <div style={{color:"#94a3b8",fontSize:12}}>Requiere hojas <span style={{color:"#22c55e",fontFamily:"monospace"}}>DS</span> y <span style={{color:"#22c55e",fontFamily:"monospace"}}>Layout</span></div>
           </div>
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS 2020"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA (Cant±1, Val±4 = DS)"],["Naranja en SEC CALC ⚠","Secuencia existente NO verificada — revisar manualmente"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA (Cant±1, Val±4 = DS)"],["Naranja en SEC CALC ⚠","Secuencia existente NO verificada — revisar manualmente"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
@@ -3199,7 +3545,7 @@ function App2020() {
       {phase2020 === "processing" && (
         <div style={{textAlign:"center",padding:"80px 0",animation:"fadeUp 0.3s ease"}}>
           <div style={{width:48,height:48,border:"3px solid #22c55e",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 24px"}} />
-          <div style={{color:"#f8fafc",fontSize:18,fontWeight:700,marginBottom:8}}>Procesando DS 2020...</div>
+          <div style={{color:"#f8fafc",fontSize:18,fontWeight:700,marginBottom:8}}>Procesando DS...</div>
           <div style={{color:"#64748b",fontSize:13,marginBottom:24}}>{fileName2020}</div>
           <div style={{width:280,height:4,background:"#1e293b",borderRadius:2,margin:"0 auto",overflow:"hidden"}}>
             <div style={{height:"100%",background:"#22c55e",width:`${progress2020}%`,transition:"width 0.4s ease",borderRadius:2}} />
@@ -3332,10 +3678,15 @@ function App2020() {
             };
 
             const copyTSV = () => {
-              const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tEstado";
+              const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tCadena (L vs DS)\tCadena total (grupo vs DS)\tSecuencias en grupo\tEstado\tNotas";
               const body = filtered.map(r => [
                 r.secNueva, r.ped, r.frac, r.pais,
-                r.desc, r.cant, r.val.toFixed(2), statusLabel(r.status)
+                r.desc, r.cant, r.val.toFixed(2),
+                (r.cadenaLayout ? `L: ${r.cadenaLayout} | DS: ${r.cadenaDS || "—"}` : ""),
+                (r.cadenaTotalLayout ? `L(total): ${r.cadenaTotalLayout} | DS: ${r.cadenaDS || "—"}${r.cadenaTotalCoincide ? " ✓ grupo" : ""}` : "—"),
+                (r.secuenciasEnGrupo?.length ? (() => { const c={}; for (const s of r.secuenciasEnGrupo) { const v=s||"—"; c[v]=(c[v]||0)+1; } return Object.entries(c).map(([sec,n]) => n>1 ? `${sec} (se repite ${n})` : sec).join("; "); })() : "—"),
+                statusLabel(r.status),
+                r.notasModificaciones ?? "OK"
               ].join("\t")).join("\n");
               navigator.clipboard.writeText(hdr + "\n" + body).then(() => {
                 setCopiedMsg("¡Tabla copiada! Pega en Excel con Ctrl+V");
@@ -3432,12 +3783,12 @@ function App2020() {
                   </div>
                 )}
 
-                {/* Tabla */}
-                <div style={{overflowX:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:500,overflowY:"auto"}}>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:"DM Mono, monospace"}}>
+                {/* Tabla — scroll horizontal para ver cadenas completas */}
+                <div style={{overflowX:"auto",overflowY:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:500,WebkitOverflowScrolling:"touch"}}>
+                  <table style={{width:"100%",minWidth:1200,borderCollapse:"collapse",fontSize:12,fontFamily:"DM Mono, monospace"}}>
                     <thead>
                       <tr style={{background:"#0f172a",position:"sticky",top:0,zIndex:2}}>
-                        {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Estado"].map(h => (
+                        {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Cadena (L vs DS)","Cadena total (grupo vs DS)","Secuencias en grupo","Estado","Notas"].map(h => (
                           <th key={h} style={{padding:"8px 10px",textAlign:["Cantidad","Valor USD"].includes(h)?"right":"left",color:"#64748b",fontWeight:700,borderBottom:"1px solid #1e293b",whiteSpace:"nowrap",fontSize:11}}>{h}</th>
                         ))}
                       </tr>
@@ -3487,10 +3838,47 @@ function App2020() {
                             <td style={{padding:"6px 10px",textAlign:"right",color:ci.color,fontWeight:600,whiteSpace:"nowrap"}}>{ci.label}</td>
                             {/* Valor USD — color según diferencia grupo vs DS */}
                             <td style={{padding:"6px 10px",textAlign:"right",color:vi.color,fontWeight:600,whiteSpace:"nowrap"}}>{vi.label}</td>
+                            {/* Cadena Layout vs DS — siempre muestra L y DS cuando hay secuencia; verde si coinciden, naranja si no */}
+                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A3222":"#92400E22") : "#1e293b",color:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A32":"#92400E") : "#64748b",borderLeft:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"2px solid #22c55e":"2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={`Layout: ${r.cadenaLayout}\nDS: ${r.cadenaDS||"—"}`}>
+                              <>
+                                <div style={{fontWeight:600}}>L: {r.cadenaLayout}</div>
+                                <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || "—"}</div>
+                                {r.cadenaCoincide && (r.secNueva || r.cadenaDS) && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}>✓ Coinciden</div>}
+                              </>
+                            </td>
+                            {/* Cadena total (grupo vs DS): cuando hay varias líneas, suma del grupo vs DS — verde si coinciden totales, naranja si no */}
+                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A3222" : "#92400E22") : "transparent",color:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A32" : "#92400E") : "#64748b",borderLeft:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "2px solid #22c55e" : "2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={r.cadenaTotalLayout ? `L (total grupo): ${r.cadenaTotalLayout}\nDS: ${r.cadenaDS||"—"}` : ""}>
+                              {r.cadenaCoincide ? (
+                                <span style={{color:"#64748b",fontSize:10}}>—</span>
+                              ) : r.cadenaTotalLayout ? (
+                                <>
+                                  <div style={{fontWeight:600}}>L (total): {r.cadenaTotalLayout}</div>
+                                  <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || "—"}</div>
+                                  {r.cadenaTotalCoincide && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}>✓ Coincide a nivel grupo</div>}
+                                </>
+                              ) : (
+                                <span style={{color:"#64748b"}}>—</span>
+                              )}
+                            </td>
+                            {/* Secuencias involucradas en el grupo: valor único con "(se repite N)" en vez de repetir */}
+                            <td style={{padding:"6px 10px",minWidth:120,fontSize:11,color:"#94a3b8",whiteSpace:"pre-wrap",wordBreak:"break-word"}} title={r.secuenciasEnGrupo?.length ? `Secuencias en este grupo: ${r.secuenciasEnGrupo.join(", ")}` : ""}>
+                              {r.secuenciasEnGrupo?.length ? (() => {
+                                const countBy = {};
+                                for (const s of r.secuenciasEnGrupo) { const v = s || "—"; countBy[v] = (countBy[v] || 0) + 1; }
+                                const txt = Object.entries(countBy).map(([sec, n]) => n > 1 ? `${sec} (se repite ${n})` : sec).join("; ");
+                                return <div style={{fontWeight:600,color:"#cbd5e1"}}>{txt}</div>;
+                              })() : (
+                                <span style={{color:"#64748b"}}>—</span>
+                              )}
+                            </td>
                             <td style={{padding:"6px 10px"}}>
                               <span style={{background:statusColor(r.status)+"22",color:statusColor(r.status),padding:"2px 7px",borderRadius:3,fontSize:10,fontWeight:700}}>
                                 {statusLabel(r.status)}
                               </span>
+                            </td>
+                            {/* Notas: correcciones (país, descripción, fracción, secuencia) o OK */}
+                            <td style={{padding:"6px 10px",minWidth:180,maxWidth:320,fontSize:11,color:"#94a3b8",whiteSpace:"pre-wrap",wordBreak:"break-word"}} title={r.notasModificaciones}>
+                              {r.notasModificaciones}
                             </td>
                           </tr>
                         );
@@ -3628,7 +4016,7 @@ export default function App() {
           }}>🛃</div>
           <div>
             <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "-0.01em", color: "#f8fafc" }}>
-              SECUENCIAPED MATCHER
+              LCK consultores
             </div>
             <div style={{ fontSize: 11, color: "#475569", letterSpacing: "0.08em", fontFamily: "DM Mono, monospace" }}>
               COMERCIO EXTERIOR · INMEX · PEDIMENTO 551
@@ -3636,7 +4024,7 @@ export default function App() {
           </div>
           {/* Tab selector */}
           <div style={{ display:"flex", gap:4, marginLeft:24, background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:4 }}>
-            {[{ id:"551", label:"Módulo 551" }, { id:"2020", label:"Módulo DS 2020" }].map(t => (
+            {[{ id:"551", label:"Módulo 551" }, { id:"2020", label:"Módulo DS" }].map(t => (
               <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
                 background: activeTab===t.id ? (t.id==="2020"?"#22c55e":"#f59e0b") : "transparent",
                 border:"none", color: activeTab===t.id ? "#0f172a" : "#64748b",
@@ -3679,7 +4067,7 @@ export default function App() {
 
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 24px" }}>
 
-        {/* MÓDULO DS 2020 */}
+        {/* MÓDULO DS */}
         {activeTab === "2020" && <App2020 />}
 
         {/* MÓDULO 551 — original */}
