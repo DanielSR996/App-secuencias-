@@ -1781,8 +1781,12 @@ function readLayout2020Sheet(sheet) {
   console.log("[Layout2020] ref:", sheet["!ref"], "filas totales:", range.e.r + 1, "cols:", range.e.c + 1);
 
   // Asegurar que leemos suficientes columnas para encontrar candado (ej. AJ = col 35); si !ref es corto, extendemos
+  // Limitar columnas leídas para el header: si el sheet es más ancho que 400 cols
+  // (ej. A1:XEM5065), la mayoría de columnas útiles están en las primeras ~300.
+  // Escaneamos en bloques de 300 cols hasta encontrar los hits suficientes (≥4).
   const MIN_COLS_CANDADO = 60;
-  const maxCol = Math.max(range.e.c, MIN_COLS_CANDADO - 1);
+  const MAX_HDR_COLS     = 400; // límite razonable para encontrar todos los headers
+  const maxCol = Math.min(Math.max(range.e.c, MIN_COLS_CANDADO - 1), MAX_HDR_COLS - 1);
 
   // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
   const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: maxCol } };
@@ -1869,11 +1873,14 @@ function readLayout2020Sheet(sheet) {
     return cell ? (parseFloat(cell.v) || 0) : 0;
   };
 
-  // ── 5. Leer filas de datos celda-por-celda (incluir todas, no saltar) ─────
+  // ── 5. Leer filas de datos celda-por-celda (saltar filas sin pedimento ni fracción) ─────
   const layoutRows = [];
   for (let r = hdrI + 1; r <= range.e.r; r++) {
     const pedVal  = cellVal(r, colIdx.pedimento);
     const fracVal = cellVal(r, colIdx.frac);
+
+    // Saltar filas completamente vacías (sin pedimento ni fracción)
+    if (!pedVal && !fracVal) continue;
 
     const notasInVal = cellVal(r, colIdx.notasIn).toUpperCase();
     const noIncluir  = notasInVal.includes("NO INCLUIR");
