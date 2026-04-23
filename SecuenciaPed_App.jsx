@@ -1,11 +1,12 @@
-import { useState, useCallback, useRef } from "react";
+﻿import { useState, useCallback, useRef } from "react";
 import * as XLSX from "xlsx-js-style";
 
-// ─── LECTURA EXCEL (hoja 551 con columnas duplicadas / nombres con espacios) ───
+//  LECTURA EXCEL (hoja 551 con columnas duplicadas / nombres con espacios) 
 // Columnas necesarias del 551 (se busca la PRIMERA ocurrencia de cada nombre, por eso
 // se usa header:1 y búsqueda por nombre trimado en lugar de sheet_to_json directamente).
 const COLS_551 = [
   "Pedimento",
+  "Pedimento2",         // forma extendida; prioridad en pedCruceKey para alinear con Layout
   "Secuencias",         // clave compuesta Ped-Fraccion-SecuenciaFraccion (match directo con CANDADO DS 551 del Layout)
   "Fraccion",           // clave de cruce con FraccionNico del Layout
   "SecuenciaFraccion",  // valor a asignar en Layout.SecuenciaPed
@@ -21,6 +22,100 @@ function firstIndexByHeader(headerRow, colName) {
     if (String(headerRow[i] || "").trim() === s) return i;
   }
   return -1;
+}
+
+/**
+ * Alinea pedimentos entre Layout (ej. 21-400-3459-1000958) y 551/DS
+ * (ej. 400-3459-1000958 o 1000958) para claves de cruce.
+ */
+/**
+ * Clave canónica de pedimento para cruzar Layout vs 551/DS.
+ * En México el pedimento "real" (aduana-aa-patente-clave) es fijo: p. ej. 400-3459-1000958.
+ * Los 12 dígitos iniciales (año, aduana distinta, etc. como 22- o 21- antes del núcleo)
+ * NO cambian el pedimento y se ignoran para el cruce.
+ * Prioridad: extraer el trío NNN-NNNN- por regex; si no, quitar solo el primer tramo de 12 dígitos.
+ */
+function pedCruceKey(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  // Núcleo estándar: 3 cifras - 4 cifras - clave (410 dígitos)  p. ej. 400-3459-1000958
+  const mCore = s.match(/(\d{3}-\d{4}-\d{4,10})/);
+  if (mCore) return mCore[1];
+  if (/^\d{6,10}$/.test(s)) return s;
+  const p = s.split(/[\s-]+/).filter(Boolean);
+  // 22-400-3459-1000958    descartar el primer tramo (12 dígitos) y unir 400-3459-1000958
+  if (p.length >= 4 && p[0].length <= 2 && /^\d+$/.test(p[0])) {
+    return p.slice(1, 4).join("-");
+  }
+  if (p.length === 3) return p.join("-");
+  if (p.length === 2) return s;
+  if (p.length === 1) return p[0];
+  return s;
+}
+
+function scoreLayoutHeaderRow(cells) {
+  const HITS = ["pediment", "fraccion", "francion", "frac", "pais", "candado", "cantidad", "descrip", "umc", "sec", "vcusd", "valor", "clave", "aduana"];
+  let s = 0;
+  for (const c of cells) {
+    const t = String(c ?? "").trim().toLowerCase();
+    if (!t) continue;
+    for (const h of HITS) {
+      if (t.includes(h)) { s += 1; break; }
+    }
+  }
+  return s;
+}
+
+function findLayoutHeaderRowIndex(rows) {
+  const maxR = Math.min(25, rows.length);
+  let best = 0, bestS = -1;
+  for (let r = 0; r < maxR; r++) {
+    const sc = scoreLayoutHeaderRow(rows[r] || []);
+    if (sc > bestS) { bestS = sc; best = r; }
+  }
+  return bestS >= 2 ? best : 0;
+}
+
+/**
+ * Asegura nombres de columnas que usa runCascade (p. ej. pedimento  Pedimento,
+ * cantidad_comercial  CantidadSaldo).
+ */
+function applyLayoutAliases(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  if ((obj.Pedimento == null || String(obj.Pedimento).trim() === "") && obj.pedimento != null)
+    obj.Pedimento = obj.pedimento;
+  if (obj.pedimento1 && (obj.Pedimento == null || String(obj.Pedimento).trim() === "")) obj.Pedimento = obj.pedimento1;
+  if (obj.FraccionNico == null) {
+    for (const a of [obj.fraccionNico, obj.Fraccion, obj.fraccion, obj.frac]) {
+      if (a != null && String(a).trim() !== "") { obj.FraccionNico = a; break; }
+    }
+  }
+  if (obj.PaisOrigen == null) {
+    for (const a of [obj.pais_origen, obj.pais, obj.origen_destino]) {
+      if (a != null && String(a).trim() !== "") { obj.PaisOrigen = a; break; }
+    }
+  }
+  if (obj.CantidadSaldo == null) {
+    for (const a of [obj.cantidad_comercial, obj.cantidad_saldo, obj.Cantidad]) {
+      if (a != null && String(a).replace(/\s/g, "") !== "") { obj.CantidadSaldo = a; break; }
+    }
+  }
+  if (obj.VCUSD == null) {
+    for (const a of [obj.ValorTotalDolares, obj.vcusd, obj.ValorMPDolares, obj.valor_total_dlls]) {
+      if (a != null && String(a).replace(/\s/g, "") !== "") { obj.VCUSD = a; break; }
+    }
+  }
+  if (obj.Descripcion == null) {
+    for (const a of [obj.descripcion, obj["Descripción"]]) {
+      if (a != null && String(a).trim() !== "") { obj.Descripcion = a; break; }
+    }
+  }
+  if (obj.SecuenciaPed == null) {
+    for (const a of [obj["SEC CALC"], obj.secuencias, obj.SeqPed, obj.Seq, obj.secuencia_ped, obj.sSecuenciaPed, obj.Secuencia]) {
+      if (a != null && String(a).replace(/\s/g, "") !== "") { obj.SecuenciaPed = a; break; }
+    }
+  }
+  return obj;
 }
 
 /** Lee la hoja 551 tomando la PRIMERA columna que coincida con cada nombre (maneja espacios y duplicados).
@@ -51,7 +146,7 @@ function read551Sheet(sheet) {
       obj[col] = row[idx];
     }
     // Resolver ValorDolares efectivo cuando hay columnas duplicadas:
-    // recorrer todos los índices y quedarse con el primero que tenga valor numérico ≠ 0.
+    // recorrer todos los índices y quedarse con el primero que tenga valor numérico  0.
     if (vdIndices.length > 1) {
       let efectivo = null;
       for (const idx of vdIndices) {
@@ -66,22 +161,26 @@ function read551Sheet(sheet) {
   return out;
 }
 
-/** Lee el Layout y normaliza los nombres de columnas con espacios. */
+/** Lee el Layout: detecta fila de encabezado (plantillas con fila 1 de títulos) y aplica alias. */
 function readLayoutSheet(sheet) {
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (!rows.length) return [];
-  // Construir header normalizado (trim), guardando el índice de cada columna
-  const rawHeaders = rows[0];
-  const headers = rawHeaders.map((c) => String(c ?? "").trim());
+  const headerRowI = findLayoutHeaderRowIndex(rows);
+  const rawHeaders = rows[headerRowI] || [];
+  const headers = rawHeaders.map((c, j) => {
+    const t = String(c ?? "").trim();
+    return t || `__C${j}`;
+  });
   const out = [];
-  for (let i = 1; i < rows.length; i++) {
+  for (let i = headerRowI + 1; i < rows.length; i++) {
     const row = rows[i];
     if (row.every((c) => c === "" || c == null)) continue;
     const obj = {};
     for (let j = 0; j < headers.length; j++) {
-      if (headers[j]) obj[headers[j]] = row[j];
+      const key = headers[j] || `__C${j}`;
+      obj[key] = row[j];
     }
-    out.push(obj);
+    out.push(applyLayoutAliases(obj));
   }
   return out;
 }
@@ -90,6 +189,8 @@ function resolve551SheetName(wb) {
   const names = wb.SheetNames || [];
   if (names.includes("551")) return "551";
   const lower = names.map((n) => String(n).toLowerCase());
+  const d = lower.findIndex((n) => n === "ds" || n === "data" || n.startsWith("ds"));
+  if (d >= 0) return names[d];
   const i = lower.findIndex((n) => n.includes("data") && n.includes("stage"));
   if (i >= 0) return names[i];
   const j = lower.findIndex((n) => n === "datastage" || n.includes("551"));
@@ -97,10 +198,20 @@ function resolve551SheetName(wb) {
   return null;
 }
 
-// ─── MATCHING ENGINE ──────────────────────────────────────────────────────────
+/** Nombre de hoja Layout (case-insensitive) o "Layout" por defecto. */
+function resolveLayoutSheetName(wb) {
+  const names = wb.SheetNames || [];
+  if (names.includes("Layout")) return "Layout";
+  const lower = names.map((n) => String(n).toLowerCase());
+  const i = lower.findIndex((n) => n === "layout");
+  if (i >= 0) return names[i];
+  return null;
+}
+
+//  MATCHING ENGINE 
 // Lógica real de cruce IMMEX:
-//   Layout: Pedimento + FraccionNico + PaisOrigen → suma CantidadSaldo y VCUSD
-//   551:    Pedimento + Fraccion    + PaisOrigenDestino → CantidadUMComercial y ValorDolares
+//   Layout: Pedimento + FraccionNico + PaisOrigen  suma CantidadSaldo y VCUSD
+//   551:    Pedimento + Fraccion    + PaisOrigenDestino  CantidadUMComercial y ValorDolares
 //   Resultado: SecuenciaFraccion del 551 se asigna a SecuenciaPed del Layout
 
 function groupBy(rows, keys) {
@@ -135,7 +246,7 @@ function tryMatch(candidates, sumCant, sumVCUSD, tolCant = 1, tolVCUSD = 2) {
 }
 
 /**
- * E6 — Busca un subconjunto de 2 o 3 candidatos cuya suma ≈ (sumCant, sumVCUSD).
+ * E6  Busca un subconjunto de 2 o 3 candidatos cuya suma  (sumCant, sumVCUSD).
  * Detecta el caso donde el mismo material entró en varios lotes del mismo pedimento.
  * Limita el pool a 12 para evitar explosión combinatoria (12C3 = 220 iteraciones máx.).
  */
@@ -175,7 +286,7 @@ function tryMatchCombination(candidates, sumCant, sumVCUSD, tolC = 1, tolV = 4) 
 }
 
 /**
- * E7 — Precio unitario (ValorDolares / CantidadUMComercial) como discriminador.
+ * E7  Precio unitario (ValorDolares / CantidadUMComercial) como discriminador.
  * Busca el candidato cuyo $/pieza sea más cercano al del Layout, con tolerancia ±tolPct.
  */
 function tryMatchUnitPrice(candidates, sumCant, sumVCUSD, tolPct = 0.15) {
@@ -192,6 +303,23 @@ function tryMatchUnitPrice(candidates, sumCant, sumVCUSD, tolPct = 0.15) {
     if (diff <= tolPct && diff < bestDiff) { bestDiff = diff; best = r; }
   }
   return best ? { seq: best["SecuenciaFraccion"], r551: best } : null;
+}
+
+function normDescLite(s) {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .trim();
+}
+
+function tokenOverlapRatio(a, b) {
+  const ta = new Set(normDescLite(a).split(" ").filter((x) => x.length > 2));
+  const tb = new Set(normDescLite(b).split(" ").filter((x) => x.length > 2));
+  if (!ta.size || !tb.size) return 0;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  return inter / Math.max(ta.size, tb.size);
 }
 
 /** Detecta si DS y Layout tienen pedimentos distintos (sin intersección).
@@ -219,7 +347,7 @@ function getPedimentosFromRows(rows, ...keys) {
 }
 
 function runCascade(layoutRows, s551Rows) {
-  // ── Columnas del Layout (ya vienen normalizadas por readLayoutSheet) ─────
+  //  Columnas del Layout (ya vienen normalizadas por readLayoutSheet) 
   const L_PED   = "Pedimento";
   const L_FRAC  = "FraccionNico";
   const L_PAIS  = "PaisOrigen";
@@ -227,7 +355,7 @@ function runCascade(layoutRows, s551Rows) {
   const L_VCUSD = "VCUSD";
   const L_SEC   = "SecuenciaPed";
 
-  // ── Columnas del 551 ─────────────────────────────────────────────────────
+  //  Columnas del 551 
   const S_PED  = "Pedimento";
   const S_FRAC = "Fraccion";
   const S_PAIS = "PaisOrigenDestino";
@@ -242,20 +370,45 @@ function runCascade(layoutRows, s551Rows) {
     return isNaN(n) ? "" : String(Math.round(n));
   };
 
-  const layout = layoutRows.map((r, i) => ({
-    ...r,
-    _idx: i,
-    _frac: nFrac(r[L_FRAC]),
-    _sec:  nSec(r[L_SEC]),
-  }));
+  const L_PEDK = "_pedCruce";
 
-  const s551 = s551Rows.map((r, i) => ({
-    ...r,
-    _frac:    nFrac(r[S_FRAC]),
-    _551idx:  i,
-  }));
+  const layout = layoutRows.map((r, i) => {
+    const pedRaw =
+      r[L_PED] != null && String(r[L_PED]).trim() !== "" ? r[L_PED] : (r.pedimento ?? r.pedimento1 ?? "");
+    const pedKey = pedCruceKey(pedRaw);
+    const fracKey = nFrac(r[L_FRAC]);
+    const cantNum = parseFloat(r[L_CANT]);
+    const valNum = parseFloat(r[L_VCUSD]);
+    const skipReasons = [];
+    if (!pedKey) skipReasons.push("pedimento vacío o no interpretable");
+    if (!fracKey || fracKey === "0") skipReasons.push("fracción vacía/no válida");
+    if (!isFinite(cantNum) || cantNum === 0) skipReasons.push("CantidadSaldo vacía o 0");
+    if (!isFinite(valNum) || valNum === 0) skipReasons.push("VCUSD vacío o 0");
+    const skipReason = skipReasons.length > 0
+      ? `No se buscó secuencia: ${skipReasons.join("; ")}.`
+      : "";
+    return {
+      ...r,
+      [L_PED]: pedRaw,
+      _idx: i,
+      _frac: fracKey,
+      _sec:  nSec(r[L_SEC]),
+      [L_PEDK]: pedKey,
+      _skipReason: skipReason,
+    };
+  });
 
-  // ── Totales globales para validar si Layout y 551 balancean ──────────────
+  const s551 = s551Rows.map((r, i) => {
+    const pk = pedCruceKey(r.Pedimento2) || pedCruceKey(r[S_PED]) || "";
+    return {
+      ...r,
+      _frac:   nFrac(r[S_FRAC]),
+      _551idx: i,
+      [L_PEDK]: pk,
+    };
+  });
+
+  //  Totales globales para validar si Layout y 551 balancean 
   const globalTotals = {
     layoutCant:  layout.reduce((a, r) => a + (parseFloat(r[L_CANT])  || 0), 0),
     layoutVCUSD: layout.reduce((a, r) => a + (parseFloat(r[L_VCUSD]) || 0), 0),
@@ -263,59 +416,70 @@ function runCascade(layoutRows, s551Rows) {
     s551Val:     s551.reduce((a, r) => a + (parseFloat(r["ValorDolares"])        || 0), 0),
   };
 
-  // ── Set de todas las fracciones en el 551 (para diagnóstico) ────────────
+  //  Set de todas las fracciones en el 551 (para diagnóstico) 
   const fracSet551 = new Set(s551.map((r) => r._frac));
 
-  // ── Lookups del 551 ───────────────────────────────────────────────────────
+  //  Lookups del 551 
   const lookupPFP   = new Map();  // Pedimento + Fraccion + Pais
   const lookupPF    = new Map();  // Pedimento + Fraccion (sin país)
   const lookupP     = new Map();  // Solo Pedimento
   const lookupPChap = new Map();  // Pedimento + capítulo (primeros 4 dígitos de fracción)
 
   for (const r of s551) {
-    const k1 = `${r[S_PED]}|||${r._frac}|||${String(r[S_PAIS] ?? "").trim()}`;
+    const pK = String(r._pedCruce ?? "");
+    const k1 = `${pK}|||${r._frac}|||${String(r[S_PAIS] ?? "").trim()}`;
     if (!lookupPFP.has(k1)) lookupPFP.set(k1, []);
     lookupPFP.get(k1).push(r);
 
-    const k2 = `${r[S_PED]}|||${r._frac}`;
+    const k2 = `${pK}|||${r._frac}`;
     if (!lookupPF.has(k2)) lookupPF.set(k2, []);
     lookupPF.get(k2).push(r);
 
-    const kP = String(r[S_PED] ?? "");
+    const kP = String(pK ?? "");
     if (!lookupP.has(kP)) lookupP.set(kP, []);
     lookupP.get(kP).push(r);
 
     const chap = r._frac.slice(0, 4);
-    const kPC  = `${r[S_PED]}|||${chap}`;
+    const kPC  = `${pK}|||${chap}`;
     if (!lookupPChap.has(kPC)) lookupPChap.set(kPC, []);
     lookupPChap.get(kPC).push(r);
   }
 
-  // ── Tracking ──────────────────────────────────────────────────────────────
+  //  Tracking 
   const assignment    = new Map();
   const assigned      = new Set();
   const used551       = new Set();
-  const correctionMap = new Map(); // rowIdx → [{field, original, corrected}]
-  const strategyStats = { E0: 0, E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0 };
+  const correctionMap = new Map(); // rowIdx  [{field, original, corrected}]
+  const rowNotes      = new Map();
+  const strategyStats = { E0: 0, E1: 0, E2: 0, E3: 0, E4: 0, E5: 0, E6: 0, E7: 0, E8: 0, E9: 0, E10: 0, E11: 0, R1: 0, R2: 0, R3: 0, R4: 0, R5: 0 };
+  const pendingRows = () => layout.filter((r) => !assigned.has(r._idx) && !r._skipReason);
+
+  // Registrar desde el inicio por qué NO se busca secuencia en ciertas filas
+  for (const r of layout) {
+    if (r._skipReason) rowNotes.set(r._idx, r._skipReason);
+  }
 
   // Asigna filas a secuencia 551. NO modifica país, fracción ni descripción del Layout.
-  const assignRows = (rows, seq, strategy, r551 = null) => {
+  const assignRows = (rows, seq, strategy, r551 = null, corrections = []) => {
     for (const r of rows) {
       if (!assigned.has(r._idx)) {
         assignment.set(r._idx, { seq, strategy, r551 });
         assigned.add(r._idx);
         strategyStats[strategy]++;
         if (r551?._551idx !== undefined) used551.add(r551._551idx);
+        if (corrections && corrections.length > 0) {
+          correctionMap.set(r._idx, corrections);
+        }
       }
     }
   };
 
-  // ── E0: Match directo por clave compuesta CANDADO DS 551 ↔ 551.Secuencias ──
+  //  E0: Match directo por clave compuesta CANDADO DS 551  551.Secuencias 
   // La columna "CANDADO DS 551" del Layout contiene la clave compuesta
   // "Pedimento-Fraccion-SecuenciaFraccion" que corresponde EXACTAMENTE a la
   // columna "Secuencias" del 551. Esto da asignación perfecta sin ningún cálculo.
-  {
-    // Construir lookup: 551.Secuencias → fila del 551
+  if (!STRICT_DS_RULES) {
+    // Construir lookup: 551.Secuencias  fila del 551
     const lookupSecuencias = new Map();
     for (const r of s551) {
       const clave = String(r["Secuencias"] ?? "").trim();
@@ -323,6 +487,7 @@ function runCascade(layoutRows, s551Rows) {
     }
     // Leer columna "CANDADO DS 551" de cada fila del Layout y asignar directamente
     for (const r of layout) {
+      if (r._skipReason) continue;
       if (assigned.has(r._idx)) continue;
       const candado = String(r["CANDADO DS 551"] ?? "").trim();
       if (!candado) continue;
@@ -334,8 +499,8 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── E1: Pedimento + Fracción + País, cantidades exactas (±1 ud / ±4 USD) ──
-  for (const g of groupBy(layout, [L_PED, "_frac", L_PAIS])) {
+  //  E1: Pedimento + Fracción + País, cantidades exactas (±1 ud / ±4 USD) 
+  for (const g of groupBy(layout.filter((r) => !r._skipReason), ['_pedCruce', "_frac", L_PAIS])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const cands = lookupPFP.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
@@ -343,8 +508,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E1", match.r551);
   }
 
-  // ── E2: Mismo Ped+Frac+País, sub-grupo por SecuenciaPed (solo numérico) ───
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+  //  E2: Mismo Ped+Frac+País, sub-grupo por SecuenciaPed (solo numérico) 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS, "_sec"])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const cands = lookupPFP.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
@@ -352,8 +517,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E2", match.r551);
   }
 
-  // ── E3: Pedimento + Fracción (sin País) ───────────────────────────────────
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac"])) {
+  //  E3: Pedimento + Fracción (sin País) 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac"])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
@@ -361,8 +526,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E3", match.r551);
   }
 
-  // ── E4: Ped+Frac (sin País) + sub-grupo por SecuenciaPed (solo numérico) ──
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", "_sec"])) {
+  //  E4: Ped+Frac (sin País) + sub-grupo por SecuenciaPed (solo numérico) 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", "_sec"])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
@@ -370,8 +535,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E4", match.r551);
   }
 
-  // ── E5: Tolerancia estricta ±1 ud / ±4 USD (igual que E1-E4) ──────────────
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+  //  E5: Tolerancia estricta ±1 ud / ±4 USD (igual que E1-E4) 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS, "_sec"])) {
     const k = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = lookupPF.get(k) || [];
     const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
@@ -379,10 +544,10 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E5", match.r551);
   }
 
-  // ── E6: Suma de combinaciones (2 o 3 secuencias del 551) ──────────────────
+  //  E6: Suma de combinaciones (2 o 3 secuencias del 551) 
   // Resuelve cuando el mismo material ingresó en múltiples lotes del mismo pedimento
   // y la suma de 2 o 3 entradas del 551 iguala la suma del grupo Layout (±1 cant / ±4 val).
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS])) {
     const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     // Preferir candidatos con país coincidente; si no hay suficientes, usar sin país
@@ -415,8 +580,8 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── E7: Precio unitario ($/pieza) como discriminador — solo si Cant±1 y Val±4 ──
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+  //  E7: Precio unitario ($/pieza) como discriminador  solo si Cant±1 y Val±4 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS, "_sec"])) {
     const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = (lookupPFP.get(kPFP) || []).length > 0
@@ -427,8 +592,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E7", match.r551);
   }
 
-  // ── E8: Asignación por eliminación — solo si Cant±1 y Val±4 ───────────────
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac"])) {
+  //  E8: Asignación por eliminación  solo si Cant±1 y Val±4 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac"])) {
     const k     = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = (lookupPF.get(k) || []).filter((r) => !used551.has(r._551idx));
     if (cands.length === 0) continue;
@@ -439,8 +604,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E8", match.r551);
   }
 
-  // ── E9: Mismo capítulo arancelario (4 dígitos) — sin modificar Layout ─────
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+  //  E9: Mismo capítulo arancelario (4 dígitos)  sin modificar Layout 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS])) {
     const chap  = String(g.keyVals[1]).slice(0, 4);
     const kPC   = `${g.keyVals[0]}|||${chap}`;
     const cands = (lookupPChap.get(kPC) || []).filter((r) => !used551.has(r._551idx));
@@ -450,8 +615,8 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E9", match.r551);
   }
 
-  // ── E10: Solo Pedimento + precio unitario — solo si Cant±1 y Val±4 ────────
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+  //  E10: Solo Pedimento + precio unitario  solo si Cant±1 y Val±4 
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS])) {
     const kP    = String(g.keyVals[0]);
     const cands = (lookupP.get(kP) || []).filter((r) => !used551.has(r._551idx));
     if (!cands.length) continue;
@@ -462,9 +627,9 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "E10", match.r551);
   }
 
-  // ── E11: Fuerza 1:1 greedy por precio unitario — solo si Cant±1 y Val±4 ───
+  //  E11: Fuerza 1:1 greedy por precio unitario  solo si Cant±1 y Val±4 
   {
-    const pendGrps = groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS]);
+    const pendGrps = groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS]);
     const pedMap   = new Map();
     for (const g of pendGrps) {
       const ped = String(g.keyVals[0]);
@@ -502,18 +667,87 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── Layout lookup por Ped+Frac (para diagnóstico de orphans del 551) ─────
+  //  R4: Cobertura total por score (pedimento) 
+  // Si aún queda algo sin asignar, elige la mejor secuencia del MISMO pedimento
+  // minimizando una función de costo (cantidad, valor, $/pieza y similitud de descripción).
+  {
+    const pendR4 = groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS]);
+    for (const g of pendR4) {
+      const [ped, frac] = g.keyVals;
+      const cands = lookupP.get(String(ped)) || [];
+      if (!cands.length) continue;
+      const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+      const upL = vcusd / Math.max(cant, 0.0001);
+      const descL = [...new Set(g.rows.map((r) => r["Descripcion"]).filter(Boolean))].join(" ");
+
+      let best = null;
+      let bestScore = Infinity;
+      for (const c of cands) {
+        const cCant = parseFloat(c["CantidadUMComercial"]) || 0;
+        const cVal = parseFloat(c["ValorDolares"]) || 0;
+        const upC = cVal / Math.max(cCant, 0.0001);
+        const descC = c["DescripcionMercancia"] || "";
+
+        const relCant = Math.abs(cant - cCant) / Math.max(cant, cCant, 1);
+        const relVal = Math.abs(vcusd - cVal) / Math.max(vcusd, cVal, 1);
+        const relUP = Math.abs(upL - upC) / Math.max(Math.abs(upL), Math.abs(upC), 0.0001);
+        const descPenalty = 1 - tokenOverlapRatio(descL, descC);
+        const fracPenalty = String(frac) === String(c._frac) ? 0 : 0.25;
+        const score = relCant * 0.45 + relVal * 0.35 + relUP * 0.15 + descPenalty * 0.05 + fracPenalty;
+        if (score < bestScore) { bestScore = score; best = c; }
+      }
+      if (!best) continue;
+      const corrFrac = String(g.keyVals[1]) !== best._frac
+        ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: best._frac }]
+        : [];
+      assignRows(g.rows, best[S_SEQ], "R4", best, corrFrac);
+    }
+  }
+
+  //  R5: Cobertura total absoluta (global, incluso sin pedimento) 
+  // ltimo recurso de emergencia: si no hay candidatos por pedimento, busca globalmente
+  // por fracción y luego en todo el 551 para NO dejar filas sin secuencia.
+  {
+    const pendR5 = groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS]);
+    for (const g of pendR5) {
+      const [, frac] = g.keyVals;
+      const poolFrac = s551.filter((r) => String(r._frac) === String(frac));
+      const cands = poolFrac.length > 0 ? poolFrac : s551;
+      if (!cands.length) continue;
+      const { cant, vcusd } = sumGroup(g.rows, L_CANT, L_VCUSD);
+      const upL = vcusd / Math.max(cant, 0.0001);
+      let best = null;
+      let bestScore = Infinity;
+      for (const c of cands) {
+        const cCant = parseFloat(c["CantidadUMComercial"]) || 0;
+        const cVal = parseFloat(c["ValorDolares"]) || 0;
+        const upC = cVal / Math.max(cCant, 0.0001);
+        const relCant = Math.abs(cant - cCant) / Math.max(cant, cCant, 1);
+        const relVal = Math.abs(vcusd - cVal) / Math.max(vcusd, cVal, 1);
+        const relUP = Math.abs(upL - upC) / Math.max(Math.abs(upL), Math.abs(upC), 0.0001);
+        const score = relCant * 0.5 + relVal * 0.35 + relUP * 0.15;
+        if (score < bestScore) { bestScore = score; best = c; }
+      }
+      if (!best) continue;
+      const corrFrac = String(g.keyVals[1]) !== best._frac
+        ? [{ field: "FraccionNico", original: String(g.keyVals[1]), corrected: best._frac }]
+        : [];
+      assignRows(g.rows, best[S_SEQ], "R5", best, corrFrac);
+    }
+  }
+
+  //  Layout lookup por Ped+Frac (para diagnóstico de orphans del 551) 
   const layoutPF = new Map();
   for (const r of layout) {
-    const k = `${r[L_PED]}|||${r._frac}`;
+    const k = `${r._pedCruce}|||${r._frac}`;
     if (!layoutPF.has(k)) layoutPF.set(k, []);
     layoutPF.get(k).push(r);
   }
 
-  // ── R1: Barrido inverso — precio unitario ±30%, SIN filtro used551 ─────────
+  //  R1: Barrido inverso  precio unitario ±30%, SIN filtro used551 
   // Las E anteriores solo usan secuencias 551 "libres". R1 permite reusar cualquier
   // secuencia 551 (incluso asignada) con tolerancia más amplia de precio/pieza.
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS, "_sec"])) {
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS, "_sec"])) {
     const kPFP = `${g.keyVals[0]}|||${g.keyVals[1]}|||${String(g.keyVals[2] ?? "").trim()}`;
     const kPF  = `${g.keyVals[0]}|||${g.keyVals[1]}`;
     const cands = (lookupPFP.get(kPFP) || []).length > 0
@@ -526,9 +760,9 @@ function runCascade(layoutRows, s551Rows) {
     if (match) assignRows(g.rows, match.seq, "R1", match.r551);
   }
 
-  // ── R2: Solo Pedimento — sin filtro used551 — corrige Fracción y País ──────
+  //  R2: Solo Pedimento  sin filtro used551  corrige Fracción y País 
   // Busca en todo el pedimento sin importar fracción ni país, con precio ±40%.
-  for (const g of groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS])) {
+  for (const g of groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS])) {
     const kP    = String(g.keyVals[0]);
     const cands = lookupP.get(kP) || [];
     if (!cands.length) continue;
@@ -542,11 +776,11 @@ function runCascade(layoutRows, s551Rows) {
     assignRows(g.rows, match.seq, "R2", match.r551, corrFrac);
   }
 
-  // ── R3: Fuerza total greedy — sin filtro, sin tolerancia ──────────────────
-  // Último recurso absoluto: empareja cada grupo Layout restante con la secuencia
+  //  R3: Fuerza total greedy  sin filtro, sin tolerancia 
+  // ltimo recurso absoluto: empareja cada grupo Layout restante con la secuencia
   // 551 del mismo pedimento cuyo precio/pieza sea más cercano (sin importar diferencia).
   {
-    const pendR3  = groupBy(layout.filter((r) => !assigned.has(r._idx)), [L_PED, "_frac", L_PAIS]);
+    const pendR3  = groupBy(pendingRows(), ['_pedCruce', "_frac", L_PAIS]);
     const pedMapR = new Map();
     for (const g of pendR3) {
       const ped = String(g.keyVals[0]);
@@ -579,7 +813,7 @@ function runCascade(layoutRows, s551Rows) {
     }
   }
 
-  // ── Secuencias del 551 que NO se usaron en ningún match (orphans) ─────────
+  //  Secuencias del 551 que NO se usaron en ningún match (orphans) 
   const getOrphanReason = (r) => {
     const cant = parseFloat(r["CantidadUMComercial"]);
     const val  = parseFloat(r["ValorDolares"]);
@@ -587,18 +821,18 @@ function runCascade(layoutRows, s551Rows) {
     const valZero  = isNaN(val)  || val  === 0;
     const seq  = r["SecuenciaFraccion"] ?? "?";
     const frac = r._frac ?? r[S_FRAC] ?? "?";
-    const ped  = r[S_PED] ?? "?";
+    const ped  = r._pedCruce != null && String(r._pedCruce).trim() !== "" ? r._pedCruce : (r[S_PED] ?? "?");
 
     if (cantZero && valZero)
-      return `Sec.${seq} — Sin cantidad ni valor: CantidadUMComercial=0 y ValorDolares=0`;
+      return `Sec.${seq}  Sin cantidad ni valor: CantidadUMComercial=0 y ValorDolares=0`;
     if (cantZero)
-      return `Sec.${seq} — CantidadUMComercial=0 (sin cantidad registrada en el 551)`;
+      return `Sec.${seq}  CantidadUMComercial=0 (sin cantidad registrada en el 551)`;
     if (valZero)
-      return `Sec.${seq} — ValorDolares=0 (sin valor en dólares registrado en el 551)`;
+      return `Sec.${seq}  ValorDolares=0 (sin valor en dólares registrado en el 551)`;
 
     const kPF = `${ped}|||${frac}`;
     if (!layoutPF.has(kPF))
-      return `Sec.${seq} — Pedimento ${ped} / Fracción ${frac} no tiene partidas en Layout`;
+      return `Sec.${seq}  Pedimento (cruce) ${ped} / Fracción ${frac} no tiene partidas en Layout`;
 
     // Esta secuencia 551 no recibió ninguna fila del Layout. El total Layout es de TODA la fracción (otras secuencias sí pueden tener asignación).
     const layoutCands = layoutPF.get(kPF);
@@ -610,22 +844,26 @@ function runCascade(layoutRows, s551Rows) {
     const parte = sumSinAsignarC > 0 || sumSinAsignarV > 0
       ? ` Layout sin asignar (esta fracción): ${sumSinAsignarC.toFixed(0)} ud / $${sumSinAsignarV.toFixed(2)}.`
       : "";
-    return `Sec.${seq} — Ninguna fila del Layout asignada a esta secuencia. Total Layout (ped+fracción): ${sumCant.toFixed(0)} ud / $${sumVal.toFixed(2)}; esta línea 551: ${cant.toFixed(0)} ud / $${val.toFixed(2)}.${parte}`;
+    return `Sec.${seq}  Ninguna fila del Layout asignada a esta secuencia. Total Layout (ped+fracción): ${sumCant.toFixed(0)} ud / $${sumVal.toFixed(2)}; esta línea 551: ${cant.toFixed(0)} ud / $${val.toFixed(2)}.${parte}`;
   };
 
   const orphan551Rows = s551
     .filter((r) => !used551.has(r._551idx))
     .map((r)  => ({ ...r, _orphanReason: getOrphanReason(r) }));
 
-  // ── Diagnóstico por grupo sin match ──────────────────────────────────────
+  //  Diagnóstico por grupo sin match 
   const computeGroupNote = (ped, frac, pais, cant, vcusd) => {
     if (!fracSet551.has(frac)) {
       return `Fracción arancelaria ${frac} no registrada en el 551`;
     }
     const candsPF = lookupPF.get(`${ped}|||${frac}`) || [];
     if (candsPF.length === 0) {
-      const otrosPed = [...new Set(s551.filter((r) => r._frac === frac).map((r) => r[S_PED]))].join(", ");
-      return `Fracción ${frac} no encontrada para pedimento ${ped}. Aparece en: ${otrosPed || "ninguno"}`;
+      const otrosPed = [...new Set(s551.filter((r) => r._frac === frac).map((r) => r._pedCruce || r[S_PED]))].join(", ");
+      return `Fracción ${frac} no encontrada para clave de pedimento ${ped}. Aparece en: ${otrosPed || "ninguno"}`;
+    }
+    const candsPFValid = candsPF.filter((r) => (parseFloat(r.CantidadUMComercial) || 0) > 0 || (parseFloat(r.ValorDolares) || 0) > 0);
+    if (candsPFValid.length === 0) {
+      return `No se buscó secuencia con datos de 551 para ${ped}/${frac}: los candidatos tienen cantidad y valor en 0 o vacíos.`;
     }
     const candsPFP = lookupPFP.get(`${ped}|||${frac}|||${String(pais ?? "").trim()}`) || [];
     if (candsPFP.length === 0) {
@@ -647,16 +885,16 @@ function runCascade(layoutRows, s551Rows) {
       return `Suma Layout: ${cant.toFixed(0)} ud / $${vcusd.toFixed(2)} | ` +
              `Entrada 551 (seq ${best[S_SEQ]}): ${c551c.toFixed(0)} ud / $${c551v.toFixed(2)} | ` +
              `Diferencia: ${diffC > 0 ? "+" : ""}${diffC} ud / $${diffV > 0 ? "+" : ""}${diffV} ` +
-             `(hay ${candsPFP.length} candidatos — requiere sub-agrupación manual)`;
+             `(hay ${candsPFP.length} candidatos; requiere sub-agrupación manual)`;
     }
     return "No se encontró correspondencia exacta en 551";
   };
 
-  // Construir mapa rowIdx → nota para filas sin match
-  const rowNotes = new Map();
+  // Construir mapa rowIdx  nota para filas sin match
+  // rowNotes se inicializa arriba para conservar razones de filas bloqueadas
   const unmatchedGroups = groupBy(
-    layout.filter((r) => !assigned.has(r._idx)),
-    [L_PED, "_frac", L_PAIS]
+    pendingRows(),
+    ['_pedCruce', "_frac", L_PAIS]
   );
   for (const g of unmatchedGroups) {
     const [ped, frac, pais] = g.keyVals;
@@ -665,7 +903,7 @@ function runCascade(layoutRows, s551Rows) {
     for (const r of g.rows) rowNotes.set(r._idx, nota);
   }
 
-  // ── Construir lista de sin-match para la UI ───────────────────────────────
+  //  Construir lista de sin-match para la UI 
   const unmatchedFinal = layout
     .filter((r) => !assigned.has(r._idx))
     .map((r) => ({
@@ -678,19 +916,19 @@ function runCascade(layoutRows, s551Rows) {
       Nota:                  rowNotes.get(r._idx) || "",
     }));
 
-  // ── Construir datos para la hoja Cruce_Layout_vs_551 ─────────────────────
+  //  Construir datos para la hoja Cruce_Layout_vs_551 
   // Un registro por GRUPO (Ped + Frac + Pais + SecuenciaPedAsignada)
   const cruceData = [];
 
-  // rowMatchMap: rowIdx → { okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant, layoutVCUSD }
-  // Permite que buildOutputExcel marque en rojo las filas donde los totales Layout ≠ 551.
+  // rowMatchMap: rowIdx  { okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant, layoutVCUSD }
+  // Permite que buildOutputExcel marque en rojo las filas donde los totales Layout  551.
   const rowMatchMap = new Map();
 
   // Grupos ASIGNADOS: agrupar por (seq asignada + frac + pais + ped)
   const matchedGroupMap = new Map();
   for (const [rowIdx, info] of assignment) {
     const r = layout[rowIdx];
-    const gk = `${r[L_PED]}|||${r._frac}|||${String(r[L_PAIS] || "").trim()}|||${info.seq}`;
+    const gk = `${r._pedCruce}|||${r._frac}|||${String(r[L_PAIS] || "").trim()}|||${info.seq}`;
     if (!matchedGroupMap.has(gk)) {
       matchedGroupMap.set(gk, { rows: [], info, firstRow: r });
     }
@@ -709,9 +947,22 @@ function runCascade(layoutRows, s551Rows) {
     const okCant = diffCant !== null && Math.abs(diffCant) <= 1;
     const okVal  = diffVal  !== null && Math.abs(diffVal)  <= 2;
 
-    // Registrar discrepancia por fila individual para que buildOutputExcel la señale
+    const softStrat = new Set(["R1", "R2", "R3", "R4", "R5", "E6", "E7", "E8", "E9", "E10", "E11"]);
+    const estr = g.info.strategy || "";
+    const weakByDelta = !okCant || !okVal;
+    const weakByStrat = softStrat.has(estr);
+    const motivoCruce = weakByDelta
+      ? `Diferencia grupo vs renglón 551 asignado: �cant = ${diffCant != null ? diffCant.toFixed(0) : "�"} ud; �USD = $${diffVal != null ? diffVal.toFixed(2) : "�"} (supera tolerancia estricta: ±1 ud y ±$2 al nivel de grupo).`
+      : weakByStrat
+        ? `Asignado con ${estr} (criterio flexible/combinación/respaldo; puede exceder tolerancias estrictas, validar manualmente).`
+        : "Cruce estricto con el renglón 551 asignado (cantidad y valor dentro de tolerancias al agrupar).";
+    const severidad = weakByDelta ? "alta" : (weakByStrat ? "media" : "ok");
+
     for (const row of g.rows) {
-      rowMatchMap.set(row._idx, { okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant: cant, layoutVCUSD: vcusd });
+      rowMatchMap.set(row._idx, {
+        okCant, okVal, diffCant, diffVal, cant551, val551, layoutCant: cant, layoutVCUSD: vcusd,
+        strategy: estr, motivo: motivoCruce, severidad, weakByDelta, weakByStrat,
+      });
     }
 
     // Descripciones únicas de las partes en el grupo
@@ -722,6 +973,7 @@ function runCascade(layoutRows, s551Rows) {
       estrategia: g.info.strategy,
       numFilas:   g.rows.length,
       pedimento:  g.firstRow[L_PED],
+      pedimentoCruce: g.firstRow._pedCruce,
       // Layout
       layoutDesc:  descs,
       layoutFrac:  String(g.firstRow[L_FRAC] || ""),
@@ -740,6 +992,8 @@ function runCascade(layoutRows, s551Rows) {
       // Diferencias
       diffCant, diffVal,
       okFrac, okPais, okCant, okVal,
+      motivo: motivoCruce,
+      severidad,
     });
   }
 
@@ -759,7 +1013,8 @@ function runCascade(layoutRows, s551Rows) {
       tipo:       "unmatched",
       estrategia: "SIN MATCH",
       numFilas:   g.rows.length,
-      pedimento:  ped,
+      pedimento:  g.rows[0][L_PED] || String(ped),
+      pedimentoCruce: String(ped),
       layoutDesc:  descs,
       layoutFrac:  frac,
       layoutPais:  pais,
@@ -768,7 +1023,7 @@ function runCascade(layoutRows, s551Rows) {
       secOriginal: g.rows[0][L_SEC],
       secAsignada: "",
       s551Secuencias: best ? (best["Secuencias"] || `${best[S_PED]}-${best[S_FRAC]}-${best[S_SEQ]}`) : "",
-      s551Desc:   best ? (best["DescripcionMercancia"] || "") : "— Sin candidato en 551 —",
+      s551Desc:   best ? (best["DescripcionMercancia"] || "") : " Sin candidato en 551 ",
       s551Frac:   best ? (best[S_FRAC] || "") : "",
       s551Pais:   best ? (best[S_PAIS] || "") : "",
       s551Cant:   best ? (parseFloat(best.CantidadUMComercial) || 0) : null,
@@ -777,6 +1032,8 @@ function runCascade(layoutRows, s551Rows) {
       diffVal:    best ? vcusd - (parseFloat(best.ValorDolares)       || 0) : null,
       okFrac: false, okPais: false, okCant: false, okVal: false,
       nota: rowNotes.get(g.rows[0]._idx) || "",
+      motivo: rowNotes.get(g.rows[0]._idx) || "Ninguna estrategia pudo asignar secuencia a este grupo (revisa totales, país, fracción o columnas clave).",
+      severidad: "alta",
     });
   }
 
@@ -789,13 +1046,14 @@ function runCascade(layoutRows, s551Rows) {
   return { assignment, strategyStats, unmatchedFinal, total: layout.length, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap };
 }
 
-// ─── EXCEL BUILDER ────────────────────────────────────────────────────────────
-function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap = new Map()) {
+//  EXCEL BUILDER 
+function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignment, unmatchedFinal, stats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap = new Map(), layoutOutName = "Layout") {
   const wb = XLSX.utils.book_new();
 
-  // ── Datos originales del Layout ─────────────────────────────────────────
+  //  Datos originales del Layout 
   const layoutData = XLSX.utils.sheet_to_json(layoutSheet, { header: 1 });
-  const rawHeaders  = layoutData[0] || [];
+  const headerI = findLayoutHeaderRowIndex(layoutData);
+  const rawHeaders  = layoutData[headerI] || [];
 
   // Helper: busca la primera columna cuyo nombre (sin espacios, en minúsculas) coincida
   // con alguno de los nombres candidatos. Tolera variaciones de mayúsculas/minúsculas y espacios.
@@ -823,12 +1081,12 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     return isNaN(n) ? String(v ?? "").trim() : String(Math.round(n));
   };
 
-  // ── Construir filas + registrar cambios ──────────────────────────────────
-  // changeMap: rowIdx → { original, nuevo, tipoNota }
-  //   tipoNota: "nuevo"    → la celda estaba vacía/texto y ahora tiene valor
-  //             "cambio"   → el valor cambió de un número a otro
-  //             "igual"    → el valor nuevo es igual al original (sin marcado)
-  //             "sinmatch" → no se asignó secuencia
+  //  Construir filas + registrar cambios 
+  // changeMap: rowIdx  { original, nuevo, tipoNota }
+  //   tipoNota: "nuevo"     la celda estaba vacía/texto y ahora tiene valor
+  //             "cambio"    el valor cambió de un número a otro
+  //             "igual"     el valor nuevo es igual al original (sin marcado)
+  //             "sinmatch"  no se asignó secuencia
   const changeMap = new Map();
   const updatedRows = [headers];
 
@@ -838,7 +1096,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   // rowIdx paralelo que sólo cuenta filas NO vacías, igual que readLayoutSheet/_idx
   let dataRowIdx = 0;
 
-  for (let i = 1; i < layoutData.length; i++) {
+  for (let i = headerI + 1; i < layoutData.length; i++) {
     const rawDataRow = layoutData[i] || [];
     const isEmpty    = rawDataRow.every((c) => c === "" || c == null);
     const row        = [...rawDataRow];
@@ -854,7 +1112,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     const originalRaw = secIdx >= 0 ? (rawDataRow[secIdx] ?? "") : "";
     const originalStr = normSeq(originalRaw);
 
-    // ── Correcciones extra que vienen de estrategias específicas (E9, E10, R2…) ──
+    //  Correcciones extra que vienen de estrategias específicas (E9, E10, R2) 
     const extraCorrs = correctionMap ? (correctionMap.get(rowIdx) || []) : [];
     for (const corr of extraCorrs) {
       const colIdx = corr.field === "PaisOrigen"   ? paisIdx
@@ -863,7 +1121,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       if (colIdx >= 0) row[colIdx] = corr.corrected;
     }
 
-    // ── Correcciones DIRECTAS desde r551 (siempre, para todos los campos clave) ──
+    //  Correcciones DIRECTAS desde r551 (siempre, para todos los campos clave) 
     // Independientes de correctionMap para garantizar que siempre se apliquen.
     const directCorrs = [];
     if (assignment.has(rowIdx)) {
@@ -894,7 +1152,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     const corrections = [...extraCorrs, ...directCorrs];
     const corrNote = corrections.length > 0
       ? corrections.map((c) =>
-          `[CORRECCIÓN ${c.field}] '${c.original}' → '${c.corrected}' (fuente: 551)`
+          `[CORRECCI�N ${c.field}] '${c.original}' -> '${c.corrected}' (fuente: 551)`
         ).join(" | ")
       : "";
 
@@ -912,7 +1170,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
           : (wasEmpty ? "nuevo" : "cambio");
         let nota = wasEmpty
           ? `Secuencia asignada: ${newStr}`
-          : `Secuencia modificada: ${originalStr} → ${newStr}`;
+          : `Secuencia modificada: ${originalStr} -> ${newStr}`;
         if (corrNote) nota += `. ${corrNote}`;
         row[notasIdx] = nota;
         changeMap.set(rowIdx, { original: originalStr, nuevo: newStr, tipo, nota, corrections });
@@ -933,7 +1191,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       if (mq && (!mq.okCant || !mq.okVal)) {
         const dC = mq.diffCant != null ? ((mq.diffCant > 0 ? "+" : "") + mq.diffCant.toFixed(0)) : "?";
         const dV = mq.diffVal  != null ? ((mq.diffVal  > 0 ? "+" : "") + mq.diffVal.toFixed(2))  : "?";
-        const badNote = `⚠ DIFERENCIA TOTALES: Layout(${(mq.layoutCant||0).toFixed(0)} ud / $${(mq.layoutVCUSD||0).toFixed(2)}) ≠ 551(${mq.cant551 != null ? mq.cant551.toFixed(0) : "?"} ud / $${mq.val551 != null ? mq.val551.toFixed(2) : "?"}) | Δcant:${dC} | Δval:${dV}`;
+        const badNote = `�a� DIFERENCIA SOBRE TOLERANCIA: Layout(${(mq.layoutCant||0).toFixed(0)} ud / $${(mq.layoutVCUSD||0).toFixed(2)}) vs 551(${mq.cant551 != null ? mq.cant551.toFixed(0) : "?"} ud / $${mq.val551 != null ? mq.val551.toFixed(2) : "?"}) | �cant:${dC} | �val:${dV}. Motivo: asignación de respaldo o datos no conciliables al umbral estricto.`;
         row[notasIdx] = row[notasIdx] ? `${row[notasIdx]} | ${badNote}` : badNote;
         const cm = changeMap.get(rowIdx);
         if (cm) cm.hasBadMatch = true;
@@ -943,7 +1201,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     updatedRows.push(row);
   }
 
-  // ── Filas extra al final: secuencias del 551 que no se asignaron al Layout ─
+  //  Filas extra al final: secuencias del 551 que no se asignaron al Layout 
   const orphan551StartRow = updatedRows.length; // índice de fila en la hoja (0-based)
 
   if (orphan551Rows && orphan551Rows.length > 0) {
@@ -952,10 +1210,10 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
 
     // Encabezado de sección
     const sectionHdr = Array(headers.length).fill("");
-    sectionHdr[0] = `▼ FILAS AÑADIDAS DESDE EL 551 — Secuencias sin partida en Layout (${orphan551Rows.length} registros) — campos llenados con datos del 551`;
+    sectionHdr[0] = ` FILAS AADIDAS DESDE EL 551  Secuencias sin partida en Layout (${orphan551Rows.length} registros)  campos llenados con datos del 551`;
     updatedRows.push(sectionHdr);
 
-    // Usar los índices flexibles ya definidos arriba (findCol) + mapeo 551→Layout
+    // Usar los índices flexibles ya definidos arriba (findCol) + mapeo 551Layout
     const orphanFieldMap = [
       { colIdx: secIdx,     val: (r) => r["SecuenciaFraccion"]       ?? "" },
       { colIdx: pedIdx,     val: (r) => r["Pedimento"]               ?? "" },
@@ -972,12 +1230,12 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       for (const { colIdx, val } of orphanFieldMap) {
         if (colIdx >= 0) row[colIdx] = val(r551);
       }
-      row[notasIdx] = `FILA AÑADIDA DESDE 551 — ${r551._orphanReason || "secuencia sin partida en Layout"}`;
+      row[notasIdx] = `FILA AADIDA DESDE 551  ${r551._orphanReason || "secuencia sin partida en Layout"}`;
       updatedRows.push(row);
     }
   }
 
-  // ── Crear worksheet y aplicar estilos ────────────────────────────────────
+  //  Crear worksheet y aplicar estilos 
   const wsLayout = XLSX.utils.aoa_to_sheet(updatedRows);
 
   // Cabecera SecuenciaPed
@@ -1089,7 +1347,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       }
     }
 
-    // Señalar en rojo cuando los totales Layout ≠ 551 para esta fila asignada
+    // Señalar en rojo cuando los totales Layout  551 para esta fila asignada
     if (info.hasBadMatch) {
       if (secIdx >= 0) {
         const addrSeqDisc = XLSX.utils.encode_cell({ r: rowI, c: secIdx });
@@ -1102,7 +1360,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     }
   }
 
-  // ── Estilos para filas de orphan 551 ────────────────────────────────────
+  //  Estilos para filas de orphan 551 
   if (orphan551Rows && orphan551Rows.length > 0) {
     const S_ORPHAN_HDR = {
       font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } },
@@ -1150,35 +1408,35 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   if (secIdx >= 0) wsLayout["!cols"][secIdx] = { wch: 16 };
   wsLayout["!cols"][notasIdx] = { wch: 75 };
 
-  XLSX.utils.book_append_sheet(wb, wsLayout, "Layout");
+  XLSX.utils.book_append_sheet(wb, wsLayout, layoutOutName);
 
   // Copy original 551 / Data Stage sheet
   const ws551 = XLSX.utils.sheet_to_json(sheet551, { header: 1 });
   const ws551Sheet = XLSX.utils.aoa_to_sheet(ws551);
   XLSX.utils.book_append_sheet(wb, ws551Sheet, sheet551Name || "551");
 
-  // ── Hoja Cruce_Layout_vs_551 ─────────────────────────────────────────────
+  //  Hoja Cruce_Layout_vs_551 
   if (cruceData && cruceData.length > 0) {
-    const pct2 = (v, total) => total > 0 ? ((v / total) * 100).toFixed(1) + "%" : "—";
+    const pct2 = (v, total) => total > 0 ? ((v / total) * 100).toFixed(1) + "%" : "";
     const fmt  = (v) => v == null ? "" : (typeof v === "number" ? Number(v.toFixed(4)) : v);
     const fmtDiff = (d) => d == null ? "" : (d > 0 ? `+${d.toFixed(2)}` : d.toFixed(2));
-    const check = (ok) => ok ? "✓" : "✗";
+    const check = (ok) => ok ? "" : "";
 
     // Cabeceras con dos niveles
     const HEADERS = [
       // Bloque General
       "Estrategia", "N° Filas Layout", "Pedimento",
       // Bloque LAYOUT
-      "Layout — Descripcion", "Layout — FraccionNico", "Layout — PaisOrigen",
-      "Layout — Suma CantidadSaldo", "Layout — Suma VCUSD",
+      "Layout  Descripcion", "Layout  FraccionNico", "Layout  PaisOrigen",
+      "Layout  Suma CantidadSaldo", "Layout  Suma VCUSD",
       "SecuenciaPed Original", "SecuenciaPed ASIGNADA",
       // Bloque 551
-      "551 — Secuencias (clave)", "551 — DescripcionMercancia",
-      "551 — Fraccion", "551 — PaisOrigenDestino",
-      "551 — CantidadUMComercial", "551 — ValorDolares",
+      "551  Secuencias (clave)", "551  DescripcionMercancia",
+      "551  Fraccion", "551  PaisOrigenDestino",
+      "551  CantidadUMComercial", "551  ValorDolares",
       // Comparación
       "¿Fracción coincide?", "¿País coincide?",
-      "Dif. Cantidad (Layout−551)", "Dif. Valor USD (Layout−551)",
+      "Dif. Cantidad (Layout551)", "Dif. Valor USD (Layout551)",
       "Estado match",
       // Nota (solo sin-match)
       "Notas / Motivo sin asignación",
@@ -1188,9 +1446,9 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
 
     for (const d of cruceData) {
       const statusMatch = d.tipo === "unmatched"
-        ? "❌ SIN MATCH"
-        : (d.okCant && d.okVal ? "✅ MATCH EXACTO"
-          : (Math.abs(d.diffCant || 0) / Math.max(1, d.layoutCant) < 0.05 ? "⚠ MATCH ~TOL.5%" : "⚠ MATCH TOLERADO"));
+        ? " SIN MATCH"
+        : (d.okCant && d.okVal ? " MATCH EXACTO"
+          : (Math.abs(d.diffCant || 0) / Math.max(1, d.layoutCant) < 0.05 ? " MATCH ~TOL.5%" : " MATCH TOLERADO"));
 
       cruceRows.push([
         d.estrategia,
@@ -1220,7 +1478,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
 
     const wsCruce = XLSX.utils.aoa_to_sheet(cruceRows);
 
-    // ── Estilos hoja Cruce ────────────────────────────────────────────────
+    //  Estilos hoja Cruce 
     const colWidths = [10,12,22,40,16,10,20,20,18,18,38,45,16,10,22,22,16,14,20,20,20,60];
     wsCruce["!cols"] = colWidths.map((w) => ({ wch: w }));
 
@@ -1252,7 +1510,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
       const addrStatus = XLSX.utils.encode_cell({ r: rowI, c: 20 });
       if (wsCruce[addrStatus]) wsCruce[addrStatus].s = isUnmatched ? S_UNMATCH : (d.okCant && d.okVal ? S_MATCH_OK : S_MATCH_TOL);
 
-      // Columnas ✓/✗
+      // Columnas /
       const fracOk = XLSX.utils.encode_cell({ r: rowI, c: 16 });
       const paisOk = XLSX.utils.encode_cell({ r: rowI, c: 17 });
       if (wsCruce[fracOk]) wsCruce[fracOk].s = d.okFrac ? S_CHECK_OK : S_CHECK_KO;
@@ -1268,10 +1526,10 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     XLSX.utils.book_append_sheet(wb, wsCruce, "Cruce_Layout_vs_551");
   }
 
-  // ── Hoja Reporte_Secuencias_vs_551: totales globales + detalle por secuencia asignada ──
+  //  Hoja Reporte_Secuencias_vs_551: totales globales + detalle por secuencia asignada 
   const matchedOnly = (cruceData || []).filter((d) => d.tipo === "matched");
   const reportSecRows = [];
-  reportSecRows.push(["REPORTE — SECUENCIAS ASIGNADAS vs DATA 551"]);
+  reportSecRows.push(["REPORTE  SECUENCIAS ASIGNADAS vs DATA 551"]);
   reportSecRows.push([]);
 
   // Total global Layout vs 551
@@ -1282,7 +1540,7 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     reportSecRows.push(["551 (suma total)", Number(globalTotals.s551Cant.toFixed(4)), Number(globalTotals.s551Val.toFixed(4))]);
     const dC = globalTotals.layoutCant - globalTotals.s551Cant;
     const dV = globalTotals.layoutVCUSD - globalTotals.s551Val;
-    reportSecRows.push(["Diferencia (Layout − 551)", Number(dC.toFixed(4)), Number(dV.toFixed(4))]);
+    reportSecRows.push(["Diferencia (Layout  551)", Number(dC.toFixed(4)), Number(dV.toFixed(4))]);
     const okGlobal = Math.abs(dC) < 1 && Math.abs(dV) < 2;
     reportSecRows.push(["¿Totales coinciden?", okGlobal ? "Sí" : "No"]);
     reportSecRows.push([]);
@@ -1292,8 +1550,8 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   reportSecRows.push(["DETALLE POR SECUENCIA ASIGNADA (Layout vs 551)"]);
   const detalleHeaders = [
     "Estrategia", "Secuencia asignada", "Pedimento",
-    "Layout — Descripción", "Layout — Cantidad", "Layout — Valor USD",
-    "551 — Clave (Secuencias)", "551 — Descripción", "551 — Cantidad", "551 — Valor USD",
+    "Layout  Descripción", "Layout  Cantidad", "Layout  Valor USD",
+    "551  Clave (Secuencias)", "551  Descripción", "551  Cantidad", "551  Valor USD",
     "¿Cantidad coincide?", "¿Valor coincide?", "¿País coincide?", "¿Descripción coincide?",
     "Estado match",
   ];
@@ -1344,13 +1602,13 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   const pct = ((matched / total) * 100).toFixed(1);
 
   const reportRows = [
-    ["RESULTADO DE VALIDACIÓN — CRUCE LAYOUT vs 551"],
+    ["RESULTADO DE VALIDACIN  CRUCE LAYOUT vs 551"],
     [],
     ["RESUMEN EJECUTIVO"],
     ["Total filas Layout", total],
     ["Filas con SecuenciaPed asignada", matched],
     ["Filas sin match", unmatchedFinal.length],
-    ["PORCENTAJE DE ÉXITO", `${pct}%`],
+    ["PORCENTAJE DE XITO", `${pct}%`],
     [],
     ["DESGLOSE POR ESTRATEGIA"],
     ["Estrategia", "Filas Asignadas", "Descripción"],
@@ -1369,6 +1627,8 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     ["R1 - Barrido inverso Ped+Frac ±30%", stats.R1, "Barrido inverso sin filtro used551: usa cualquier sec. 551 del mismo Ped+Frac, precio ±30% o exacto. Elimina restricción de secuencias 'ya usadas' para maximizar asignación."],
     ["R2 - Barrido inverso solo Pedimento ±40%", stats.R2, "Busca en todo el pedimento sin restricción de fracción/país, precio ±40%. Corrige Fracción y País si difieren del 551. Para casos con fracción completamente diferente en Layout."],
     ["R3 - Fuerza total greedy sin filtro", stats.R3, "Fuerza máxima: empareja todos los grupos Layout restantes con cualquier sec. 551 del mismo pedimento, sin filtro ni tolerancia, eligiendo siempre la de precio/pieza más cercano."],
+    ["R4 - Cobertura total por score (mismo pedimento)", stats.R4, "Optimización tardía: para cada grupo pendiente busca la mejor secuencia del mismo pedimento minimizando score combinado de diferencia en cantidad, valor, precio unitario y similitud de descripción."],
+    ["R5 - Cobertura total absoluta (global)", stats.R5, "ltimo recurso extremo: si no hay candidatos por pedimento, busca por fracción a nivel global y, si tampoco existe, contra todo el 551. Prioriza mínima diferencia de cantidad/valor/precio para no dejar filas sin secuencia."],
     [],
   ];
 
@@ -1378,25 +1638,25 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
     const diffVal   = globalTotals.layoutVCUSD - globalTotals.s551Val;
     const pctC = globalTotals.s551Cant  > 0 ? ((diffCant  / globalTotals.s551Cant)  * 100).toFixed(2) + "%" : "N/A";
     const pctV = globalTotals.s551Val   > 0 ? ((diffVal   / globalTotals.s551Val)   * 100).toFixed(2) + "%" : "N/A";
-    const balance = Math.abs(diffCant) < 1 && Math.abs(diffVal) < 2 ? "✓ BALANCE EXACTO" : "⚠ DIFERENCIA";
-    reportRows.push(["VALIDACIÓN DE TOTALES GLOBALES (Layout vs 551)"]);
+    const balance = Math.abs(diffCant) < 1 && Math.abs(diffVal) < 2 ? " BALANCE EXACTO" : " DIFERENCIA";
+    reportRows.push(["VALIDACIN DE TOTALES GLOBALES (Layout vs 551)"]);
     reportRows.push(["", "Cantidad total", "Valor USD total"]);
     reportRows.push(["Layout (suma CantidadSaldo + VCUSD)", fmt4(globalTotals.layoutCant), fmt4(globalTotals.layoutVCUSD)]);
     reportRows.push(["551   (suma CantidadUMC + ValorDolares)", fmt4(globalTotals.s551Cant),  fmt4(globalTotals.s551Val)]);
-    reportRows.push(["Diferencia (Layout − 551)", fmt4(diffCant), fmt4(diffVal)]);
+    reportRows.push(["Diferencia (Layout  551)", fmt4(diffCant), fmt4(diffVal)]);
     reportRows.push(["Diferencia %", pctC, pctV]);
     reportRows.push([balance]);
     reportRows.push([]);
   }
 
   if (unmatchedFinal.length > 0) {
-    reportRows.push(["GRUPOS SIN MATCH — REVISIÓN MANUAL REQUERIDA"]);
+    reportRows.push(["GRUPOS SIN MATCH  REVISIN MANUAL REQUERIDA"]);
     reportRows.push(["Descripcion", "FraccionNico", "PaisOrigen", "SecuenciaPed_Original", "CantidadSaldo", "VCUSD", "Notas (motivo sin asignación)"]);
     for (const u of unmatchedFinal) {
       reportRows.push([u.Descripcion, u.FraccionNico, u.PaisOrigen, u.SecuenciaPed_Original, u.CantidadSaldo, u.VCUSD, u.Nota || ""]);
     }
   } else {
-    reportRows.push(["✓ TODOS LOS GRUPOS TUVIERON MATCH EXITOSO"]);
+    reportRows.push([" TODOS LOS GRUPOS TUVIERON MATCH EXITOSO"]);
   }
 
   if (orphan551Rows && orphan551Rows.length > 0) {
@@ -1422,112 +1682,126 @@ function buildOutputExcel(workbook, layoutSheet, sheet551, sheet551Name, assignm
   return wb;
 }
 
-// ─── COMPONENTS ───────────────────────────────────────────────────────────────
+//  COMPONENTS 
 const STRATEGIES = [
   {
     id: "E0",
-    name: "Match directo — CANDADO DS 551 ↔ Secuencias 551",
+    name: "Match directo  CANDADO DS 551  Secuencias 551",
     desc: "Estrategia prioritaria: usa la columna 'CANDADO DS 551' del Layout (clave compuesta Ped-Fracción-Secuencia) para hacer match DIRECTO con la columna 'Secuencias' del 551. Asignación perfecta sin cálculos. Resuelve el 99%+ de los casos cuando el Layout tiene esta columna poblada.",
     color: "#00d4aa",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E1",
     name: "Pedimento + Fracción + País",
     desc: "Agrupación exacta por Pedimento + FraccionNico + PaisOrigen. Suma CantidadSaldo vs CantidadUMComercial y VCUSD vs ValorDolares del 551 (tolerancia ±1 unidad / ±2 USD). Resuelve la mayoría de los casos.",
     color: "#22c55e",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E2",
     name: "Sub-agrupación por SecuenciaPed",
     desc: "Para grupos que fallaron E1, sub-divide usando el SecuenciaPed existente como guía. Resuelve casos donde la misma fracción+país tiene múltiples líneas en el 551 (ej: mismo material importado en dos fechas distintas).",
     color: "#3b82f6",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E3",
     name: "Sin filtro de País (Ped + Fracción)",
     desc: "Ignora PaisOrigen para manejar diferencias de captura de código de país entre Layout y 551 (ej: 'TWN' vs 'TAI', 'CHN' vs 'PRC'). Aplica las mismas tolerancias exactas de cantidad y valor.",
     color: "#f59e0b",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E4",
     name: "Sin País + Sub-SecuenciaPed",
     desc: "Combina E3 y E2: sin filtro de País y sub-agrupación por SecuenciaPed. Captura casos donde hay variación de código de país Y múltiples secuencias para la misma fracción.",
     color: "#a855f7",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E5",
     name: "Tolerancia Ampliada (±5%)",
     desc: "Tolerancia ±5% en cantidad (mín 2 unidades) y ±5% en valor (mín 5 USD). Resuelve diferencias de redondeo, conversión de unidades UMC/UMT o tipos de cambio entre sistemas.",
     color: "#ef4444",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E6",
     name: "Suma de combinaciones (2 + 3 lotes)",
     desc: "Cuando el Layout suma más que cualquier secuencia individual del 551, evalúa si la combinación de 2 o 3 secuencias suma al total del grupo Layout (±2%). Detecta materiales importados en múltiples lotes dentro del mismo pedimento. Particiona las filas del Layout entre los lotes por cuota restante.",
     color: "#06b6d4",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E7",
     name: "Precio unitario ($/pieza ±15%)",
     desc: "Usa el precio por unidad (ValorDolares / CantidadUMComercial) como discriminador con tolerancia ±15%. Resuelve casos donde los totales no coinciden pero el precio unitario confirma el material correcto (saldo acumulado de pedimentos anteriores, diferencias de conversión UMC/UMT).",
     color: "#f97316",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E8",
     name: "Eliminación por descarte",
     desc: "Filtra candidatos del 551 ya usados y asigna el único remanente (o el más cercano en precio unitario ±30%). Válido cuando el material no tiene otra posible correspondencia.",
     color: "#8b5cf6",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E9",
-    name: "Mismo capítulo arancelario — corrige Fracción",
+    name: "Mismo capítulo arancelario  corrige Fracción",
     desc: "Si la fracción del Layout no está en el 551 pero existe otra fracción del mismo capítulo (mismos 4 dígitos) en el mismo pedimento, la corrige usando el 551 como fuente oficial. Usa tolerancia de cantidades ±2 ud / ±5 USD o precio unitario ±20%. La fracción corregida aparece en rojo en el Excel.",
     color: "#ec4899",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E10",
-    name: "Solo Pedimento + precio unitario — corrige Fracción y País",
+    name: "Solo Pedimento + precio unitario  corrige Fracción y País",
     desc: "Busca en todo el pedimento sin restricción de fracción ni país. Usa precio por pieza (±25%) como discriminador o asigna el único candidato disponible. Corrige tanto FraccionNico como PaisOrigen si difieren del 551. Las correcciones aparecen en rojo en el Excel.",
     color: "#14b8a6",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "E11",
-    name: "Fuerza 1:1 greedy — emparejamiento por precio unitario",
-    desc: "Último recurso total: empareja los grupos Layout pendientes con las secuencias 551 no usadas del mismo pedimento, ordenando ambas listas por precio unitario y asignando en pares (greedy). Aplica todas las correcciones necesarias de fracción y país. Sin límite de tolerancia.",
+    name: "Fuerza 1:1 greedy  emparejamiento por precio unitario",
+    desc: "ltimo recurso total: empareja los grupos Layout pendientes con las secuencias 551 no usadas del mismo pedimento, ordenando ambas listas por precio unitario y asignando en pares (greedy). Aplica todas las correcciones necesarias de fracción y país. Sin límite de tolerancia.",
     color: "#64748b",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "R1",
-    name: "Barrido inverso — precio unitario ±30% (cualquier sec. 551)",
+    name: "Barrido inverso  precio unitario ±30% (cualquier sec. 551)",
     desc: "Primer barrido inverso: usa cualquier secuencia del 551 del mismo Pedimento+Fracción (sin importar si ya fue asignada antes). Criterio: precio por pieza ±30% o cantidades exactas ±3 ud / ±8 USD. Elimina el sesgo del filtro 'used551'.",
     color: "#0ea5e9",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "R2",
-    name: "Barrido inverso — solo Pedimento, precio ±40%, corrige Fracción",
+    name: "Barrido inverso  solo Pedimento, precio ±40%, corrige Fracción",
     desc: "Busca en todo el pedimento ignorando fracción y país. Precio unitario ±40% o único candidato disponible. Corrige FraccionNico y PaisOrigen si difieren del 551. Para los casos donde el Layout tiene fracción completamente diferente.",
     color: "#10b981",
-    icon: "⬛",
+    icon: "",
   },
   {
     id: "R3",
-    name: "Fuerza total — greedy global sin tolerancia",
+    name: "Fuerza total  greedy global sin tolerancia",
     desc: "Fuerza máxima: empareja TODOS los grupos Layout restantes con cualquier secuencia 551 del mismo pedimento, sin filtro ni tolerancia, eligiendo siempre la de precio unitario más cercano. Garantiza cobertura máxima aunque las correcciones sean necesarias.",
     color: "#f43f5e",
-    icon: "⬛",
+    icon: "",
+  },
+  {
+    id: "R4",
+    name: "Cobertura total por score (mismo pedimento)",
+    desc: "Optimización de cierre: para cada grupo pendiente calcula un score de distancia contra todas las secuencias del mismo pedimento (cantidad, valor, precio unitario y similitud de descripción) y asigna la mejor. Diseñada para archivos grandes con variaciones de captura.",
+    color: "#06b6d4",
+    icon: "",
+  },
+  {
+    id: "R5",
+    name: "Cobertura total absoluta (global)",
+    desc: "ltimo recurso extremo: si no existe candidato por pedimento, busca por fracción a nivel global y luego contra todo el 551. Prioriza la menor diferencia de cantidad/valor/precio para evitar filas sin secuencia.",
+    color: "#f59e0b",
+    icon: "",
   },
 ];
 
@@ -1567,7 +1841,7 @@ function UploadZone({ onFile, isDragging, setIsDragging }) {
         style={{ display: "none" }}
         onChange={(e) => e.target.files[0] && onFile(e.target.files[0])}
       />
-      <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
+      <div style={{ fontSize: 48, marginBottom: 16 }}></div>
       <div style={{ color: "#f8fafc", fontSize: 18, fontWeight: 700, marginBottom: 8, fontFamily: "Syne, sans-serif" }}>
         Sube tu archivo Excel
       </div>
@@ -1581,7 +1855,7 @@ function UploadZone({ onFile, isDragging, setIsDragging }) {
 function StrategyBar({ stats, total }) {
   const colors = { E0: "#00d4aa", E1: "#22c55e", E2: "#3b82f6", E3: "#f59e0b", E4: "#a855f7", E5: "#ef4444",
                    E6: "#06b6d4", E7: "#f97316", E8: "#8b5cf6", E9: "#ec4899", E10: "#14b8a6", E11: "#64748b",
-                   R1: "#0ea5e9", R2: "#10b981", R3: "#f43f5e" };
+                   R1: "#0ea5e9", R2: "#10b981", R3: "#f43f5e", R4: "#06b6d4", R5: "#f59e0b" };
   const unmatched = total - Object.values(stats).reduce((a, b) => a + b, 0);
   const segs = [
     ...Object.entries(stats).map(([k, v]) => ({ label: k, val: v, color: colors[k] })),
@@ -1639,12 +1913,12 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MÓDULO 2020 — DS multi-pedimento (hoja DS*, Layout*)
+// 
+// MDULO 2020  DS multi-pedimento (hoja DS*, Layout*)
 // Lectura celda-por-celda para manejar hojas de >600 MB sin colapsar memoria.
-// ═══════════════════════════════════════════════════════════════════════════════
+// 
 
-// ── Helper compartido ──────────────────────────────────────────────────────────
+//  Helper compartido 
 const nH2020 = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "");
 
 /**
@@ -1661,10 +1935,10 @@ const nH2020 = (s) => String(s ?? "").trim().toLowerCase().replace(/[\s_\-]/g, "
 function resolveDS2020SheetNames(wb) {
   const names = wb.SheetNames || [];
 
-  // ── DS: primera hoja con "DS" en el nombre ─────────────────────────────────
+  //  DS: primera hoja con "DS" en el nombre 
   const dsName = names.find(n => n.toUpperCase().includes("DS"));
 
-  // ── Layout: paso 1 — detección por contenido ──────────────────────────────
+  //  Layout: paso 1  detección por contenido 
   const LAY_KNOWN = new Set([
     "pedimento","fraccionnico","seccalc","descripcion","paisorigen","pais_origen",
     "valormpdolares","cantidad_comercial","cantidadcomercial","notas","estado",
@@ -1675,7 +1949,7 @@ function resolveDS2020SheetNames(wb) {
   for (const name of names) {
     if (name === dsName) continue;
     const ws = wb.Sheets[name];
-    if (!ws) continue; // hoja no cargada → se intentará en paso 2
+    if (!ws) continue; // hoja no cargada  se intentará en paso 2
     try {
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", sheetRows: 5 });
       for (const row of rows) {
@@ -1685,7 +1959,7 @@ function resolveDS2020SheetNames(wb) {
     } catch (_) { /* skip hojas que lancen error */ }
   }
 
-  // ── Layout: paso 2 — fallback por nombre (hojas grandes no cargadas) ───────
+  //  Layout: paso 2  fallback por nombre (hojas grandes no cargadas) 
   // Si no se encontró por contenido, buscar hojas con "layout" en el nombre
   // que NO cargaron (típico de archivos con hojas >500 MB).
   if (!layName) {
@@ -1705,10 +1979,11 @@ function resolveDS2020SheetNames(wb) {
 function readDS2020Sheet(sheet) {
   if (!sheet) return [];
 
-  // Aliases internos → posibles nombres en el Excel (normalizados con nH2020)
+  // Aliases internos  posibles nombres en el Excel (normalizados con nH2020)
   const DS_COL_MAP = {
     Pedimento2:           ["Pedimento2"],
     Fraccion:             ["Fraccion"],
+    SubdivisionFraccion:  ["SubdivisionFraccion","Subdivision Fraccion","NICO"],
     SecuenciaFraccion:    ["SecuenciaFraccion"],
     DescripcionMercancia: ["DescripcionMercancia"],
     CantidadUMComercial:  ["CantidadUMComercial"],
@@ -1731,7 +2006,7 @@ function readDS2020Sheet(sheet) {
   const hdr = rows[hdrI].map(c => String(c ?? "").trim());
   console.log("[DS2020] hdrI:", hdrI, "hits:", bestHits, "headers:", hdr.slice(0, 16));
 
-  // Mapear: nombre interno → primer índice que coincida, respetando ORDEN de aliases
+  // Mapear: nombre interno  primer índice que coincida, respetando ORDEN de aliases
   const idx = {};
   for (const [internalName, aliases] of Object.entries(DS_COL_MAP)) {
     let found = -1;
@@ -1783,20 +2058,20 @@ function readLayout2020Sheet(sheet) {
   // Asegurar que leemos suficientes columnas para encontrar candado (ej. AJ = col 35); si !ref es corto, extendemos
   // Limitar columnas leídas para el header: si el sheet es más ancho que 400 cols
   // (ej. A1:XEM5065), la mayoría de columnas útiles están en las primeras ~300.
-  // Escaneamos en bloques de 300 cols hasta encontrar los hits suficientes (≥4).
+  // Escaneamos en bloques de 300 cols hasta encontrar los hits suficientes (4).
   const MIN_COLS_CANDADO = 60;
   const MAX_HDR_COLS     = 400; // límite razonable para encontrar todos los headers
   const maxCol = Math.min(Math.max(range.e.c, MIN_COLS_CANDADO - 1), MAX_HDR_COLS - 1);
 
-  // ── 1. Primeras 15 filas con sheet_to_json (resuelve shared strings) ──────
+  //  1. Primeras 15 filas con sheet_to_json (resuelve shared strings) 
   const hdrRange = { s: { r: 0, c: range.s.c }, e: { r: Math.min(14, range.e.r), c: maxCol } };
   const sampleRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", range: hdrRange });
   console.log("[Layout2020] sampleRows leídas:", sampleRows.length, "cols hasta:", maxCol + 1);
 
-  // ── 2. Detectar fila de encabezado ────────────────────────────────────────
+  //  2. Detectar fila de encabezado 
   const KNOWN = new Set(["pedimento","fraccionnico","seccalc","descripcion",
                          "paisorigen","valormpdolares","cantidadcomercial",
-                         "cantidad_comercial","notas","estado","candado","clave"]);
+                         "cantidad_comercial","notas","estado","candado","clave","nico"]);
   let hdrI = 0, bestHits = 0;
   for (let i = 0; i < sampleRows.length; i++) {
     const hits = sampleRows[i].filter(c => KNOWN.has(nH2020(String(c ?? "")))).length;
@@ -1806,7 +2081,7 @@ function readLayout2020Sheet(sheet) {
   }
   console.log("[Layout2020] hdrI:", hdrI, "bestHits:", bestHits);
 
-  // ── 3. Mapear columnas ────────────────────────────────────────────────────
+  //  3. Mapear columnas 
   const rawHeaders = (sampleRows[hdrI] || []).map(c => String(c ?? "").trim());
   console.log("[Layout2020] headers:", rawHeaders);
 
@@ -1827,7 +2102,7 @@ function readLayout2020Sheet(sheet) {
   };
 
   const colIdx = {
-    // findLast para columnas que pueden estar duplicadas y la versión útil es la ÚLTIMA
+    // findLast para columnas que pueden estar duplicadas y la versión útil es la LTIMA
     // (ej. "pedimento" en col 3 es "20-400-3459-..." pero col 174 es "400-3459-..." = formato DS)
     pedimento:  findLast("pedimento"),
     frac:       findLast("FraccionNico","fraccionnico"),
@@ -1838,6 +2113,7 @@ function readLayout2020Sheet(sheet) {
     desc:       findFirst("descripcion","clase_descripcion","descripcionmercancia"),
     pais:       findFirst("pais_origen","paisorigen","paisorigendestino"),
     val:        findFirst("ValorMPDolares","valormpdolares","valordolares","valor_me","valorme"),
+    nico:       findFirst("NICO","nico","SubdivisionFraccion","subdivisionfraccion"),
     sec:        findFirst("SEC CALC","seccalc","secuenciaped","Secuencia","secuencia","SEC"),
     notasIn:    findFirst("NOTAS","notas"),   // primera NOTAS = flags de entrada ("NO INCLUIR")
     estado:     findFirst("ESTADO","estado"),
@@ -1859,7 +2135,7 @@ function readLayout2020Sheet(sheet) {
   const layoutMissing = LAYOUT_COL_SPEC.filter(({ key }) => colIdx[key] < 0).map(({ label, aceptados }) => ({ name: label, aceptados }));
   console.log("[Layout2020] colIdx:", JSON.stringify(colIdx), "missing:", layoutMissing.length);
 
-  // ── 4. Helpers lectura celda ──────────────────────────────────────────────
+  //  4. Helpers lectura celda 
   const cellVal = (r, c) => {
     if (c < 0) return "";
     const cell = sheet[XLSX.utils.encode_cell({ r, c })];
@@ -1873,7 +2149,7 @@ function readLayout2020Sheet(sheet) {
     return cell ? (parseFloat(cell.v) || 0) : 0;
   };
 
-  // ── 5. Leer filas de datos celda-por-celda (saltar filas sin pedimento ni fracción) ─────
+  //  5. Leer filas de datos celda-por-celda (saltar filas sin pedimento ni fracción) 
   const layoutRows = [];
   for (let r = hdrI + 1; r <= range.e.r; r++) {
     const pedVal  = cellVal(r, colIdx.pedimento);
@@ -1890,6 +2166,7 @@ function readLayout2020Sheet(sheet) {
       _rowI:       r,
       Pedimento:   pedVal,
       FraccionNico:fracVal,
+      NICO:        colIdx.nico >= 0 ? cellVal(r, colIdx.nico) : "",
       Descripcion: cellVal(r, colIdx.desc),
       PaisOrigen:  cellVal(r, colIdx.pais),
       Cantidad:    cellNum(r, colIdx.cant),
@@ -1912,7 +2189,7 @@ function readLayout2020Sheet(sheet) {
  *  Cada secuencia del DS tiene Fraccion + Descripcion + PaisOrigenDestino +
  *  CantidadUMComercial + ValorDolares. En el Layout, las filas con la misma
  *  fracción y descripción (normalizada) forman el grupo que debe coincidir con
- *  esa secuencia DS, SIN importar si el país difiere — el DS puede registrar
+ *  esa secuencia DS, SIN importar si el país difiere  el DS puede registrar
  *  país MEX mientras el Layout tiene MEX+CHN+USA+TWN (todos entran con ese país
  *  de la sec, no se corrige el país).
  *
@@ -1922,11 +2199,25 @@ function readLayout2020Sheet(sheet) {
 function runCascade2020(layoutRows, dsRows) {
   const nFrac = (v) => String(v ?? "").trim().replace(/^0+/, "") || "0";
   const normStr = (v) => String(v ?? "").trim();
+  // NICO normalizado (2 dígitos). Si no viene explícito, intenta derivarlo de FraccionNico (10 dígitos).
+  const nNico = (nicoVal, fracNicoVal = "") => {
+    let s = normStr(nicoVal);
+    if (!s || s === ".") {
+      const digits = normStr(fracNicoVal).replace(/\D/g, "");
+      if (digits.length >= 10) s = digits.slice(-2);
+    }
+    if (!s || s === ".") return "00";
+    const d = s.replace(/\D/g, "");
+    if (d) return d.slice(-2).padStart(2, "0");
+    const n = parseInt(s, 10);
+    if (Number.isFinite(n)) return String(n).padStart(2, "0");
+    return s.toUpperCase();
+  };
   // Normaliza descripción: lowercase, collapse whitespace, quita paréntesis redundantes
-  // nDesc: normaliza descripción — espacios, "/" sin espacios alrededor, paréntesis
+  // nDesc: normaliza descripción  espacios, "/" sin espacios alrededor, paréntesis
   const nDesc = (s) => String(s ?? "").trim().toLowerCase()
-    .replace(/\s*\/\s*/g, "/")   // "hoja / divisores" → "hoja/divisores"
-    .replace(/\s*\(\s*/g, "(")   // "resistencia ( las" → "resistencia (las"
+    .replace(/\s*\/\s*/g, "/")   // "hoja / divisores"  "hoja/divisores"
+    .replace(/\s*\(\s*/g, "(")   // "resistencia ( las"  "resistencia (las"
     .replace(/\s*\)\s*/g, ")")
     .replace(/\s+/g, " ");
 
@@ -1936,11 +2227,12 @@ function runCascade2020(layoutRows, dsRows) {
   const lyTotalV = layoutRows.filter(r=>!r.noIncluir).reduce((a,r)=>a+r.ValorUSD,0);
   const diffC = Math.abs(lyTotalC - dsTotalC);
   const diffV = Math.abs(lyTotalV - dsTotalV);
-  // globalCuadra se basa SOLO en cantidad — si cant global coincide, todo layout debe asignarse
+  // globalCuadra se basa SOLO en cantidad  si cant global coincide, todo layout debe asignarse
   // El valor USD puede tener diferencias pequeñas por redondeos entre el DS y el Layout
   const globalCantCuadra = diffC <= 1;
   const globalValCuadra  = diffV <= 5;
-  const globalCuadra     = globalCantCuadra; // para lógica de asignación, solo cuenta cantidad
+  const globalCuadra     = globalCantCuadra && globalValCuadra; // para lógica de asignación, solo cuenta cantidad
+  const STRICT_DS_RULES = true; // En DS: sin forzados fuera de tolerancia
   if (diffC > 1) {
     console.warn("[Cascade2020] Cantidades globales NO coinciden: Layout=", lyTotalC, "DS=", dsTotalC, "diff=", diffC);
   }
@@ -1961,7 +2253,7 @@ function runCascade2020(layoutRows, dsRows) {
     const candado = normStr(dsRow["Candado 551"]);
     if (candado) {
       // Separar por "-" y reconstruir: primer token = aduana, segundo = num, tercero = año, cuarto = frac, quinto = sec
-      // Formato real: "400-3459-0002178-85322999-104" → partes [400, 3459, 0002178, 85322999, 104]
+      // Formato real: "400-3459-0002178-85322999-104"  partes [400, 3459, 0002178, 85322999, 104]
       const parts = candado.split("-");
       // La fracción siempre es la parte de 8 dígitos (índice 3 en el formato estándar)
       for (let i = 0; i < parts.length; i++) {
@@ -1972,21 +2264,23 @@ function runCascade2020(layoutRows, dsRows) {
     return "";
   };
 
-  // ── Lookups del DS ────────────────────────────────────────────────────────
-  const dsByCandado  = new Map(); // "Candado 551" → dsRow
-  const dsByPFP      = new Map(); // Pedimento2|||Fraccion|||Pais → [dsRow]
-  const dsByPF       = new Map(); // Pedimento2|||Fraccion → [dsRow]
-  const dsByPFDesc   = new Map(); // Pedimento2|||Fraccion|||DescNorm → [dsRow]
+  //  Lookups del DS 
+  const dsByCandado  = new Map(); // "Candado 551"  dsRow
+  const dsByPFP      = new Map(); // Pedimento2|||Fraccion|||Pais  [dsRow]
+  const dsByPF       = new Map(); // Pedimento2|||Fraccion  [dsRow]
+  const dsByPFN      = new Map(); // Pedimento2|||Fraccion|||NICO  [dsRow]
+  const dsByPFDesc   = new Map(); // Pedimento2|||Fraccion|||DescNorm  [dsRow]
   const usedDS       = new Set();
 
   // Cadena de prioridad: Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado (para match explícito y mensaje "Coincide por cadena")
-  const dsByCadenaPrefix = new Map(); // ped|||frac|||desc|||pais → [dsRow]
+  const dsByCadenaPrefix = new Map(); // ped|||frac|||desc|||pais  [dsRow]
   for (const r of dsRows) {
     const candado = normStr(r["Candado 551"]);
     if (candado) dsByCandado.set(candado, r);
 
     const ped2 = normStr(r["Pedimento2"]);
     const frac = getDSFrac(r);
+    const nico = nNico(r["SubdivisionFraccion"], r["Fraccion"]);
     const pais = normStr(r["PaisOrigenDestino"]);
     const desc = nDesc(r["DescripcionMercancia"]);
 
@@ -2001,6 +2295,10 @@ function runCascade2020(layoutRows, dsRows) {
     const kPF = `${ped2}|||${frac}`;
     if (!dsByPF.has(kPF)) dsByPF.set(kPF, []);
     dsByPF.get(kPF).push(r);
+
+    const kPFN = `${ped2}|||${frac}|||${nico}`;
+    if (!dsByPFN.has(kPFN)) dsByPFN.set(kPFN, []);
+    dsByPFN.get(kPFN).push(r);
 
     const kPFD = `${ped2}|||${frac}|||${desc}`;
     if (!dsByPFDesc.has(kPFD)) dsByPFDesc.set(kPFD, []);
@@ -2074,7 +2372,7 @@ function runCascade2020(layoutRows, dsRows) {
     // 3. Backtracking con poda de sufijo (branch & bound).
     //    sortedDesc ya calculado arriba.
     //    Precalcular sufijos: suffixC[i] = suma Cantidad desde i hasta el final.
-    //    Si sumC + suffixC[i] < dsCant - tolC → imposible llegar → podar.
+    //    Si sumC + suffixC[i] < dsCant - tolC  imposible llegar  podar.
     const suffixC = new Array(sortedDesc.length + 1).fill(0);
     for (let i = sortedDesc.length - 1; i >= 0; i--) {
       suffixC[i] = suffixC[i + 1] + sortedDesc[i].Cantidad;
@@ -2178,7 +2476,14 @@ function runCascade2020(layoutRows, dsRows) {
     return null;
   };
 
-  // assignment: _idx → { status, newSec, dsRow, corrections[], reason }
+  const pickSubset = (pool, dsCant, dsVal) => {
+    const exact = findSubset(pool, dsCant, dsVal, 1, 4);
+    if (exact) return exact;
+    if (!STRICT_DS_RULES && globalCantCuadra) return findSubsetCantOnly(pool, dsCant);
+    return null;
+  };
+
+  // assignment: _idx  { status, newSec, dsRow, corrections[], reason }
   // status: "ok"|"corrected"|"new"|"unmatched"
   const assignment = new Map();
 
@@ -2198,11 +2503,11 @@ function runCascade2020(layoutRows, dsRows) {
       const secOriginal  = isRealSec(row.SecCalc) ? normStr(row.SecCalc) : null;
       const isCorrected = secOriginal !== null && secOriginal !== newSec;
       let reason = estrategia === "Cadena"
-        ? `Coincide por cadena (${CADENA_FIELDS}). [Cadena] Sec=${newSec} — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`
+        ? `Coincide por cadena (${CADENA_FIELDS}). [Cadena] Sec=${newSec}  Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`
         : `[${estrategia}] Sec=${newSec}`;
       if (!(estrategia === "Cadena") && isCorrected)  reason += ` (corregido de ${secOriginal})`;
-      if (!(estrategia === "Cadena") && isCrossFrac)  reason += ` [Frac ${fracOriginal}→${fracCorr||dsFrac}]`;
-      if (estrategia !== "Cadena") reason += ` — Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`;
+      if (!(estrategia === "Cadena") && isCrossFrac)  reason += ` [Frac ${fracOriginal}${fracCorr||dsFrac}]`;
+      if (estrategia !== "Cadena") reason += `  Layout Cant=${sumC.toLocaleString()} Val=$${sumV.toFixed(0)} | DS Cant=${dsCant.toLocaleString()} Val=$${dsVal.toFixed(0)}`;
       if (estrategia !== "Cadena") reason = `Alternativa: ${reason}`;
       assignment.set(row._idx, {
         status: secOriginal !== null ? "corrected" : "new",
@@ -2215,7 +2520,91 @@ function runCascade2020(layoutRows, dsRows) {
     }
   };
 
-  // ── Prioridad por cadena: Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado ──
+  //  Prioridad por NICO: Pedimento2+Fraccion+NICO (grupos CE) 
+  // Consultoría CE: primero cerrar por grupos NICO, luego bajar a reglas más amplias.
+  const groupsByNico = new Map(); // ped|||frac|||nico  rows
+  for (const row of layoutRows) {
+    if (row.noIncluir) continue;
+    const ped  = normStr(row.Pedimento);
+    const frac = nFrac(row.FraccionNico);
+    const nico = nNico(row.NICO, row.FraccionNico);
+    const kN   = `${ped}|||${frac}|||${nico}`;
+    if (!groupsByNico.has(kN)) groupsByNico.set(kN, []);
+    groupsByNico.get(kN).push(row);
+  }
+
+  for (const [kN, rows] of groupsByNico) {
+    const pend = rows.filter(r => !assignment.has(r._idx));
+    if (!pend.length) continue;
+
+    const dsListBase = (dsByPFN.get(kN) || []).filter(ds => !usedDS.has(ds._dsIdx));
+    if (!dsListBase.length) continue;
+
+    // Caso simple: solo una secuencia DS para este NICO
+    if (dsListBase.length === 1) {
+      const dsRow = dsListBase[0];
+      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      const dsVal  = parseFloat(dsRow["ValorDolares"]) || 0;
+      const dsSinValor = dsVal === 0 || !Number.isFinite(dsVal);
+      const sumC = pend.reduce((a, r) => a + r.Cantidad, 0);
+      const sumV = pend.reduce((a, r) => a + r.ValorUSD, 0);
+      const okC = Math.abs(sumC - dsCant) <= 1 || (dsCant > 1000 && Math.abs(sumC - dsCant) / dsCant <= 0.005);
+      const okV = Math.abs(sumV - dsVal) <= 5 || dsSinValor;
+      if (okC && okV) {
+        assignRows(pend, dsRow, "NICO1");
+      } else {
+        const sub = pickSubset(pend, dsCant, dsVal);
+        if (sub) assignRows(sub, dsRow, "NICO1_sub");
+      }
+      continue;
+    }
+
+    // Caso múltiple: repartir filas del mismo NICO entre varias secuencias DS del NICO
+    const dsList = [...dsListBase].sort((a, b) => (parseFloat(a["CantidadUMComercial"]) || 0) - (parseFloat(b["CantidadUMComercial"]) || 0));
+    let remaining = [...pend];
+
+    for (let i = 0; i < dsList.length; i++) {
+      const dsRow = dsList[i];
+      if (usedDS.has(dsRow._dsIdx) || !remaining.length) continue;
+
+      const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
+      const dsVal  = parseFloat(dsRow["ValorDolares"]) || 0;
+      const dsDesc = nDesc(dsRow["DescripcionMercancia"]);
+      const dsPais = normStr(dsRow["PaisOrigenDestino"]);
+      const isLast = i === dsList.length - 1;
+
+      let sub = null;
+      const byDP = remaining.filter(r => nDesc(r.Descripcion) === dsDesc && normStr(r.PaisOrigen) === dsPais);
+      if (byDP.length) sub = pickSubset(byDP, dsCant, dsVal);
+
+      if (!sub) {
+        const byD = remaining.filter(r => nDesc(r.Descripcion) === dsDesc);
+        if (byD.length) sub = pickSubset(byD, dsCant, dsVal);
+      }
+
+      if (!sub && !isLast) {
+        sub = pickSubset(remaining, dsCant, dsVal);
+      }
+
+      if (!sub && isLast) {
+        const remC = remaining.reduce((a, r) => a + r.Cantidad, 0);
+        const remV = remaining.reduce((a, r) => a + r.ValorUSD, 0);
+        const dsSinValor = dsVal === 0 || !Number.isFinite(dsVal);
+        const okC = Math.abs(remC - dsCant) <= 1 || (dsCant > 1000 && Math.abs(remC - dsCant) / dsCant <= 0.005);
+        const okV = Math.abs(remV - dsVal) <= 5 || dsSinValor;
+        if (okC && okV) sub = remaining;
+        if (!sub) sub = pickSubset(remaining, dsCant, dsVal);
+      }
+
+      if (sub && sub.length) {
+        assignRows(sub, dsRow, "NICOm");
+        const usedSet = new Set(sub.map(r => r._idx));
+        remaining = remaining.filter(r => !usedSet.has(r._idx));
+      }
+    }
+  }
+
+  //  Prioridad por cadena: Pedimento2-Fraccion-DescripcionMercancia-PaisOrigen-CantidadUMComercial-ValorUSDredondeado 
   // Si los campos en Layout y DS coinciden (misma cadena + totales dentro de tolerancia), asignar y reportar "Coincide por cadena".
   // Agrupar Layout por (Pedimento, FraccionNico, Descripcion norm, PaisOrigen); buscar en DS por la misma cadena y totales ±1 cant / ±5 USD.
   const groupsByCadena = new Map();
@@ -2249,7 +2638,7 @@ function runCascade2020(layoutRows, dsRows) {
     if (dsRow) assignRows(rows, dsRow, "Cadena");
   }
 
-  // ── E0candado: Asignar por candado (Layout col AJ = DS col candado) ───────────
+  //  E0candado: Asignar por candado (Layout col AJ = DS col candado) 
   // Solo si el total del grupo Layout (cantidad + valor) cuadra con el DS (±1 ud / ±5 USD).
   // Así se evita "sobrepasar por mucho": no asignar 54 filas Layout que suman 1M ud a un DS de 100 ud.
   const layoutByCandado = new Map();
@@ -2280,7 +2669,7 @@ function runCascade2020(layoutRows, dsRows) {
     // Si no cuadra: las filas pasan a FASE A (A1, A2, findSubset, etc.)
   }
 
-  // ── E0: Verificar SEC CALC existente contra DS ───────────────────────────
+  //  E0: Verificar SEC CALC existente contra DS 
   // Intento 1: por "Candado 551" exacto (Pedimento-Fraccion-Secuencia)
   // Intento 2: por Ped+Frac+SecuenciaFraccion directamente (cubre formatos distintos de candado)
   // Solo para filas que aún no se asignaron por E0candado y que ya tienen secuencia en Layout.
@@ -2303,26 +2692,26 @@ function runCascade2020(layoutRows, dsRows) {
     }
 
     if (dsRow && !usedDS.has(dsRow._dsIdx)) {
-      // DS sec encontrada y aún no usada → verificar OK
+      // DS sec encontrada y aún no usada  verificar OK
       usedDS.add(dsRow._dsIdx);
       assignment.set(row._idx, { status: "ok", newSec: row.SecCalc, dsRow, corrections: [],
-        reason: "OK — Secuencia verificada contra DS" });
+        reason: "OK  Secuencia verificada contra DS" });
     }
     // Si la DS sec ya fue usada por otra fila (duplicado con misma sec), esta fila
-    // pasa a fases siguientes para encontrar su secuencia correcta (ej: Sec22→Sec23)
+    // pasa a fases siguientes para encontrar su secuencia correcta (ej: Sec22Sec23)
   }
 
-  // ── E1–E7: Asignar filas sin secuencia (o cuya sec no coincidió en E0) ────
+  //  E1E7: Asignar filas sin secuencia (o cuya sec no coincidió en E0) 
   // Agrupamos por DOS criterios en paralelo:
   //   1. Ped+Frac+Pais  (tradicional, para casos exactos por país)
   //   2. Ped+Frac+DescNorm  (nuevo, para casos donde DS agrupa por descripción
   //      y el Layout mezcla países con la misma descripción)
 
-  const groupsByPais = new Map(); // Ped|||Frac|||Pais → rows
-  const groupsByDesc = new Map(); // Ped|||Frac|||DescNorm → rows
+  const groupsByPais = new Map(); // Ped|||Frac|||Pais  rows
+  const groupsByDesc = new Map(); // Ped|||Frac|||DescNorm  rows
   for (const row of layoutRows) {
     if (row.noIncluir) continue;
-    if (assignment.has(row._idx)) continue; // ya asignada (E0candado, E0, E1–E7, etc.)
+    if (assignment.has(row._idx)) continue; // ya asignada (E0candado, E0, E1E7, etc.)
     const a = assignment.get(row._idx);
     if (a?.status === "ok") continue;
     const ped  = row.Pedimento;
@@ -2337,7 +2726,7 @@ function runCascade2020(layoutRows, dsRows) {
     groupsByDesc.get(kD).push(row);
   }
 
-  // ── FASE A: Para cada DS row, buscar Layout por Ped+Frac+Desc ────────────
+  //  FASE A: Para cada DS row, buscar Layout por Ped+Frac+Desc 
   // Esto resuelve el caso PRUEBA 1: DS 85049099/CAJA vs Layout 85049099/CAJA MEX+CHN+USA+TWN
   // Ordena secuencias DS de menor a mayor cant (asigna las más pequeñas primero)
   const dsSorted = [...dsRows].filter(r => !usedDS.has(r._dsIdx))
@@ -2362,7 +2751,7 @@ function runCascade2020(layoutRows, dsRows) {
         continue;
       }
       // Quizá solo es un subconjunto (misma desc pero DS tiene varias secs)
-      // → ver si un subconjunto de grpDesc suma exactamente (búsqueda greedy)
+      //  ver si un subconjunto de grpDesc suma exactamente (búsqueda greedy)
       const subset = findSubset(grpDesc, dsCant, dsVal, 1, 4);
       if (subset) { assignRows(subset, dsRow, "A1b"); continue; }
     }
@@ -2399,7 +2788,7 @@ function runCascade2020(layoutRows, dsRows) {
       if (subset) { assignRows(subset, dsRow, "A3b"); continue; }
     }
 
-    // --- A1_fuzzy: Desc parcial — primer 50% de la desc DS coincide ---
+    // --- A1_fuzzy: Desc parcial  primer 50% de la desc DS coincide ---
     // Para casos donde DS tiene desc corta y Layout tiene desc más larga
     const descKey50 = desc.slice(0, Math.max(8, Math.floor(desc.length * 0.6)));
     for (const [k, grp] of groupsByDesc) {
@@ -2420,7 +2809,7 @@ function runCascade2020(layoutRows, dsRows) {
     if (usedDS.has(dsRow._dsIdx)) continue;
   }
 
-  // ── FASE A2: Segundo paso — DS aún no usadas, buscar por Ped+Frac total con combo ──
+  //  FASE A2: Segundo paso  DS aún no usadas, buscar por Ped+Frac total con combo 
   // Para casos donde Layout total Ped+Frac = suma de 2-3 DS secs
   const dsSortedB = [...dsRows].filter(r => !usedDS.has(r._dsIdx))
     .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
@@ -2454,7 +2843,7 @@ function runCascade2020(layoutRows, dsRows) {
       continue;
     }
 
-    // Múltiples DS secs: distribuir filas por descripción/país → subconjunto → resto
+    // Múltiples DS secs: distribuir filas por descripción/país  subconjunto  resto
     const dsSort = [...dsList].sort((a,b)=>(parseFloat(a["CantidadUMComercial"])||0)-(parseFloat(b["CantidadUMComercial"])||0));
     let remaining = [...allPFRows];
 
@@ -2469,7 +2858,7 @@ function runCascade2020(layoutRows, dsRows) {
 
       let matched = false;
 
-      // ── Estrategia 1: desc + país exacto ────────────────────────────────
+      //  Estrategia 1: desc + país exacto 
       const byDP = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
       if (!matched && byDP.length > 0) {
         const sC = byDP.reduce((a,r)=>a+r.Cantidad,0), sV = byDP.reduce((a,r)=>a+r.ValorUSD,0);
@@ -2481,7 +2870,7 @@ function runCascade2020(layoutRows, dsRows) {
         }
       }
 
-      // ── Estrategia 2: solo descripción ───────────────────────────────────
+      //  Estrategia 2: solo descripción 
       if (!matched) {
         const byD = remaining.filter(r => nDesc(r.Descripcion) === dsDescNorm);
         if (byD.length > 0) {
@@ -2495,7 +2884,7 @@ function runCascade2020(layoutRows, dsRows) {
         }
       }
 
-      // ── Estrategia 3: solo país ──────────────────────────────────────────
+      //  Estrategia 3: solo país 
       if (!matched) {
         const byP = remaining.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
         if (byP.length > 0) {
@@ -2509,10 +2898,10 @@ function runCascade2020(layoutRows, dsRows) {
         }
       }
 
-      // ── Estrategia 4: subconjunto del total remaining ───────────────────
+      //  Estrategia 4: subconjunto del total remaining 
       if (!matched) {
         if (esUltimo) {
-          // Último: si remaining cuadra exacto, asignar todo
+          // ltimo: si remaining cuadra exacto, asignar todo
           const sC = remaining.reduce((a,r)=>a+r.Cantidad,0), sV = remaining.reduce((a,r)=>a+r.ValorUSD,0);
           if (Math.abs(sC - dsCant) <= 1 && Math.abs(sV - dsVal) <= 4) {
             assignRows(remaining, m, "A2m_last"); matched = true;
@@ -2552,7 +2941,7 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
-  // ── FASE B: E0b — completar remanente de sec ya verificada en E0 ─────────
+  //  FASE B: E0b  completar remanente de sec ya verificada en E0 
   for (const [kP, rows] of groupsByPais) {
     const pendingRows = rows.filter(r => !assignment.has(r._idx));
     if (pendingRows.length === 0) continue;
@@ -2574,11 +2963,11 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
-  // ── FASE B2: Fallback cantidad-only (solo si cant global coincide) ───────
+  //  FASE B2: Fallback cantidad-only (solo si cant global coincide) 
   // Si la cantidad global cuadra pero quedan DS sin asignar (por diferencias en USD
   // o backtracking con subconjuntos complejos), asignar priorizando cantidad ±1.
   // Orden: primero desc+pais, luego desc, luego pais, luego PF completo.
-  if (globalCantCuadra) {
+  if (globalCuadra) {
     const dsPendientes = [...dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"])||0) > 0)]
       .sort((a,b) => (parseFloat(a["CantidadUMComercial"])||0) - (parseFloat(b["CantidadUMComercial"])||0));
 
@@ -2605,7 +2994,7 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyPend.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B2_dp"); matched = true; }
         }
       }
@@ -2613,7 +3002,7 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyPend.filter(r => nDesc(r.Descripcion) === dsDescNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B2_d"); matched = true; }
         }
       }
@@ -2621,19 +3010,19 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyPend.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B2_p"); matched = true; }
         }
       }
       // 4. Ped+Frac completo (cantidad-only)
       if (!matched) {
-        const sub = findSubset(lyPend, dsCant, dsVal, 1, 4) || findSubsetCantOnly(lyPend, dsCant);
+        const sub = findSubset(lyPend, dsCant, dsVal, 1, 4);
         if (sub) { assignRows(sub, dsRow, "B2_pf"); matched = true; }
       }
     }
   }
 
-  // ── FASE B3: Partición PF-total cuando cant PF coincide exactamente ──────
+  //  FASE B3: Partición PF-total cuando cant PF coincide exactamente 
   // Para grupos donde el total del Ped+Frac entre DS y Layout coincide ±1 en
   // cantidad, pero el backtracking no pudo dividir (ej: 85340004, 48081001).
   // Estrategia: distribuir Layout rows entre DS secs por país, luego por greedy.
@@ -2690,7 +3079,7 @@ function runCascade2020(layoutRows, dsRows) {
             continue;
           }
           // Subconjunto del grupo pais
-          const sub = findSubsetCantOnly(byPais, dsCant);
+          const sub = null;
           if(sub){
             assignRows(sub, ds, "B3_pais_sub");
             const used = new Set(sub.map(r=>r._idx));
@@ -2700,7 +3089,7 @@ function runCascade2020(layoutRows, dsRows) {
         }
 
         // Subconjunto del total remaining
-        const sub2 = findSubset(remaining, dsCant, dsVal, 1, 4) || findSubsetCantOnly(remaining, dsCant);
+        const sub2 = findSubset(remaining, dsCant, dsVal, 1, 4);
         if(sub2){
           assignRows(sub2, ds, "B3_sub");
           const used = new Set(sub2.map(r=>r._idx));
@@ -2727,14 +3116,14 @@ function runCascade2020(layoutRows, dsRows) {
     }
   }
 
-  // ── FASE B4: Búsqueda cruzada de fracciones (cross-fraction) ────────────
+  //  FASE B4: Búsqueda cruzada de fracciones (cross-fraction) 
   // Algunos Layout tienen la fracción incorrecta respecto al DS.
   // Ej: DS sec `85332101` no tiene Layout, pero `85332999` tiene 46k extra que
   //     en el DS corresponden a `85332101`.
   // Estrategia: para DS secs sin Layout en su fracción, buscar en cualquier
   //             fila del MISMO pedimento que esté sin asignar.
   //             Solo si cantidad global coincide (no inventamos unidades).
-  if (globalCantCuadra) {
+  if (globalCuadra) {
     const dsPendB4 = [...dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"])||0) > 0)]
       .sort((a,b) => (parseFloat(b["CantidadUMComercial"])||0) - (parseFloat(a["CantidadUMComercial"])||0)); // desc: primero los más grandes
 
@@ -2761,7 +3150,7 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm && normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B4_dp", frac); matched = true; }
         }
       }
@@ -2769,7 +3158,7 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyAllPed.filter(r => nDesc(r.Descripcion) === dsDescNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B4_d", frac); matched = true; }
         }
       }
@@ -2782,7 +3171,7 @@ function runCascade2020(layoutRows, dsRows) {
                  (ld.startsWith(pref) || pref.startsWith(ld.slice(0, pref.length)));
         });
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B4_fp", frac); matched = true; }
         }
       }
@@ -2794,7 +3183,7 @@ function runCascade2020(layoutRows, dsRows) {
           return ld.startsWith(pref) || pref.startsWith(ld.slice(0, pref.length));
         });
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B4_fd", frac); matched = true; }
         }
       }
@@ -2802,19 +3191,141 @@ function runCascade2020(layoutRows, dsRows) {
       if (!matched) {
         const pool = lyAllPed.filter(r => normStr(r.PaisOrigen) === dsPaisNorm);
         if (pool.length) {
-          const sub = findSubset(pool, dsCant, dsVal, 1, 4) || findSubsetCantOnly(pool, dsCant);
+          const sub = findSubset(pool, dsCant, dsVal, 1, 4);
           if (sub) { assignRows(sub, dsRow, "B4_p", frac); matched = true; }
         }
       }
-      // 6. cualquier fila del pedimento (solo cantidad) — último recurso absoluto
-      if (!matched) {
-        const sub = findSubsetCantOnly(lyAllPed, dsCant);
-        if (sub) { assignRows(sub, dsRow, "B4_any", frac); matched = true; }
+      // 6. Modo estricto: se elimina fallback "solo cantidad"
+    }
+  }
+
+  //  FASE B6: Relleno final por similitud (permite reutilizar secuencias) 
+  // Objetivo: cerrar asignación al 100% en archivos donde los métodos estrictos
+  // no alcanzan por diferencias operativas entre Layout y DS.
+  // Criterio de mejor candidato: misma fracción (si existe), descripción, país
+  // y cercanía de precio unitario. Aquí SÍ se permite reutilizar secuencia DS.
+  {
+    const dsByPed = new Map();
+    for (const ds of dsRows) {
+      const ped = normStr(ds["Pedimento2"]);
+      if (!dsByPed.has(ped)) dsByPed.set(ped, []);
+      dsByPed.get(ped).push(ds);
+    }
+
+    const descPrefixMatch = (a, b) => {
+      const x = nDesc(a), y = nDesc(b);
+      if (!x || !y) return false;
+      const pref = Math.max(8, Math.floor(Math.min(x.length, y.length) * 0.6));
+      return x.slice(0, pref) === y.slice(0, pref);
+    };
+
+    const chooseBestDsForRow = (row) => {
+      const ped  = normStr(row.Pedimento);
+      const frac = nFrac(row.FraccionNico);
+      const rDesc = nDesc(row.Descripcion || "");
+      const rPais = normStr(row.PaisOrigen || "");
+      const rUp   = row.Cantidad > 0 ? (row.ValorUSD / row.Cantidad) : 0;
+
+      const byPF = dsByPF.get(`${ped}|||${frac}`) || [];
+      const cands = byPF.length ? byPF : (dsByPed.get(ped) || []);
+      if (!cands.length) return null;
+
+      let best = null;
+      let bestScore = -Infinity;
+
+      for (const ds of cands) {
+        const dsFrac = getDSFrac(ds);
+        const dsDesc = nDesc(ds["DescripcionMercancia"] || "");
+        const dsPais = normStr(ds["PaisOrigenDestino"] || "");
+        const dsCant = parseFloat(ds["CantidadUMComercial"]) || 0;
+        const dsVal  = parseFloat(ds["ValorDolares"]) || 0;
+        const dsUp   = dsCant > 0 ? (dsVal / dsCant) : 0;
+
+        let score = 0;
+        if (dsFrac === frac) score += 30;
+        if (dsPais && rPais && dsPais === rPais) score += 20;
+        if (dsDesc && rDesc && dsDesc === rDesc) score += 80;
+        else if (descPrefixMatch(dsDesc, rDesc)) score += 35;
+
+        if (rUp > 0 && dsUp > 0) {
+          const upDiff = Math.abs(dsUp - rUp) / Math.max(rUp, 0.0001);
+          score -= Math.min(60, upDiff * 100);
+        }
+
+        // Pequeño sesgo para no preferir secuencias con cantidad cero.
+        if (dsCant <= 0) score -= 20;
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = ds;
+        }
+      }
+      return best;
+    };
+
+    for (const row of layoutRows) {
+      if (row.noIncluir || assignment.has(row._idx)) continue;
+
+      const dsBest = chooseBestDsForRow(row);
+      if (!dsBest) continue;
+
+      const newSec = normStr(dsBest["SecuenciaFraccion"]);
+      const fracOriginal = nFrac(row.FraccionNico);
+      const dsFrac       = getDSFrac(dsBest);
+      const isCrossFrac  = fracOriginal !== dsFrac;
+
+      assignment.set(row._idx, {
+        status: "new",
+        newSec,
+        dsRow: dsBest,
+        corrections: [],
+        estrategia: "B6_relleno",
+        secOrig: null,
+        fracCorr: isCrossFrac ? dsFrac : null,
+        fracOrig: isCrossFrac ? fracOriginal : null,
+        reason: `Alternativa: [B6_relleno] Sec=${newSec}  asignación por mejor similitud (desc/pais/precio unitario)${isCrossFrac ? ` [Frac ${fracOriginal}${dsFrac}]` : ""}`,
+      });
+    }
+  }
+
+  // Validaci�n estricta final: rechazar asignaciones fuera de tolerancia
+  {
+    const byDs = new Map(); // dsIdx -> rows[]
+    for (const row of layoutRows) {
+      const a = assignment.get(row._idx);
+      if (!a || !a.dsRow || a.status === "unmatched") continue;
+      const di = a.dsRow._dsIdx;
+      if (!byDs.has(di)) byDs.set(di, []);
+      byDs.get(di).push(row);
+    }
+    for (const [di, rows] of byDs.entries()) {
+      const a0 = assignment.get(rows[0]._idx);
+      const ds = a0?.dsRow;
+      if (!ds) continue;
+      const dsCant = parseFloat(ds["CantidadUMComercial"]) || 0;
+      const dsVal  = parseFloat(ds["ValorDolares"]) || 0;
+      const sumC = rows.reduce((a, r) => a + (parseFloat(r.Cantidad) || 0), 0);
+      const sumV = rows.reduce((a, r) => a + (parseFloat(r.ValorUSD) || 0), 0);
+      const diffCant = sumC - dsCant;
+      const diffVal  = sumV - dsVal;
+      const okCant = Math.abs(diffCant) <= 1;
+      const okVal  = Math.abs(diffVal) <= 4;
+      if (!(okCant && okVal)) {
+        usedDS.delete(di);
+        for (const row of rows) {
+          assignment.set(row._idx, {
+            status: "unmatched",
+            newSec: row.SecCalc || "",
+            dsRow: null,
+            corrections: [],
+            reason: `[RECHAZADO ESTRICTO] Sec ${normStr(ds["SecuenciaFraccion"])} descartada por exceder tolerancia: �Cant=${diffCant.toLocaleString("es-MX")} (tol �1), �USD=${diffVal.toFixed(2)} (tol �4). Estrategia previa: ${a0?.estrategia || "N/A"}.`,
+          });
+        }
       }
     }
   }
 
-  // ── FASE C: Marcar sin match las filas que quedaron sin asignar ──────────
+  //  FASE C: Marcar sin match las filas que quedaron sin asignar 
   for (const row of layoutRows) {
     if (row.noIncluir || assignment.has(row._idx)) continue;
     assignment.set(row._idx, {
@@ -2824,7 +3335,7 @@ function runCascade2020(layoutRows, dsRows) {
   }
 
 
-  // ── Totales asignados por sec (para verificación) ────────────────────────
+  //  Totales asignados por sec (para verificación) 
   // Secuencias DS no usadas: solo contar las que tienen cantidad real (>0)
   const unusedDS = dsRows.filter(r => !usedDS.has(r._dsIdx) && (parseFloat(r["CantidadUMComercial"]) || 0) > 0);
   const stats = { verified: 0, corrected: 0, newAssigned: 0, unmatched: 0 };
@@ -2835,9 +3346,9 @@ function runCascade2020(layoutRows, dsRows) {
     else                               stats.unmatched++;
   }
 
-  // ── Calcular motivos de no-match para DS no usadas ────────────────────────
+  //  Calcular motivos de no-match para DS no usadas 
   // Construir totales del Layout por Pedimento+Fraccion (para el diagnóstico)
-  const layoutTotals = new Map(); // "ped|||frac" → { cant, val, rows, noInc }
+  const layoutTotals = new Map(); // "ped|||frac"  { cant, val, rows, noInc }
   for (const row of layoutRows) {
     const k = `${row.Pedimento}|||${nFrac(row.FraccionNico)}`;
     if (!layoutTotals.has(k)) layoutTotals.set(k, { cant: 0, val: 0, rows: 0, noInc: 0 });
@@ -2849,7 +3360,7 @@ function runCascade2020(layoutRows, dsRows) {
   const fmt = n => Number(n).toLocaleString("es-MX", { maximumFractionDigits: 0 });
 
   // Calcular totales Layout ASIGNADOS por DS row (para comparar con DS)
-  const assignedTotalsByDS = new Map(); // _dsIdx → { cant, val }
+  const assignedTotalsByDS = new Map(); // _dsIdx  { cant, val }
   for (const row of layoutRows) {
     const a = assignment.get(row._idx);
     if (!a || a.status === "unmatched" || !a.dsRow) continue;
@@ -2859,7 +3370,14 @@ function runCascade2020(layoutRows, dsRows) {
     g.cant += row.Cantidad; g.val += row.ValorUSD;
   }
 
-  const mismatchReasons = new Map(); // _dsIdx → reason string
+  const mismatchReasons = new Map(); // _dsIdx  reason string
+  const unusedDSDetails = [];
+  const layoutByPed = new Map(); // ped -> [{ frac, cant, val, rows, noInc }]
+  for (const [k, g] of layoutTotals.entries()) {
+    const [pedK, fracK] = String(k).split("|||");
+    if (!layoutByPed.has(pedK)) layoutByPed.set(pedK, []);
+    layoutByPed.get(pedK).push({ frac: fracK, ...g });
+  }
   // Para DS usadas: verificar si el total Layout coincide con DS
   for (const dsRow of dsRows) {
     const dsCant = parseFloat(dsRow["CantidadUMComercial"]) || 0;
@@ -2868,7 +3386,7 @@ function runCascade2020(layoutRows, dsRows) {
     const asg    = assignedTotalsByDS.get(dsRow._dsIdx);
 
     if (!usedDS.has(dsRow._dsIdx)) {
-      // DS no usada → calcular motivo
+      // DS no usada  calcular motivo
       const frac = getDSFrac(dsRow);
       const k    = `${normStr(dsRow["Pedimento2"])}|||${frac}`;
       const g    = layoutTotals.get(k);
@@ -2880,29 +3398,58 @@ function runCascade2020(layoutRows, dsRows) {
       } else {
         const diffCant = g.cant - dsCant;
         const diffVal  = g.val  - dsVal;
-        const pctCant  = dsCant > 0 ? (diffCant / dsCant * 100).toFixed(0) : "∞";
-        const pctVal   = dsVal  > 0 ? (diffVal  / dsVal  * 100).toFixed(0) : "∞";
-        reason = `Sin concordancia — Cant.Layout=${fmt(g.cant)} vs DS=${fmt(dsCant)} (${diffCant>=0?"+":""}${pctCant}%) | Valor Layout=$${fmt(g.val)} vs DS=$${fmt(dsVal)} (${diffVal>=0?"+":""}${pctVal}%)`;
+        const pctCant  = dsCant > 0 ? (diffCant / dsCant * 100).toFixed(0) : "";
+        const pctVal   = dsVal  > 0 ? (diffVal  / dsVal  * 100).toFixed(0) : "";
+        reason = `Sin concordancia  Cant.Layout=${fmt(g.cant)} vs DS=${fmt(dsCant)} (${diffCant>=0?"+":""}${pctCant}%) | Valor Layout=$${fmt(g.val)} vs DS=$${fmt(dsVal)} (${diffVal>=0?"+":""}${pctVal}%)`;
       }
       mismatchReasons.set(dsRow._dsIdx, reason);
+      // Probable candidato Layout (misma clave de pedimento) para explicar "DS vacío"
+      let probable = "";
+      const pedK = normStr(dsRow["Pedimento2"]);
+      const candsPed = layoutByPed.get(pedK) || [];
+      if (!g && candsPed.length > 0) {
+        let best = null;
+        let bestScore = Infinity;
+        for (const c of candsPed) {
+          const relC = Math.abs(c.cant - dsCant) / Math.max(c.cant, dsCant, 1);
+          const relV = Math.abs(c.val - dsVal) / Math.max(c.val, dsVal, 1);
+          const score = relC * 0.6 + relV * 0.4;
+          if (score < bestScore) { bestScore = score; best = c; }
+        }
+        if (best) {
+          const prob = Math.max(5, Math.round((1 / (1 + bestScore)) * 100));
+          probable = `Probable relación en Layout: fracción ${best.frac}, Cant=${fmt(best.cant)}, Val=$${fmt(best.val)} (confianza aprox. ${prob}%).`;
+        }
+      }
+      unusedDSDetails.push({
+        dsIdx: dsRow._dsIdx,
+        secuencia: normStr(dsRow["SecuenciaFraccion"]),
+        pedimento: normStr(dsRow["Pedimento2"] || dsRow["Pedimento"]),
+        fraccion: normStr(dsRow["Fraccion"] || frac),
+        pais: normStr(dsRow["PaisOrigenDestino"]),
+        cantidadDS: dsCant,
+        valorDS: dsVal,
+        razon: reason,
+        probable,
+      });
     } else if (asg) {
       // DS usada: verificar si el total asignado coincide con DS
       const diffCant = Math.abs(asg.cant - dsCant);
       const diffVal  = Math.abs(asg.val  - dsVal);
-      const tolCant  = Math.max(5, dsCant * 0.01); // tolerancia 1%
-      const tolVal   = Math.max(5, dsVal  * 0.01);
+      const tolCant  = 1; // tolerancia estricta comercio exterior
+      const tolVal   = 4;
       if (diffCant > tolCant || diffVal > tolVal) {
-        const pctC = dsCant > 0 ? ((asg.cant - dsCant) / dsCant * 100).toFixed(1) : "∞";
-        const pctV = dsVal  > 0 ? ((asg.val  - dsVal)  / dsVal  * 100).toFixed(1) : "∞";
+        const pctC = dsCant > 0 ? ((asg.cant - dsCant) / dsCant * 100).toFixed(1) : "";
+        const pctV = dsVal  > 0 ? ((asg.val  - dsVal)  / dsVal  * 100).toFixed(1) : "";
         const signo = (v) => v >= 0 ? "+" : "";
         mismatchReasons.set(dsRow._dsIdx,
-          `⚠ DISCREPANCIA — Cant.Layout=${fmt(asg.cant)} vs DS=${fmt(dsCant)} (${signo((asg.cant-dsCant))}${pctC}%) | Valor Layout=$${fmt(asg.val)} vs DS=$${fmt(dsVal)} (${signo((asg.val-dsVal))}${pctV}%)`
+          ` DISCREPANCIA  Cant.Layout=${fmt(asg.cant)} vs DS=${fmt(dsCant)} (${signo((asg.cant-dsCant))}${pctC}%) | Valor Layout=$${fmt(asg.val)} vs DS=$${fmt(dsVal)} (${signo((asg.val-dsVal))}${pctV}%)`
         );
       }
     }
   }
 
-  return { assignment, stats, unusedDS, layoutRows, dsRows, mismatchReasons,
+  return { assignment, stats, unusedDS, unusedDSDetails, layoutRows, dsRows, mismatchReasons,
     globalTotals: { dsCant: dsTotalC, dsVal: dsTotalV, lyCant: lyTotalC, lyVal: lyTotalV, cuadra: globalCantCuadra, cuadraVal: globalValCuadra } };
 }
 
@@ -2914,7 +3461,7 @@ function runCascade2020(layoutRows, dsRows) {
  *   - La hoja DS sin cambios
  *   - Una hoja "Reporte_2020" con el detalle
  *
- * Escribir celdas directamente es ~1000x más eficiente que sheet_to_json → aoa_to_sheet
+ * Escribir celdas directamente es ~1000x más eficiente que sheet_to_json  aoa_to_sheet
  * sobre una hoja de 22 millones de celdas.
  */
 function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
@@ -2922,7 +3469,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   const { layoutRows, colIdx } = layout2020Data;
   const ws = workbook.Sheets[layoutSheetName]; // referencia al worksheet original
 
-  // ── Estilos ───────────────────────────────────────────────────────────────
+  //  Estilos 
   const S_OK_SEC   = { font:{bold:true,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{horizontal:"center"} };
   const S_NEW_SEC  = { font:{bold:true,color:{rgb:"7B241C"}}, fill:{patternType:"solid",fgColor:{rgb:"FFCCCC"}}, alignment:{horizontal:"center"} };
   const S_OK_NOTA  = { font:{italic:true,sz:10,color:{rgb:"145A32"}}, fill:{patternType:"solid",fgColor:{rgb:"D5F5E3"}}, alignment:{wrapText:true} };
@@ -2987,13 +3534,13 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     if (paisLy && paisDs && paisLy !== paisDs) partes.push(`Se corrigió país ${paisLy} a ${paisDs}`);
     const descLy = String(layoutRow.Descripcion || "").trim();
     const descDs = String(ds["DescripcionMercancia"] || "").trim();
-    if (descLy !== descDs && descDs) partes.push("En Descripción se hizo modificación");
+    if (descLy !== descDs && descDs) partes.push(`Se corrigió descripción "${descLy}" a "${descDs}"`);
     if (a.fracCorr && a.fracOrig) partes.push(`Se corrigió fracción ${a.fracOrig} a ${a.fracCorr}`);
     if (a.secOrig && a.newSec && String(a.secOrig) !== String(a.newSec)) partes.push(`Se corrigió secuencia ${a.secOrig} a ${a.newSec}`);
     return partes.length ? partes.join("; ") : "OK";
   };
 
-  // Filas repetidas (mismo Ped+Frac+Pais+Cant+Val) → pintar amarillo (solo si tienen datos)
+  // Filas repetidas (mismo Ped+Frac+Pais+Cant+Val)  pintar amarillo (solo si tienen datos)
   const keyDup = (row) => `${row.Pedimento}|||${(row.FraccionNico||"").trim()}|||${row.PaisOrigen}|||${row.Cantidad}|||${row.ValorUSD}`;
   const keyCounts = new Map();
   for (const row of layoutRows) {
@@ -3021,7 +3568,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     setCell(ws, hdrRowI, notasModifCol, "Notas (modificaciones)", { font: { bold: true, sz: 10 }, fill: { patternType: "solid", fgColor: { rgb: "E5E7EB" } }, alignment: { wrapText: true } });
   }
 
-  // ── Modificar celdas en el worksheet original ─────────────────────────────
+  //  Modificar celdas en el worksheet original 
   if (ws) {
     for (const row of layoutRows) {
       const a = assignment.get(row._idx);
@@ -3043,7 +3590,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
                         : isOk        ? S_OK_NOTA
                         :               S_NEW_NOTA;
 
-        // SEC CALC — si la sec fue corregida, mostrar "Nueva (antes: Vieja)"
+        // SEC CALC  si la sec fue corregida, mostrar "Nueva (antes: Vieja)"
         let secDisplayVal = newSecVal;
         if (a.secOrig && !isOk) {
           // Escribir solo el número nuevo en la celda (el "antes" va en NOTAS)
@@ -3051,15 +3598,32 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         }
         setCell(ws, r, colIdx.sec, secDisplayVal, styleSec);
 
-        // Fracción corregida (cross-fraction B4)
-        if (isCrossFrac && colIdx.frac >= 0) {
+        // Sincronizar campos maestros con DS (551): Fracción, Descripción y País
+        // En CE, el DS es la referencia final para estos datos.
+        const dsFracOut = getDSFrac(a.dsRow);
+        const dsDescOut = normStr(a.dsRow["DescripcionMercancia"] || "");
+        const dsPaisOut = normStr(a.dsRow["PaisOrigenDestino"] || "");
+        const lyFracOut = normStr(row.FraccionNico || "");
+        const lyDescOut = normStr(row.Descripcion || "");
+        const lyPaisOut = normStr(row.PaisOrigen || "");
+
+        if (colIdx.frac >= 0 && dsFracOut && lyFracOut !== dsFracOut) {
+          setCell(ws, r, colIdx.frac, dsFracOut, S_CORR_FLD);
+        } else if (isCrossFrac && colIdx.frac >= 0) {
+          // Compatibilidad con resaltado histórico de cross-fraction
           setCell(ws, r, colIdx.frac, a.fracCorr, S_FRAC_CORR);
         }
+        if (colIdx.desc >= 0 && dsDescOut && lyDescOut !== dsDescOut) {
+          setCell(ws, r, colIdx.desc, dsDescOut, S_CORR_FLD);
+        }
+        if (colIdx.pais >= 0 && dsPaisOut && lyPaisOut !== dsPaisOut) {
+          setCell(ws, r, colIdx.pais, dsPaisOut, S_CORR_FLD);
+        }
 
-        // NOTAS — incluir "(corregido de X)" si había secuencia previa incorrecta
+        // NOTAS  incluir "(corregido de X)" si había secuencia previa incorrecta
         let notaText = a.reason;
         if (a.secOrig && !isOk && a.secOrig !== String(newSecVal)) {
-          notaText = `⚠ Sec anterior: ${a.secOrig} → Corregida a ${newSecVal} | ${a.reason}`;
+          notaText = ` Sec anterior: ${a.secOrig}  Corregida a ${newSecVal} | ${a.reason}`;
         }
         setCell(ws, r, colIdx.notas, notaText, styleNota);
 
@@ -3080,34 +3644,34 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         setCell(ws, r, colIdx.notas, notaUnmatched, styleAmarilloNota);
         if (cadenaCol >= 0) {
           const cadenaLay = buildCadenaLayout(row);
-          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: —`, S_CADENA_DIFF);
+          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: `, S_CADENA_DIFF);
         }
         if (notasModifCol >= 0) setCell(ws, r, notasModifCol, "OK", styleAmarilloNota);
       } else if (row.SecCalc && String(row.SecCalc).trim() !== "" && String(row.SecCalc).trim() !== "." && !isNaN(parseFloat(String(row.SecCalc)))) {
         // Fila con secuencia existente que NO pudo verificarse ni corregirse
-        // → marcar en naranja oscuro para que el usuario la revise manualmente
+        //  marcar en naranja oscuro para que el usuario la revise manualmente
         const S_SEC_REVISAR  = { font:{bold:true,color:{rgb:"6E2C00"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{horizontal:"center"} };
         const S_NOTA_REVISAR = { font:{italic:true,sz:10,color:{rgb:"6E2C00"}}, fill:{patternType:"solid",fgColor:{rgb:"FDEBD0"}}, alignment:{wrapText:true} };
-        setCell(ws, r, colIdx.sec, `${row.SecCalc} ⚠`, S_SEC_REVISAR);
-        const motivo = a?.reason || `Sec ${row.SecCalc} no coincide con DS — revisar manualmente`;
-        setCell(ws, r, colIdx.notas, `⚠ REVISAR: ${motivo}`, S_NOTA_REVISAR);
+        setCell(ws, r, colIdx.sec, `${row.SecCalc} `, S_SEC_REVISAR);
+        const motivo = a?.reason || `Sec ${row.SecCalc} no coincide con DS  revisar manualmente`;
+        setCell(ws, r, colIdx.notas, ` REVISAR: ${motivo}`, S_NOTA_REVISAR);
         if (cadenaCol >= 0) {
           const cadenaLay = buildCadenaLayout(row);
-          const cadenaDs  = a?.dsRow ? buildCadenaDS(a.dsRow) : "—";
+          const cadenaDs  = a?.dsRow ? buildCadenaDS(a.dsRow) : "";
           setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: ${cadenaDs}`, S_CADENA_DIFF);
         }
         if (notasModifCol >= 0) setCell(ws, r, notasModifCol, buildNotasModifExcel(row, a) || "OK", S_NOTA_REVISAR);
       } else {
         if (cadenaCol >= 0) {
           const cadenaLay = buildCadenaLayout(row);
-          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: —`, S_CADENA_DIFF);
+          setCell(ws, r, cadenaCol, `L: ${cadenaLay}\nDS: `, S_CADENA_DIFF);
         }
         if (notasModifCol >= 0) setCell(ws, r, notasModifCol, "OK", { font: { sz: 10 }, alignment: { wrapText: true } });
       }
     }
   }
 
-  // ── Escribir motivos de no-match en columna REVISADO del DS ──────────────
+  //  Escribir motivos de no-match en columna REVISADO del DS 
   const dsWsOut = workbook.Sheets[dsSheetName];
   const dsRows  = layout2020Data.dsRows;  // las filas del DS con _rowI y _dsIdx
   let revCol    = dsRows?._revisadoCol ?? -1;
@@ -3150,7 +3714,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
         // Fila DS sí fue usada: marcar OK en verde (solo si estaba vacía)
         const existing = dsWsOut[addr];
         if (!existing || !String(existing.v ?? "").trim()) {
-          dsWsOut[addr] = { t: "s", v: "OK — Secuencia verificada/asignada", s: S_REVISADO_OK };
+          dsWsOut[addr] = { t: "s", v: "OK  Secuencia verificada/asignada", s: S_REVISADO_OK };
         }
       }
     }
@@ -3159,7 +3723,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     dsWsOut["!cols"][revCol] = { wch: 80 };
   }
 
-  // ── Construir libro de salida ─────────────────────────────────────────────
+  //  Construir libro de salida 
   const wb = XLSX.utils.book_new();
 
   // Añadir la hoja Layout modificada (referencia al ws ya modificado arriba)
@@ -3178,9 +3742,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     try { XLSX.utils.book_append_sheet(wb, workbook.Sheets[dsSheetName], dsSheetName.slice(0,31)); } catch(_){}
   }
 
-  // ── Hoja Reporte_2020 ─────────────────────────────────────────────────────
+  //  Hoja Reporte_2020 
   const reportRows2020 = [
-    ["REPORTE MÓDULO 2020 — Verificación y Asignación de Secuencias"],
+    ["REPORTE MDULO 2020  Verificación y Asignación de Secuencias"],
     [],
     ["Hoja DS usada", dsSheetName || "DS *"],
     ["Hoja Layout usada", layoutSheetName],
@@ -3190,9 +3754,9 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
     ["Rojo en SEC CALC",  "Secuencia asignada o corregida por la app"],
     [],
     ["LEYENDA DE COLORES"],
-    ["Verde (celda SEC CALC)", "Secuencia verificada — coincide con DS"],
-    ["Rojo (celda SEC CALC)", "Secuencia asignada — Cant±1, Val±4 = DS (sin modificar país/fracción)"],
-    ["Amarillo (celda)", "Fila repetida — mismo Ped+Frac+Pais+Cant+Val que otra(s)"],
+    ["Verde (celda SEC CALC)", "Secuencia verificada  coincide con DS"],
+    ["Rojo (celda SEC CALC)", "Secuencia asignada  Cant±1, Val±4 = DS (sin modificar país/fracción)"],
+    ["Amarillo (celda)", "Fila repetida  mismo Ped+Frac+Pais+Cant+Val que otra(s)"],
     [],
     ["DETALLE POR FILA"],
     ["Pedimento","FraccionNico","PaisOrigen","Cantidad","ValorUSD","SEC CALC anterior","SEC CALC nuevo","Estado","Notas / Razón"],
@@ -3203,7 +3767,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
       row.Pedimento, row.FraccionNico, row.PaisOrigen,
       row.Cantidad, row.ValorUSD,
       row.SecCalc, a?.newSec ?? "",
-      a?.status ?? "—", a?.reason ?? "",
+      a?.status ?? "", a?.reason ?? "",
     ]);
   }
   const wsReport2020 = XLSX.utils.aoa_to_sheet(reportRows2020);
@@ -3213,7 +3777,7 @@ function buildOutput2020Excel(workbook, layoutSheetName, dsSheetName,
   return wb;
 }
 
-// ─── COMPONENTE APP2020 ────────────────────────────────────────────────────────
+//  COMPONENTE APP2020 
 function App2020() {
   const [phase2020, setPhase2020]     = useState("upload");
   const [isDragging2020, setIsDrag2020] = useState(false);
@@ -3226,6 +3790,8 @@ function App2020() {
   const [filterPed2020, setFilterPed2020] = useState("TODOS");
   const [copiedMsg, setCopiedMsg] = useState("");
   const [showInstrucciones2020, setShowInstrucciones2020] = useState(false);
+  const [showUnusedDS2020, setShowUnusedDS2020] = useState(false);
+  const [unusedPasteMsg2020, setUnusedPasteMsg2020] = useState("");
   const inputRef2020 = useRef(null);
 
   const process2020 = useCallback(async (file) => {
@@ -3254,13 +3820,13 @@ function App2020() {
       if (missingDS.length > 0 || missingLy.length > 0) {
         const parts = [];
         if (missingDS.length > 0) {
-          parts.push("Hoja DS — columnas no encontradas:\n" + missingDS.map(m =>
-            `• ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
+          parts.push("Hoja DS  columnas no encontradas:\n" + missingDS.map(m =>
+            ` ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
           ).join("\n\n"));
         }
         if (missingLy.length > 0) {
-          parts.push("Hoja Layout — columnas no encontradas:\n" + missingLy.map(m =>
-            `• ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
+          parts.push("Hoja Layout  columnas no encontradas:\n" + missingLy.map(m =>
+            ` ${m.name}\n  Nómbrela así (o use un alias aceptado): ${m.aceptados.join(", ")}`
           ).join("\n\n"));
         }
         throw new Error(parts.join("\n\n") + "\n\nConsulte «Instrucciones» (botón arriba) para la lista completa de nombres requeridos.");
@@ -3273,7 +3839,7 @@ function App2020() {
         getPedimentosFromRows(layout2020.layoutRows, "Pedimento", "pedimento")
       );
 
-      const { assignment, stats, unusedDS, mismatchReasons, globalTotals: gt2020 } = runCascade2020(layout2020.layoutRows, dsRows);
+      const { assignment, stats, unusedDS, unusedDSDetails, mismatchReasons, globalTotals: gt2020 } = runCascade2020(layout2020.layoutRows, dsRows);
       setProgress2020(80);
 
       const newWb = buildOutput2020Excel(wb, layName, dsName, layout2020, assignment, mismatchReasons);
@@ -3319,14 +3885,17 @@ function App2020() {
 
       // Helper: texto de notas de modificaciones (correcciones) o "OK"
       const buildNotasModificaciones = (layoutRow, a, ds) => {
-        if (!a || a.status === "unmatched" || !ds) return "OK";
+        if (!a) return "Sin evaluación de secuencia para esta fila.";
+        if (a.status === "unmatched" || !ds) {
+          return `Sin match (DS sin cadena para esta fila): ${a.reason || "No se encontró candidato en DS con pedimento/fracción/cantidad/valor compatibles."}`;
+        }
         const partes = [];
         const paisLy  = normT(layoutRow.PaisOrigen || "");
         const paisDs  = normT(ds["PaisOrigenDestino"] || "");
         if (paisLy && paisDs && paisLy !== paisDs) partes.push(`Se corrigió país ${paisLy} a ${paisDs}`);
         const descLy  = String(layoutRow.Descripcion || "").trim();
         const descDs  = String(ds["DescripcionMercancia"] || "").trim();
-        if (descLy !== descDs && descDs) partes.push("En Descripción se hizo modificación");
+        if (descLy !== descDs && descDs) partes.push(`Se corrigió descripción "${descLy}" a "${descDs}"`);
         if (a.fracCorr && a.fracOrig) partes.push(`Se corrigió fracción ${a.fracOrig} a ${a.fracCorr}`);
         if (a.secOrig && a.newSec && String(a.secOrig) !== String(a.newSec)) partes.push(`Se corrigió secuencia ${a.secOrig} a ${a.newSec}`);
         return partes.length ? partes.join("; ") : "OK";
@@ -3376,7 +3945,7 @@ function App2020() {
 
       // Paso 2: calcular sumas por grupo y secuencias involucradas en cada grupo
       const groupSums = new Map();
-      const groupSecuencias = new Map(); // groupKey → [secNueva, secNueva, ...]
+      const groupSecuencias = new Map(); // groupKey  [secNueva, secNueva, ...]
       for (const r of tRowsBase) {
         if (!r.groupKey) continue;
         if (!groupSums.has(r.groupKey)) groupSums.set(r.groupKey, { sumCant: 0, sumVal: 0 });
@@ -3384,7 +3953,7 @@ function App2020() {
         g.sumCant += r.cant;
         g.sumVal  += r.val;
         if (!groupSecuencias.has(r.groupKey)) groupSecuencias.set(r.groupKey, []);
-        groupSecuencias.get(r.groupKey).push(String(r.secNueva || "").trim() || "—");
+        groupSecuencias.get(r.groupKey).push(String(r.secNueva || "").trim() || "");
       }
 
       // Paso 3: añadir totales de grupo, cadena total (grupo sumado vs DS) y secuencias del grupo
@@ -3397,6 +3966,29 @@ function App2020() {
         const cadenaTotalCoincide = (r.dsCant != null && r.dsVal != null && groupSumCant != null && groupSumVal != null)
           && (Math.round(groupSumCant) === Math.round(r.dsCant) && Math.round(groupSumVal) === Math.round(r.dsVal));
         const secuenciasEnGrupo = r.groupKey ? (groupSecuencias.get(r.groupKey) || []) : [];
+        const diffCantGrupo = (r.dsCant != null && groupSumCant != null) ? (groupSumCant - r.dsCant) : null;
+        const diffValGrupo  = (r.dsVal  != null && groupSumVal  != null) ? (groupSumVal  - r.dsVal)  : null;
+        const absDiffCant = diffCantGrupo == null ? null : Math.abs(diffCantGrupo);
+        const absDiffVal  = diffValGrupo  == null ? null : Math.abs(diffValGrupo);
+        const strategy = r.estrategia || "";
+        const isForced = ["B6_relleno","A_forzado","R2","R3","R4","R5","A3b","A2b","A1b"].includes(strategy) || r.status === "new";
+        const fueraRegla = (absDiffCant != null && absDiffCant > 1) || (absDiffVal != null && absDiffVal > 4);
+        const motivoDetallado = (() => {
+          if (r.status === "unmatched") {
+            return `Sin match: ${r.reason || "No se encontró secuencia con reglas del DS."}`;
+          }
+          const partes = [];
+          partes.push(`Estrategia: ${strategy || "N/A"}`);
+          if (!r.cadenaDS) partes.push("DS sin cadena para esta fila (no hubo renglón DS equivalente para comparación 1:1).");
+          if (isForced) partes.push("Asignación de respaldo/forzada para no dejar fila sin secuencia.");
+          if (fueraRegla) {
+            partes.push(`Fuera de regla: �Cant=${diffCantGrupo == null ? "N/A" : diffCantGrupo.toLocaleString("es-MX")} (tol ±1), �USD=${diffValGrupo == null ? "N/A" : diffValGrupo.toFixed(2)} (tol ±4).`);
+          } else {
+            partes.push("Dentro de reglas de tolerancia de comparación por grupo.");
+          }
+          if (r.reason && r.reason !== "Sin match") partes.push(`Motor: ${r.reason}`);
+          return partes.join(" | ");
+        })();
         return {
           ...r,
           groupSumCant,
@@ -3404,13 +3996,38 @@ function App2020() {
           cadenaTotalLayout,
           cadenaTotalCoincide: !!cadenaTotalCoincide,
           secuenciasEnGrupo,
+          diffCantGrupo,
+          diffValGrupo,
+          isForced,
+          fueraRegla,
+          motivoDetallado,
         };
       });
+
+      const secuenciasCompletasAsignadas = (() => {
+        const seen = new Set();
+        for (const r of tRows) {
+          if (r.groupKey && r.status !== "unmatched" && r.cadenaTotalCoincide) {
+            seen.add(r.groupKey);
+          }
+        }
+        return seen.size;
+      })();
 
       setTableData2020(tRows);
       setFilterPed2020("TODOS");
 
-      setResults2020({ stats, unusedDSCount: unusedDS.length, total: layout2020.layoutRows.length, dsName, layName, pedMismatch, globalTotals: gt2020 });
+      setResults2020({
+        stats,
+        unusedDSCount: unusedDS.length,
+        unusedDSDetails: unusedDSDetails || [],
+        total: layout2020.layoutRows.length,
+        secuenciasCompletasAsignadas,
+        dsName,
+        layName,
+        pedMismatch,
+        globalTotals: gt2020
+      });
       setOutputWb2020(newWb);
       setTimeout(() => setPhase2020("results"), 400);
     } catch (e) {
@@ -3434,15 +4051,15 @@ function App2020() {
     a.click(); URL.revokeObjectURL(url);
   };
 
-  const reset2020 = () => { setPhase2020("upload"); setResults2020(null); setOutputWb2020(null); setError2020(null); setProgress2020(0); setTableData2020(null); setFilterPed2020("TODOS"); setCopiedMsg(""); };
+  const reset2020 = () => { setPhase2020("upload"); setResults2020(null); setOutputWb2020(null); setError2020(null); setProgress2020(0); setTableData2020(null); setFilterPed2020("TODOS"); setCopiedMsg(""); setShowUnusedDS2020(false); setUnusedPasteMsg2020(""); };
 
   return (
     <div>
       {/* Botones header */}
       {phase2020 === "results" && (
         <div style={{ display:"flex", gap:8, marginBottom:24 }}>
-          <button onClick={reset2020} style={{ background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"8px 16px",cursor:"pointer",borderRadius:4,fontSize:13 }}>← Nuevo archivo</button>
-          <button onClick={download2020} style={{ background:"#22c55e",border:"none",color:"#0f172a",padding:"8px 20px",cursor:"pointer",borderRadius:4,fontSize:13,fontWeight:800 }}>⬇ Descargar Excel 2020</button>
+          <button onClick={reset2020} style={{ background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"8px 16px",cursor:"pointer",borderRadius:4,fontSize:13 }}> Nuevo archivo</button>
+          <button onClick={download2020} style={{ background:"#22c55e",border:"none",color:"#0f172a",padding:"8px 20px",cursor:"pointer",borderRadius:4,fontSize:13,fontWeight:800 }}> Descargar Excel 2020</button>
         </div>
       )}
 
@@ -3450,10 +4067,10 @@ function App2020() {
         <div style={{ animation:"fadeUp 0.4s ease" }}>
           <div style={{ textAlign:"center", marginBottom:40 }}>
             <div style={{ display:"inline-block",background:"rgba(34,197,94,0.1)",border:"1px solid rgba(34,197,94,0.2)",color:"#22c55e",padding:"4px 14px",borderRadius:20,fontSize:11,letterSpacing:"0.12em",fontFamily:"DM Mono, monospace",marginBottom:16 }}>
-              MULTI-PEDIMENTO · VERIFICACIÓN + ASIGNACIÓN
+              MULTI-PEDIMENTO · VERIFICACIN + ASIGNACIN
             </div>
             <h2 style={{ fontSize:32,fontWeight:900,margin:"0 0 12px",letterSpacing:"-0.02em" }}>
-              Módulo <span style={{color:"#22c55e"}}>DS</span> — Secuencias Multi-Pedimento
+              Módulo <span style={{color:"#22c55e"}}>DS</span>  Secuencias Multi-Pedimento
             </h2>
             <p style={{ color:"#64748b",fontSize:14,maxWidth:520,margin:"0 auto" }}>
               Sube un Excel con hojas <b style={{color:"#22c55e"}}>DS *</b> (Data Stage) y <b style={{color:"#22c55e"}}>Layout *</b>.
@@ -3464,7 +4081,7 @@ function App2020() {
               onClick={() => setShowInstrucciones2020(!showInstrucciones2020)}
               style={{ marginTop:12, background:"transparent", border:"1px solid #334155", color:"#94a3b8", padding:"8px 16px", borderRadius:6, cursor:"pointer", fontSize:13, fontWeight:600 }}
             >
-              {showInstrucciones2020 ? "▼ Ocultar instrucciones" : "📋 Instrucciones — requisitos del Excel"}
+              {showInstrucciones2020 ? " Ocultar instrucciones" : " Instrucciones  requisitos del Excel"}
             </button>
           </div>
 
@@ -3483,6 +4100,7 @@ function App2020() {
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Pedimento2</td><td style={{ padding:"6px 8px" }}>Pedimento2</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Fraccion</td><td style={{ padding:"6px 8px" }}>Fraccion</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>SecuenciaFraccion</td><td style={{ padding:"6px 8px" }}>SecuenciaFraccion</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>SubdivisionFraccion (NICO)</td><td style={{ padding:"6px 8px" }}>SubdivisionFraccion, Subdivision Fraccion, NICO</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>DescripcionMercancia</td><td style={{ padding:"6px 8px" }}>DescripcionMercancia</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>CantidadUMComercial</td><td style={{ padding:"6px 8px" }}>CantidadUMComercial</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>ValorDolares</td><td style={{ padding:"6px 8px" }}>ValorDolares, Valor usd redondeado, ValorAduana, Valor Aduana Estadístico, ValorAgregado</td></tr>
@@ -3502,6 +4120,7 @@ function App2020() {
                     <tbody>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Pedimento</td><td style={{ padding:"6px 8px" }}>Pedimento</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>FraccionNico</td><td style={{ padding:"6px 8px" }}>FraccionNico, fraccionnico</td></tr>
+                      <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>NICO (opcional recomendado)</td><td style={{ padding:"6px 8px" }}>NICO, nico, SubdivisionFraccion, subdivisionfraccion</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>SEC CALC / Secuencia</td><td style={{ padding:"6px 8px" }}>SEC CALC, seccalc, secuenciaped, Secuencia, secuencia, SEC</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>Descripcion</td><td style={{ padding:"6px 8px" }}>descripcion, clase_descripcion, descripcionmercancia</td></tr>
                       <tr style={{ borderBottom:"1px solid #1e293b" }}><td style={{ padding:"6px 8px", fontFamily:"monospace" }}>PaisOrigen</td><td style={{ padding:"6px 8px" }}>pais_origen, paisorigen, paisorigendestino</td></tr>
@@ -3520,7 +4139,7 @@ function App2020() {
 
           {error2020 && (
             <div style={{ background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:4,padding:"12px 18px",marginBottom:20,color:"#fca5a5",fontSize:13,whiteSpace:"pre-wrap",textAlign:"left" }}>
-              ⚠ {error2020}
+               {error2020}
             </div>
           )}
 
@@ -3532,14 +4151,14 @@ function App2020() {
             style={{ border:`2px dashed ${isDragging2020?"#22c55e":"#334155"}`,borderRadius:8,padding:"48px 32px",textAlign:"center",cursor:"pointer",background:isDragging2020?"rgba(34,197,94,0.05)":"transparent",transition:"all 0.2s" }}
           >
             <input ref={inputRef2020} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e => e.target.files[0] && onFile2020(e.target.files[0])} />
-            <div style={{fontSize:40,marginBottom:12}}>📊</div>
+            <div style={{fontSize:40,marginBottom:12}}></div>
             <div style={{color:"#f8fafc",fontSize:16,fontWeight:700,marginBottom:8}}>Sube tu archivo Excel 2020</div>
             <div style={{color:"#94a3b8",fontSize:12}}>Requiere hojas <span style={{color:"#22c55e",fontFamily:"monospace"}}>DS</span> y <span style={{color:"#22c55e",fontFamily:"monospace"}}>Layout</span></div>
           </div>
 
           <div style={{marginTop:28,padding:"18px 20px",background:"rgba(34,197,94,0.05)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:6}}>
             <div style={{color:"#22c55e",fontSize:12,fontWeight:700,marginBottom:10,letterSpacing:"0.08em"}}>LEYENDA DE COLORES EN EL EXCEL DE SALIDA</div>
-            {[["Verde en SEC CALC","Secuencia existente VERIFICADA — coincide con DS"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA (Cant±1, Val±4 = DS)"],["Naranja en SEC CALC ⚠","Secuencia existente NO verificada — revisar manualmente"],["Amarillo en celda","Fila REPETIDA — mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA — Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
+            {[["Verde en SEC CALC","Secuencia existente VERIFICADA  coincide con DS"],["Rojo en SEC CALC","Secuencia NUEVA asignada o CORREGIDA (Cant±1, Val±4 = DS)"],["Naranja en SEC CALC ","Secuencia existente NO verificada  revisar manualmente"],["Amarillo en celda","Fila REPETIDA  mismo Ped+Frac+Pais+Cant+Val (se conservan todas)"],["Morado en celda","Fracción CORREGIDA  Layout tenía fracción diferente al DS (cross-fraction)"]].map(([c,d]) => (
               <div key={c} style={{display:"flex",gap:10,marginBottom:6,fontSize:12}}>
                 <span style={{color:"#22c55e",fontWeight:700,minWidth:180}}>{c}</span>
                 <span style={{color:"#64748b"}}>{d}</span>
@@ -3567,7 +4186,7 @@ function App2020() {
           </div>
           {results2020.pedMismatch && (
             <div style={{background:"rgba(245,158,11,0.12)",border:"1px solid #f59e0b",borderRadius:6,padding:"14px 18px",marginBottom:24,fontSize:13,color:"#fcd34d"}}>
-              <strong>⚠ Pedimentos distintos entre DS y Layout</strong>
+              <strong> Pedimentos distintos entre DS y Layout</strong>
               <p style={{margin:"8px 0 0",color:"#fde68a",lineHeight:1.5}}>
                 El DS tiene pedimentos que no aparecen en el Layout (y viceversa). Por eso no hay match.
                 <br />DS: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results2020.pedMismatch.ds.join(", ")}</code>
@@ -3579,8 +4198,8 @@ function App2020() {
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:32}}>
             {[
               { label:"Verificadas (OK)", value: results2020.stats.verified,    accent:"#22c55e",  sub:"Verde en Excel" },
-              { label:"Corregidas",        value: results2020.stats.corrected,   accent:"#ef4444",  sub:"Rojo — cambio aplicado" },
-              { label:"Nuevas asignadas",  value: results2020.stats.newAssigned, accent:"#f59e0b",  sub:"Rojo — asignación nueva" },
+              { label:"Corregidas",        value: results2020.stats.corrected,   accent:"#ef4444",  sub:"Rojo  cambio aplicado" },
+              { label:"Nuevas asignadas",  value: results2020.stats.newAssigned, accent:"#f59e0b",  sub:"Rojo  asignación nueva" },
               { label:"Sin match",         value: results2020.stats.unmatched,   accent:"#64748b",  sub:"Revisar manualmente" },
             ].map(c => <StatCard key={c.label} label={c.label} value={c.value} sub={c.sub} accent={c.accent} />)}
           </div>
@@ -3599,21 +4218,21 @@ function App2020() {
                 {/* Título cantidad */}
                 <div style={{fontWeight:700, marginBottom:6, fontSize:14,
                   color: cantOk ? "#22c55e" : "#ef4444"}}>
-                  {cantOk ? "✓ Cantidad global coincide — todas las filas serán asignadas"
-                           : "⚠ Cantidad global NO coincide — habrá filas sin asignar"}
+                  {cantOk ? " Cantidad global coincide  todas las filas serán asignadas"
+                           : " Cantidad global NO coincide  habrá filas sin asignar"}
                 </div>
                 {/* Subtítulo valor */}
                 <div style={{marginBottom:12, fontSize:12,
                   color: valOk ? "#86efac" : "#fbbf24"}}>
-                  {valOk ? "✓ Valor USD global también coincide"
-                          : `ℹ Valor USD difiere $${Math.abs(diffV).toFixed(2)} — aceptable por redondeos, las secuencias se asignarán por cantidad`}
+                  {valOk ? " Valor USD global también coincide"
+                          : ` Valor USD difiere $${Math.abs(diffV).toFixed(2)}  aceptable por redondeos, las secuencias se asignarán por cantidad`}
                 </div>
                 <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
                   {[
-                    {label:"DS — Cantidad",      val: fmt(gt.dsCant),        color:"#94a3b8"},
-                    {label:"Layout — Cantidad",  val: fmt(gt.lyCant),        color: cantOk ? "#22c55e" : "#ef4444"},
-                    {label:"DS — Valor USD",     val: `$${fmtV(gt.dsVal)}`,  color:"#94a3b8"},
-                    {label:"Layout — Valor USD", val: `$${fmtV(gt.lyVal)}`,  color: valOk ? "#22c55e" : "#fbbf24"},
+                    {label:"DS  Cantidad",      val: fmt(gt.dsCant),        color:"#94a3b8"},
+                    {label:"Layout  Cantidad",  val: fmt(gt.lyCant),        color: cantOk ? "#22c55e" : "#ef4444"},
+                    {label:"DS  Valor USD",     val: `$${fmtV(gt.dsVal)}`,  color:"#94a3b8"},
+                    {label:"Layout  Valor USD", val: `$${fmtV(gt.lyVal)}`,  color: valOk ? "#22c55e" : "#fbbf24"},
                   ].map(item=>(
                     <div key={item.label}>
                       <div style={{color:"#475569",fontSize:10,fontFamily:"DM Mono, monospace",marginBottom:4}}>{item.label}</div>
@@ -3629,7 +4248,7 @@ function App2020() {
                 )}
                 {!valOk && cantOk && (
                   <div style={{marginTop:10,color:"#fde68a",fontSize:12}}>
-                    Diferencia USD: {diffV > 0 ? "+" : ""}${diffV.toFixed(2)} global — cada secuencia se asigna por cantidad (±1); el valor puede tener pequeñas variaciones de redondeo.
+                    Diferencia USD: {diffV > 0 ? "+" : ""}${diffV.toFixed(2)} global  cada secuencia se asigna por cantidad (±1); el valor puede tener pequeñas variaciones de redondeo.
                   </div>
                 )}
               </div>
@@ -3638,15 +4257,135 @@ function App2020() {
           <div style={{background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:6,padding:"12px 20px",marginBottom:24,fontSize:13,color:"#94a3b8"}}>
             Total filas Layout: <b style={{color:"#f8fafc"}}>{results2020.total}</b> &nbsp;·&nbsp;
             Secuencias DS no usadas: <b style={{color: results2020.unusedDSCount>0?"#ef4444":"#22c55e"}}>{results2020.unusedDSCount}</b>
+            &nbsp;·&nbsp;
+            Secuencias completas asignadas:{" "}
+            <b style={{color:"#22c55e"}} title="Grupos distintos donde la suma de cantidad y valor del Layout coincide con el renglón DS asignado (misma cadena agregada vs DS).">
+              {results2020.secuenciasCompletasAsignadas ?? 0}
+            </b>
           </div>
 
-          {/* ── TABLA IN-APP ───────────────────────────────────────────────── */}
+          {results2020.unusedDSCount > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <div
+                onClick={() => setShowUnusedDS2020(!showUnusedDS2020)}
+                style={{
+                  cursor: "pointer",
+                  background: "rgba(239,68,68,0.08)",
+                  border: "1px solid rgba(239,68,68,0.25)",
+                  borderRadius: 6,
+                  padding: "10px 14px",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  fontSize: 13,
+                  color: "#fecaca"
+                }}
+              >
+                <span><b>Secuencias DS no usadas:</b> detalle y razón probabilística</span>
+                <span style={{ color: "#fda4af" }}>{showUnusedDS2020 ? "\u25B2" : "\u25BC"}</span>
+              </div>
+              {showUnusedDS2020 && (
+                <>
+                  <div
+                    style={{
+                      marginTop: 10,
+                      display: "flex",
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "8px 10px",
+                      background: "rgba(15,23,42,0.6)",
+                      border: "1px solid #3f1d1d",
+                      borderRadius: 6,
+                      borderBottomLeftRadius: 0,
+                      borderBottomRightRadius: 0,
+                      borderBottom: "none"
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const details = results2020?.unusedDSDetails || [];
+                        const raw = details.map((u) => String(u.secuencia ?? "").trim()).filter(Boolean);
+                        const nums = [...new Set(raw)];
+                        nums.sort((a, b) => {
+                          const na = parseFloat(String(a).replace(/,/g, ""));
+                          const nb = parseFloat(String(b).replace(/,/g, ""));
+                          if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+                          return String(a).localeCompare(String(b), "es", { numeric: true });
+                        });
+                        const text = ["Secuencia", ...nums].join(String.fromCharCode(13, 10));
+                        try {
+                          await navigator.clipboard.writeText(text);
+                          setUnusedPasteMsg2020(`${nums.length} secuencia(s) copiadas. Pega en Excel (columna A).`);
+                          setTimeout(() => setUnusedPasteMsg2020(""), 4000);
+                        } catch {
+                          setUnusedPasteMsg2020("No se pudo copiar al portapapeles (permiso del navegador).");
+                          setTimeout(() => setUnusedPasteMsg2020(""), 5000);
+                        }
+                      }}
+                      style={{
+                        background: "#22c55e",
+                        color: "#0f172a",
+                        border: "none",
+                        borderRadius: 4,
+                        padding: "8px 14px",
+                        fontSize: 12,
+                        fontWeight: 700,
+                        cursor: "pointer"
+                      }}
+                    >
+                      Copiar lista de secuencias para Excel
+                    </button>
+                    <span style={{ fontSize: 11, color: "#94a3b8", maxWidth: 420, lineHeight: 1.4 }}>
+                      Una fila por número (encabezado &quot;Secuencia&quot;). Incluye todas las no usadas, no solo las visibles en la tabla.
+                    </span>
+                    {unusedPasteMsg2020 ? (
+                      <span style={{ fontSize: 12, color: "#86efac", fontWeight: 600 }}>{unusedPasteMsg2020}</span>
+                    ) : null}
+                  </div>
+                <div style={{ marginTop: 0, border: "1px solid #3f1d1d", borderRadius: 6, borderTopLeftRadius: 0, borderTopRightRadius: 0, overflowX: "auto", maxHeight: 320, overflowY: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead style={{ position: "sticky", top: 0, background: "#2b1212" }}>
+                      <tr>
+                        {["Sec", "Pedimento", "Fracción", "País", "Cant DS", "Valor DS", "Razón", "Probable vínculo Layout"].map(h => (
+                          <th key={h} style={{ textAlign: "left", padding: "8px 10px", color: "#fca5a5", borderBottom: "1px solid #3f1d1d", fontFamily: "DM Mono, monospace", fontSize: 10 }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(results2020.unusedDSDetails || []).slice(0, 250).map((u, i) => (
+                        <tr key={`${u.dsIdx}-${i}`} style={{ borderTop: "1px solid #2b1414" }}>
+                          <td style={{ padding: "7px 10px", color: "#f87171", fontFamily: "monospace" }}>{u.secuencia || "\u2014"}</td>
+                          <td style={{ padding: "7px 10px", color: "#e2e8f0" }}>{u.pedimento || "\u2014"}</td>
+                          <td style={{ padding: "7px 10px", color: "#f59e0b" }}>{u.fraccion || "\u2014"}</td>
+                          <td style={{ padding: "7px 10px", color: "#94a3b8" }}>{u.pais || "\u2014"}</td>
+                          <td style={{ padding: "7px 10px", color: "#94a3b8", fontFamily: "monospace" }}>{Number(u.cantidadDS || 0).toLocaleString("es-MX")}</td>
+                          <td style={{ padding: "7px 10px", color: "#94a3b8", fontFamily: "monospace" }}>${Number(u.valorDS || 0).toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                          <td style={{ padding: "7px 10px", color: "#fecaca", lineHeight: 1.4, maxWidth: 360 }}>{u.razon || "Sin razón calculada"}</td>
+                          <td style={{ padding: "7px 10px", color: "#fde68a", lineHeight: 1.4, maxWidth: 320 }}>{u.probable || "Sin candidato probable en Layout"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {(results2020.unusedDSDetails || []).length > 250 && (
+                    <div style={{ padding: "8px 10px", color: "#fca5a5", fontSize: 11 }}>
+                      ... y {(results2020.unusedDSDetails || []).length - 250} secuencias DS no usadas adicionales (ver columna REVISADO en el Excel).
+                    </div>
+                  )}
+                </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/*  TABLA IN-APP  */}
           {tableData2020 && (() => {
             const pedList = ["TODOS", ...Array.from(new Set(tableData2020.map(r => r.ped).filter(Boolean))).sort()];
             const filtered = filterPed2020 === "TODOS" ? tableData2020 : tableData2020.filter(r => r.ped === filterPed2020);
 
             const statusColor = s => s === "ok" ? "#22c55e" : s === "new" ? "#f59e0b" : s === "corrected" ? "#fb923c" : "#ef4444";
-            const statusLabel = s => s === "ok" ? "OK" : s === "new" ? "NUEVA" : s === "corrected" ? "CORR" : "—";
+            const statusLabel = s => s === "ok" ? "OK" : s === "new" ? "NUEVA" : s === "corrected" ? "CORR" : "";
             const rowBg       = s => s === "ok" ? "rgba(34,197,94,0.06)" : s === "new" ? "rgba(245,158,11,0.07)" : s === "corrected" ? "rgba(251,146,60,0.07)" : "rgba(239,68,68,0.07)";
 
             const nDescCmp = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -3659,7 +4398,7 @@ function App2020() {
               const absDiff = Math.abs(diff);
               const lbl     = Number(r.cant).toLocaleString("es-MX");
               if (absDiff <= 1) return { color:"#22c55e", label: lbl };
-              // Cualquier diferencia > 1 en cantidad es problema — mostrar en rojo con el delta
+              // Cualquier diferencia > 1 en cantidad es problema  mostrar en rojo con el delta
               return { color:"#ef4444", label: `${lbl} (${diff>0?"+":""}${diff.toLocaleString("es-MX")})` };
             };
             const valInfo = r => {
@@ -3681,19 +4420,20 @@ function App2020() {
               if (!r.dsDesc) return { color:"#94a3b8", label: r.desc };
               const match = nDescCmp(r.desc) === nDescCmp(r.dsDesc);
               if (match) return { color:"#22c55e", label: r.desc };
-              return { color:"#fbbf24", label: r.desc, sub: `DS: ${r.dsDesc.slice(0,60)}${r.dsDesc.length>60?"…":""}` };
+              return { color:"#fbbf24", label: r.desc, sub: `DS: ${r.dsDesc.slice(0,60)}${r.dsDesc.length>60?"":""}` };
             };
 
             const copyTSV = () => {
-              const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tCadena (L vs DS)\tCadena total (grupo vs DS)\tSecuencias en grupo\tEstado\tNotas";
+              const hdr = "SEC CALC\tPedimento\tFraccion\tPais\tDescripcion\tCantidad\tValor USD\tCadena (L vs DS)\tCadena total (grupo vs DS)\tSecuencias en grupo\tEstado\tNotas\tMotivo detallado";
               const body = filtered.map(r => [
                 r.secNueva, r.ped, r.frac, r.pais,
                 r.desc, r.cant, r.val.toFixed(2),
-                (r.cadenaLayout ? `L: ${r.cadenaLayout} | DS: ${r.cadenaDS || "—"}` : ""),
-                (r.cadenaTotalLayout ? `L(total): ${r.cadenaTotalLayout} | DS: ${r.cadenaDS || "—"}${r.cadenaTotalCoincide ? " ✓ grupo" : ""}` : "—"),
-                (r.secuenciasEnGrupo?.length ? (() => { const c={}; for (const s of r.secuenciasEnGrupo) { const v=s||"—"; c[v]=(c[v]||0)+1; } return Object.entries(c).map(([sec,n]) => n>1 ? `${sec} (se repite ${n})` : sec).join("; "); })() : "—"),
+                (r.cadenaLayout ? `L: ${r.cadenaLayout} | DS: ${r.cadenaDS || ""}` : ""),
+                (r.cadenaTotalLayout ? `L(total): ${r.cadenaTotalLayout} | DS: ${r.cadenaDS || ""}${r.cadenaTotalCoincide ? "  grupo" : ""}` : ""),
+                (r.secuenciasEnGrupo?.length ? (() => { const c={}; for (const s of r.secuenciasEnGrupo) { const v=s||""; c[v]=(c[v]||0)+1; } return Object.entries(c).map(([sec,n]) => n>1 ? `${sec} (se repite ${n})` : sec).join("; "); })() : ""),
                 statusLabel(r.status),
-                r.notasModificaciones ?? "OK"
+                r.notasModificaciones ?? "OK",
+                r.motivoDetallado ?? ""
               ].join("\t")).join("\n");
               navigator.clipboard.writeText(hdr + "\n" + body).then(() => {
                 setCopiedMsg("¡Tabla copiada! Pega en Excel con Ctrl+V");
@@ -3756,7 +4496,7 @@ function App2020() {
                   </select>
                   {/* Botón copiar tabla */}
                   <button onClick={copyTSV} style={{background:"#1e40af",border:"none",color:"#bfdbfe",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
-                    📋 Copiar tabla (Excel)
+                     Copiar tabla (Excel)
                   </button>
                   {/* Botón copiar solo SECs */}
                   <button onClick={copySecs} style={{background:"#14532d",border:"none",color:"#86efac",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
@@ -3764,21 +4504,21 @@ function App2020() {
                   </button>
                   {/* Botón copiar países */}
                   <button onClick={copyPaises} style={{background:"#78350f",border:"none",color:"#fde68a",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
-                    🌐 Copiar países
+                     Copiar países
                   </button>
                   {/* Botón copiar fracciones corregidas */}
                   <button onClick={copyFracciones} style={{background:"#581c87",border:"none",color:"#e9d5ff",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
-                    📐 Copiar fracciones
+                     Copiar fracciones
                   </button>
                   {/* Botón copiar descripciones corregidas */}
                   <button onClick={copyDescripciones} style={{background:"#4c1d95",border:"none",color:"#c4b5fd",padding:"6px 14px",cursor:"pointer",borderRadius:4,fontSize:12,fontWeight:700}}>
-                    📝 Copiar descripciones
+                     Copiar descripciones
                   </button>
                 </div>
 
                 {/* Leyenda comparación */}
                 <div style={{display:"flex",gap:16,flexWrap:"wrap",marginBottom:10,fontSize:11,color:"#64748b"}}>
-                  {[["#22c55e","Cant ±1 / Val ±1 (correcto)"],["#f97316","Val ±2 a ±4 (aceptable)"],["#ef4444","Cant >1 o Val >4 (fuera de tolerancia)"],["#fbbf24","País/Desc distinto al DS"]].map(([c,t])=>(
+                  {[["#22c55e","Cant ±1 / Val ±1 (correcto)"],["#f97316","Val ±2 a ±4 (aceptable)"],["#ef4444","Cant >1 o Val >4 (fuera de tolerancia)"],["#fbbf24","País/Desc distinto al DS"],["#a855f7","Asignación forzada/respaldo"]].map(([c,t])=>(
                     <span key={t}><span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:c,marginRight:4}} />{t}</span>
                   ))}
                 </div>
@@ -3786,16 +4526,16 @@ function App2020() {
                 {/* Mensaje de copiado */}
                 {copiedMsg && (
                   <div style={{background:"rgba(34,197,94,0.15)",border:"1px solid #22c55e",borderRadius:4,padding:"8px 14px",marginBottom:10,color:"#86efac",fontSize:12}}>
-                    ✓ {copiedMsg}
+                     {copiedMsg}
                   </div>
                 )}
 
-                {/* Tabla — scroll horizontal para ver cadenas completas */}
+                {/* Tabla  scroll horizontal para ver cadenas completas */}
                 <div style={{overflowX:"auto",overflowY:"auto",borderRadius:6,border:"1px solid #1e293b",maxHeight:500,WebkitOverflowScrolling:"touch"}}>
                   <table style={{width:"100%",minWidth:1200,borderCollapse:"collapse",fontSize:12,fontFamily:"DM Mono, monospace"}}>
                     <thead>
                       <tr style={{background:"#0f172a",position:"sticky",top:0,zIndex:2}}>
-                        {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Cadena (L vs DS)","Cadena total (grupo vs DS)","Secuencias en grupo","Estado","Notas"].map(h => (
+                        {["SEC CALC","Pedimento","Fracción","País","Descripción","Cantidad","Valor USD","Cadena (L vs DS)","Cadena total (grupo vs DS)","Secuencias en grupo","Estado","Notas","Motivo detallado"].map(h => (
                           <th key={h} style={{padding:"8px 10px",textAlign:["Cantidad","Valor USD"].includes(h)?"right":"left",color:"#64748b",fontWeight:700,borderBottom:"1px solid #1e293b",whiteSpace:"nowrap",fontSize:11}}>{h}</th>
                         ))}
                       </tr>
@@ -3808,9 +4548,9 @@ function App2020() {
                         const di = descInfo(r);
                         return (
                           <tr key={r.idx} style={{background:rowBg(r.status),borderBottom:"1px solid rgba(30,41,59,0.8)"}}>
-                            {/* SEC CALC — muestra sec anterior si fue corregida */}
+                            {/* SEC CALC  muestra sec anterior si fue corregida */}
                             <td style={{padding:"6px 10px",fontWeight:900,fontSize:14,color:statusColor(r.status),minWidth:80}}>
-                              {r.secNueva || <span style={{color:"#475569"}}>—</span>}
+                              {r.secNueva || <span style={{color:"#475569"}}></span>}
                               {r.secPrevCorr && r.secPrevCorr !== r.secNueva && (
                                 <div style={{fontSize:10,fontWeight:400,color:"#f97316",marginTop:2}}>
                                   antes: {r.secPrevCorr}
@@ -3818,7 +4558,7 @@ function App2020() {
                               )}
                             </td>
                             <td style={{padding:"6px 10px",color:"#cbd5e1",whiteSpace:"nowrap"}}>{r.ped.slice(-6)}</td>
-                            {/* Fracción — morado si fue corregida cross-fraction */}
+                            {/* Fracción  morado si fue corregida cross-fraction */}
                             <td style={{padding:"6px 10px",minWidth:80}}>
                               {r.fracCorr ? (
                                 <span title={`Fracción original en Layout: ${r.fracOrig}`}>
@@ -3829,53 +4569,53 @@ function App2020() {
                                 <span style={{color:"#cbd5e1"}}>{r.frac}</span>
                               )}
                             </td>
-                            {/* País — verde si coincide, amarillo si difiere */}
+                            {/* País  verde si coincide, amarillo si difiere */}
                             <td style={{padding:"6px 10px",minWidth:60}}>
-                              <span style={{color:pi.color,fontWeight:pi.sub?700:400}}>{r.pais||"—"}</span>
+                              <span style={{color:pi.color,fontWeight:pi.sub?700:400}}>{r.pais||""}</span>
                               {pi.sub && <div style={{color:"#fbbf24",fontSize:10,opacity:0.8}}>{pi.sub}</div>}
                             </td>
-                            {/* Descripción — verde si coincide, amarillo si difiere */}
+                            {/* Descripción  verde si coincide, amarillo si difiere */}
                             <td style={{padding:"6px 10px",maxWidth:260}} title={r.desc}>
                               <div style={{color:di.color,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                                {r.desc.slice(0,55)}{r.desc.length>55?"…":""}
+                                {r.desc.slice(0,55)}{r.desc.length>55?"":""}
                               </div>
                               {di.sub && <div style={{color:"#fbbf24",fontSize:10,opacity:0.8,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{di.sub}</div>}
                             </td>
-                            {/* Cantidad — color según diferencia grupo vs DS */}
+                            {/* Cantidad  color según diferencia grupo vs DS */}
                             <td style={{padding:"6px 10px",textAlign:"right",color:ci.color,fontWeight:600,whiteSpace:"nowrap"}}>{ci.label}</td>
-                            {/* Valor USD — color según diferencia grupo vs DS */}
+                            {/* Valor USD  color según diferencia grupo vs DS */}
                             <td style={{padding:"6px 10px",textAlign:"right",color:vi.color,fontWeight:600,whiteSpace:"nowrap"}}>{vi.label}</td>
-                            {/* Cadena Layout vs DS — siempre muestra L y DS cuando hay secuencia; verde si coinciden, naranja si no */}
-                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A3222":"#92400E22") : "#1e293b",color:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A32":"#92400E") : "#64748b",borderLeft:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"2px solid #22c55e":"2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={`Layout: ${r.cadenaLayout}\nDS: ${r.cadenaDS||"—"}`}>
+                            {/* Cadena Layout vs DS  siempre muestra L y DS cuando hay secuencia; verde si coinciden, naranja si no */}
+                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A3222":"#92400E22") : "#1e293b",color:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"#145A32":"#92400E") : "#64748b",borderLeft:(r.secNueva || r.cadenaDS) ? (r.cadenaCoincide?"2px solid #22c55e":"2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={`Layout: ${r.cadenaLayout}\nDS: ${r.cadenaDS||""}`}>
                               <>
                                 <div style={{fontWeight:600}}>L: {r.cadenaLayout}</div>
-                                <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || "—"}</div>
-                                {r.cadenaCoincide && (r.secNueva || r.cadenaDS) && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}>✓ Coinciden</div>}
+                                <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || ""}</div>
+                                {r.cadenaCoincide && (r.secNueva || r.cadenaDS) && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}> Coinciden</div>}
                               </>
                             </td>
-                            {/* Cadena total (grupo vs DS): cuando hay varias líneas, suma del grupo vs DS — verde si coinciden totales, naranja si no */}
-                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A3222" : "#92400E22") : "transparent",color:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A32" : "#92400E") : "#64748b",borderLeft:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "2px solid #22c55e" : "2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={r.cadenaTotalLayout ? `L (total grupo): ${r.cadenaTotalLayout}\nDS: ${r.cadenaDS||"—"}` : ""}>
+                            {/* Cadena total (grupo vs DS): cuando hay varias líneas, suma del grupo vs DS  verde si coinciden totales, naranja si no */}
+                            <td style={{padding:"6px 10px",minWidth:280,maxWidth:380,fontSize:10,background:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A3222" : "#92400E22") : "transparent",color:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "#145A32" : "#92400E") : "#64748b",borderLeft:(r.cadenaTotalLayout && !r.cadenaCoincide) ? (r.cadenaTotalCoincide ? "2px solid #22c55e" : "2px solid #f97316") : "1px solid #334155",whiteSpace:"pre-wrap",wordBreak:"break-all"}} title={r.cadenaTotalLayout ? `L (total grupo): ${r.cadenaTotalLayout}\nDS: ${r.cadenaDS||""}` : ""}>
                               {r.cadenaCoincide ? (
-                                <span style={{color:"#64748b",fontSize:10}}>—</span>
+                                <span style={{color:"#64748b",fontSize:10}}></span>
                               ) : r.cadenaTotalLayout ? (
                                 <>
                                   <div style={{fontWeight:600}}>L (total): {r.cadenaTotalLayout}</div>
-                                  <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || "—"}</div>
-                                  {r.cadenaTotalCoincide && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}>✓ Coincide a nivel grupo</div>}
+                                  <div style={{marginTop:2,opacity:0.9}}>DS: {r.cadenaDS || ""}</div>
+                                  {r.cadenaTotalCoincide && <div style={{marginTop:4,fontSize:9,color:"#22c55e",fontWeight:700}}> Coincide a nivel grupo</div>}
                                 </>
                               ) : (
-                                <span style={{color:"#64748b"}}>—</span>
+                                <span style={{color:"#64748b"}}></span>
                               )}
                             </td>
                             {/* Secuencias involucradas en el grupo: valor único con "(se repite N)" en vez de repetir */}
                             <td style={{padding:"6px 10px",minWidth:120,fontSize:11,color:"#94a3b8",whiteSpace:"pre-wrap",wordBreak:"break-word"}} title={r.secuenciasEnGrupo?.length ? `Secuencias en este grupo: ${r.secuenciasEnGrupo.join(", ")}` : ""}>
                               {r.secuenciasEnGrupo?.length ? (() => {
                                 const countBy = {};
-                                for (const s of r.secuenciasEnGrupo) { const v = s || "—"; countBy[v] = (countBy[v] || 0) + 1; }
+                                for (const s of r.secuenciasEnGrupo) { const v = s || ""; countBy[v] = (countBy[v] || 0) + 1; }
                                 const txt = Object.entries(countBy).map(([sec, n]) => n > 1 ? `${sec} (se repite ${n})` : sec).join("; ");
                                 return <div style={{fontWeight:600,color:"#cbd5e1"}}>{txt}</div>;
                               })() : (
-                                <span style={{color:"#64748b"}}>—</span>
+                                <span style={{color:"#64748b"}}></span>
                               )}
                             </td>
                             <td style={{padding:"6px 10px"}}>
@@ -3886,6 +4626,10 @@ function App2020() {
                             {/* Notas: correcciones (país, descripción, fracción, secuencia) o OK */}
                             <td style={{padding:"6px 10px",minWidth:180,maxWidth:320,fontSize:11,color:"#94a3b8",whiteSpace:"pre-wrap",wordBreak:"break-word"}} title={r.notasModificaciones}>
                               {r.notasModificaciones}
+                            </td>
+                            {/* Motivo detallado: incluye si fue forzada y si excede tolerancias */}
+                            <td style={{padding:"6px 10px",minWidth:300,maxWidth:450,fontSize:10,color:r.fueraRegla?"#fca5a5":"#cbd5e1",whiteSpace:"pre-wrap",wordBreak:"break-word"}} title={r.motivoDetallado}>
+                              {r.motivoDetallado}
                             </td>
                           </tr>
                         );
@@ -3908,7 +4652,7 @@ function App2020() {
   );
 }
 
-// ─── MAIN APP ────────────────────────────────────────────────────────────────
+//  MAIN APP 
 export default function App() {
   const [activeTab, setActiveTab] = useState("551"); // "551" | "2020"
   const [phase, setPhase] = useState("upload"); // upload | processing | results
@@ -3918,6 +4662,7 @@ export default function App() {
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState(null);
   const [showUnmatched, setShowUnmatched] = useState(false);
+  const [showCruce, setShowCruce] = useState(true);
   const [activeStrategy, setActiveStrategy] = useState(null);
   const [progress, setProgress] = useState(0);
 
@@ -3932,31 +4677,35 @@ export default function App() {
       setProgress(20);
       const wb = XLSX.read(buf, { type: "array" });
 
-      if (!wb.SheetNames.includes("Layout")) {
-        throw new Error('El archivo debe contener la hoja "Layout"');
+      const layoutName = resolveLayoutSheetName(wb);
+      if (!layoutName) {
+        throw new Error('El archivo debe contener una hoja "Layout" (sin importar mayúsculas).');
       }
       const sheet551Name = resolve551SheetName(wb);
       if (!sheet551Name) {
-        throw new Error('El archivo debe contener una hoja "551" o "Data Stage" (datos del pedimento)');
+        throw new Error('El archivo debe contener una hoja "551", "DS" o "Data Stage" (datos del pedimento)');
       }
 
       setProgress(40);
-      const layoutRows = readLayoutSheet(wb.Sheets["Layout"]);
+      const layoutRows = readLayoutSheet(wb.Sheets[layoutName]);
       const s551Rows   = read551Sheet(wb.Sheets[sheet551Name]);
       setProgress(60);
 
-      const pedMismatch551 = checkPedimentoMismatch(
-        getPedimentosFromRows(s551Rows, "Pedimento"),
-        getPedimentosFromRows(layoutRows, "Pedimento", "pedimento")
-      );
+      const dsKeys = [...new Set(s551Rows.map((r) => pedCruceKey(r.Pedimento2 || r.Pedimento)).filter(Boolean))];
+      const lyKeys = [...new Set(layoutRows.map((r) => pedCruceKey(r.Pedimento || r.pedimento || r.pedimento1)).filter(Boolean))];
+      const inters = dsKeys.filter((k) => lyKeys.includes(k));
+      const pedMismatch551 = inters.length === 0 && dsKeys.length > 0 && lyKeys.length > 0
+        ? { ds: dsKeys.slice(0, 5), layout: lyKeys.slice(0, 5) }
+        : null;
 
       const { assignment, strategyStats, unmatchedFinal, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap } = runCascade(layoutRows, s551Rows);
       setProgress(80);
 
-      const newWb = buildOutputExcel(wb, wb.Sheets["Layout"], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap);
+      const newWb = buildOutputExcel(wb, wb.Sheets[layoutName], wb.Sheets[sheet551Name], sheet551Name, assignment, unmatchedFinal, strategyStats, total, rowNotes, cruceData, orphan551Rows, correctionMap, globalTotals, rowMatchMap, layoutName);
       setProgress(100);
 
-      setResults({ strategyStats, unmatchedFinal, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals, pedMismatch: pedMismatch551 });
+      const alertasCruce = (cruceData || []).filter((d) => d.tipo === "matched" && (d.severidad === "alta" || d.severidad === "media")).length;
+      setResults({ strategyStats, unmatchedFinal, cruceData, total, orphan551Count: orphan551Rows.length, correctionCount: correctionMap.size, globalTotals, pedMismatch: pedMismatch551, alertasCruce, rowMatchMap });
       setOutputWb(newWb);
 
       setTimeout(() => setPhase("results"), 400);
@@ -3977,6 +4726,7 @@ export default function App() {
     setOutputWb(null);
     setError(null);
     setProgress(0);
+    setShowCruce(true);
   };
 
   const matched = results ? results.total - results.unmatchedFinal.length : 0;
@@ -4020,7 +4770,7 @@ export default function App() {
             width: 36, height: 36, background: "#f59e0b",
             display: "flex", alignItems: "center", justifyContent: "center",
             fontSize: 18, borderRadius: 4, flexShrink: 0,
-          }}>🛃</div>
+          }}></div>
           <div>
             <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: "-0.01em", color: "#f8fafc" }}>
               LCK consultores
@@ -4053,7 +4803,7 @@ export default function App() {
                   borderRadius: 4, fontSize: 13, fontFamily: "Syne, sans-serif",
                 }}
               >
-                ← Nuevo archivo
+                 Nuevo archivo
               </button>
               <button
                 className="dl-btn"
@@ -4065,7 +4815,7 @@ export default function App() {
                   transition: "background 0.2s",
                 }}
               >
-                ⬇ Descargar Excel
+                 Descargar Excel
               </button>
             </>
           )}
@@ -4074,10 +4824,10 @@ export default function App() {
 
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "40px 24px" }}>
 
-        {/* MÓDULO DS */}
+        {/* MDULO DS */}
         {activeTab === "2020" && <App2020 />}
 
-        {/* MÓDULO 551 — original */}
+        {/* MDULO 551  original */}
         {activeTab === "551" && <>
 
         {/* UPLOAD PHASE */}
@@ -4116,7 +4866,7 @@ export default function App() {
                 background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)",
                 borderRadius: 4, padding: "12px 16px", marginBottom: 20, color: "#fca5a5", fontSize: 13,
               }}>
-                ⚠ {error}
+                 {error}
               </div>
             )}
 
@@ -4125,7 +4875,7 @@ export default function App() {
             {/* Strategy cards */}
             <div style={{ marginTop: 48 }}>
               <div style={{ color: "#475569", fontSize: 11, letterSpacing: "0.1em", marginBottom: 20, fontFamily: "DM Mono, monospace" }}>
-                METODOLOGÍA DE COINCIDENCIA — CASCADA DE 5 ESTRATEGIAS
+                METODOLOGÍA DE COINCIDENCIA  CASCADA DE 5 ESTRATEGIAS
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12 }}>
                 {STRATEGIES.map((s) => (
@@ -4168,7 +4918,7 @@ export default function App() {
               margin: "0 auto 32px",
               animation: "spin 0.8s linear infinite",
             }} />
-            <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 8 }}>Procesando archivo…</div>
+            <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 8 }}>Procesando archivo</div>
             <div style={{ color: "#475569", fontSize: 13, marginBottom: 32 }}>{fileName}</div>
             <div style={{ maxWidth: 400, margin: "0 auto" }}>
               <div style={{ background: "#1e293b", borderRadius: 2, height: 4, overflow: "hidden" }}>
@@ -4189,7 +4939,7 @@ export default function App() {
           <div style={{ animation: "fadeUp 0.5s ease" }}>
             {results.pedMismatch && (
               <div style={{background:"rgba(245,158,11,0.12)",border:"1px solid #f59e0b",borderRadius:6,padding:"14px 18px",marginBottom:24,fontSize:13,color:"#fcd34d"}}>
-                <strong>⚠ Pedimentos distintos entre 551 y Layout</strong>
+                <strong> Pedimentos distintos entre 551 y Layout</strong>
                 <p style={{margin:"8px 0 0",color:"#fde68a",lineHeight:1.5}}>
                   El 551 tiene pedimentos que no aparecen en el Layout (y viceversa). Por eso no hay match.
                   <br />551: <code style={{background:"rgba(0,0,0,0.2)",padding:"2px 6px",borderRadius:3}}>{results.pedMismatch.ds.join(", ")}</code>
@@ -4204,12 +4954,13 @@ export default function App() {
                 {fileName} · {results.total} filas procesadas
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))", gap: 12 }}>
-                <StatCard label="Éxito global" value={`${pct}%`} sub={`${matched} de ${results.total} filas`} accent="#f59e0b" />
+                <StatCard label="xito global" value={`${pct}%`} sub={`${matched} de ${results.total} filas`} accent="#f59e0b" />
                 <StatCard label="Filas asignadas" value={matched} sub="SecuenciaPed actualizada" accent="#22c55e" />
                 <StatCard label="Sin match" value={results.unmatchedFinal.length} sub="Revisión manual" accent={results.unmatchedFinal.length > 0 ? "#ef4444" : "#22c55e"} />
                 <StatCard label="Correcciones" value={results.correctionCount || 0} sub="Campos ajustados por 551" accent={(results.correctionCount || 0) > 0 ? "#f97316" : "#22c55e"} />
                 <StatCard label="Sec. 551 sin asignar" value={results.orphan551Count || 0} sub="Al final del Layout" accent={(results.orphan551Count || 0) > 0 ? "#3b82f6" : "#22c55e"} />
                 <StatCard label="Estrategias activas" value={Object.values(results.strategyStats).filter((v) => v > 0).length} sub="de 15 disponibles" accent="#a855f7" />
+                <StatCard label="Alertas de cruce" value={results.alertasCruce ?? 0} sub=" grande o respaldo" accent={(results.alertasCruce ?? 0) > 0 ? "#f97316" : "#22c55e"} />
               </div>
             </div>
 
@@ -4226,14 +4977,14 @@ export default function App() {
                   borderRadius: 4, padding: "20px 28px", marginBottom: 20,
                 }}>
                   <div style={{ color: "#94a3b8", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 14 }}>
-                    BALANCE GLOBAL — LAYOUT vs 551
+                    BALANCE GLOBAL  LAYOUT vs 551
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
                     {[
-                      { label: "Layout — Cantidad total", val: gt.layoutCant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
-                      { label: "551 — Cantidad total", val: gt.s551Cant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
-                      { label: "Layout — Valor USD total", val: `$${gt.layoutVCUSD.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
-                      { label: "551 — Valor USD total", val: `$${gt.s551Val.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
+                      { label: "Layout  Cantidad total", val: gt.layoutCant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
+                      { label: "551  Cantidad total", val: gt.s551Cant.toLocaleString("es-MX", {maximumFractionDigits: 0}), color: "#94a3b8" },
+                      { label: "Layout  Valor USD total", val: `$${gt.layoutVCUSD.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
+                      { label: "551  Valor USD total", val: `$${gt.s551Val.toLocaleString("es-MX", {maximumFractionDigits: 2})}`, color: "#94a3b8" },
                     ].map((item) => (
                       <div key={item.label}>
                         <div style={{ color: "#475569", fontSize: 10, fontFamily: "DM Mono, monospace", marginBottom: 4 }}>{item.label}</div>
@@ -4259,12 +5010,67 @@ export default function App() {
                       color: balanced ? "#22c55e" : "#f59e0b",
                       padding: "3px 12px", borderRadius: 20, fontSize: 11, fontFamily: "DM Mono, monospace",
                     }}>
-                      {balanced ? "✓ BALANCE EXACTO" : "⚠ TOTALES DIFIEREN — revisar pedimentos faltantes"}
+                      {balanced ? " BALANCE EXACTO" : " TOTALES DIFIEREN  revisar pedimentos faltantes"}
                     </span>
                   </div>
                 </div>
               );
             })()}
+
+            {results.cruceData && results.cruceData.length > 0 && (
+              <div style={{ marginBottom: 20 }}>
+                <div
+                  onClick={() => setShowCruce(!showCruce)}
+                  style={{
+                    padding: "12px 16px", cursor: "pointer", marginBottom: showCruce ? 10 : 0,
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    background: "rgba(30,64,175,0.2)", border: "1px solid #334155", borderRadius: 4,
+                  }}
+                >
+                  <div>
+                    <span style={{ color: "#f8fafc", fontWeight: 800, fontSize: 13 }}>Motivos de asignación o sin asignar (cruce Layout vs 551)</span>
+                    <span style={{ color: "#64748b", fontSize: 12, marginLeft: 12 }}>{results.cruceData.length} grupos · {results.alertasCruce ?? 0} con alerta</span>
+                  </div>
+                  <span style={{ color: "#94a3b8" }}>{showCruce ? "" : ""}</span>
+                </div>
+                {showCruce && (
+                  <div style={{ overflowX: "auto", border: "1px solid #1e293b", borderRadius: 4, maxHeight: 420, overflowY: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                      <thead style={{ position: "sticky", top: 0, background: "#1e293b" }}>
+                        <tr>
+                          {["Tipo", "Estrat.", "Ped.", "Fracc. L", "Sec.", " cant", " $", "Motivo / nota"].map((h) => (
+                            <th key={h} style={{ padding: "8px 10px", textAlign: "left", color: "#94a3b8", fontFamily: "DM Mono, monospace", fontSize: 9, textTransform: "uppercase" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.cruceData.slice(0, 200).map((d, i) => {
+                          const sev = d.severidad;
+                          const bg = d.tipo === "unmatched" ? "rgba(127,29,29,0.2)"
+                            : sev === "alta" ? "rgba(194,65,12,0.2)"
+                            : sev === "media" ? "rgba(30,64,175,0.2)" : "transparent";
+                          return (
+                            <tr key={i} style={{ borderTop: "1px solid #1e293b", background: bg }}>
+                              <td style={{ padding: "6px 10px", color: d.tipo === "unmatched" ? "#f87171" : "#22c55e" }}>{d.tipo === "unmatched" ? "Sin" : "OK"}</td>
+                              <td style={{ padding: "6px 10px", color: "#f8fafc", fontFamily: "monospace" }}>{d.estrategia}</td>
+                              <td style={{ padding: "6px 10px", color: "#e2e8f0" }}>{String(d.pedimento || "").slice(0, 28)}</td>
+                              <td style={{ padding: "6px 10px", color: "#f59e0b" }}>{String(d.layoutFrac || "")}</td>
+                              <td style={{ padding: "6px 10px", color: "#94a3b8" }}>{d.secAsignada !== "" && d.secAsignada != null ? d.secAsignada : ""}</td>
+                              <td style={{ padding: "6px 10px", color: "#94a3b8", fontFamily: "monospace" }}>{d.diffCant == null ? "" : Number(d.diffCant).toFixed(0)}</td>
+                              <td style={{ padding: "6px 10px", color: "#94a3b8", fontFamily: "monospace" }}>{d.diffVal == null ? "" : Number(d.diffVal).toFixed(2)}</td>
+                              <td style={{ padding: "6px 10px", color: d.tipo === "unmatched" ? "#fca5a5" : "#e2e8f0", lineHeight: 1.45, maxWidth: 420 }}>{(d.motivo || d.nota || "")}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {results.cruceData.length > 200 && (
+                      <div style={{ padding: 8, textAlign: "center", color: "#64748b", fontSize: 10 }}>y {results.cruceData.length - 200} grupos más (ver hoja Cruce en Excel descargado)</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Progress bar */}
             <div style={{
@@ -4272,7 +5078,7 @@ export default function App() {
               borderRadius: 4, padding: "24px 28px", marginBottom: 20,
             }}>
               <div style={{ color: "#94a3b8", fontSize: 11, letterSpacing: "0.1em", fontFamily: "DM Mono, monospace", marginBottom: 16 }}>
-                DISTRIBUCIÓN DE ASIGNACIÓN POR ESTRATEGIA
+                DISTRIBUCIN DE ASIGNACIN POR ESTRATEGIA
               </div>
               <StrategyBar stats={results.strategyStats} total={results.total} />
             </div>
@@ -4319,7 +5125,7 @@ export default function App() {
                         <div style={{ width: 160, background: "#1e293b", borderRadius: 1, height: 4 }}>
                           <div style={{ width: `${pctS}%`, height: "100%", background: s.color, borderRadius: 1 }} />
                         </div>
-                        <span style={{ color: "#334155", fontSize: 12 }}>{activeStrategy === s.id ? "▲" : "▼"}</span>
+                        <span style={{ color: "#334155", fontSize: 12 }}>{activeStrategy === s.id ? "" : ""}</span>
                       </div>
                       {activeStrategy === s.id && (
                         <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #1e293b", color: "#64748b", fontSize: 12, lineHeight: 1.7 }}>
@@ -4349,13 +5155,13 @@ export default function App() {
                 >
                   <div>
                     <span style={{ color: "#ef4444", fontWeight: 800, fontSize: 13 }}>
-                      ⚠ {results.unmatchedFinal.length} filas sin match
+                       {results.unmatchedFinal.length} filas sin match
                     </span>
                     <span style={{ color: "#475569", fontSize: 12, marginLeft: 12 }}>
                       Requieren revisión manual por un especialista
                     </span>
                   </div>
-                  <span style={{ color: "#475569" }}>{showUnmatched ? "▲" : "▼"}</span>
+                  <span style={{ color: "#475569" }}>{showUnmatched ? "" : ""}</span>
                 </div>
 
                 {showUnmatched && (
@@ -4363,7 +5169,7 @@ export default function App() {
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                       <thead>
                         <tr style={{ background: "#1e293b" }}>
-                          {["Fraccion", "País", "Cantidad", "VCUSD", "Notas — Motivo sin asignación"].map((h) => (
+                          {["Fraccion", "País", "Cantidad", "VCUSD", "Notas  Motivo sin asignación"].map((h) => (
                             <th key={h} style={{
                               padding: "10px 16px", textAlign: "left",
                               color: "#64748b", fontFamily: "DM Mono, monospace",
@@ -4381,7 +5187,7 @@ export default function App() {
                             <td style={{ padding: "9px 16px", color: "#94a3b8", fontFamily: "monospace" }}>{r.PaisOrigen}</td>
                             <td style={{ padding: "9px 16px", color: "#94a3b8", fontFamily: "monospace" }}>{r.CantidadSaldo?.toLocaleString()}</td>
                             <td style={{ padding: "9px 16px", color: "#94a3b8", fontFamily: "monospace" }}>{Number(r.VCUSD).toFixed(2)}</td>
-                            <td style={{ padding: "9px 16px", color: "#fca5a5", fontSize: 11, lineHeight: 1.5, maxWidth: 400 }}>{r.Nota || "—"}</td>
+                            <td style={{ padding: "9px 16px", color: "#fca5a5", fontSize: 11, lineHeight: 1.5, maxWidth: 400 }}>{r.Nota || ""}</td>
                           </tr>
                         ))}
                         {results.unmatchedFinal.length > 100 && (
@@ -4424,7 +5230,7 @@ export default function App() {
                   transition: "background 0.2s",
                 }}
               >
-                ⬇ Descargar Excel Resultado
+                 Descargar Excel Resultado
               </button>
             </div>
 
@@ -4436,10 +5242,10 @@ export default function App() {
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   {[
-                    { icon: "🔍", title: "Verificar Fracción Arancelaria", body: "Muchos casos sin match ocurren porque el mismo producto tiene múltiples fracciones (ej: 85322999 vs 85414004 para CAPACITORES). Agregar FraccionImpo como criterio de agrupación resolvería estos casos." },
-                    { icon: "📋", title: "Revisar Pedimentos Pendientes", body: "Si la suma del Layout supera la cantidad del 551, es posible que parte del inventario provenga de pedimentos anteriores no incluidos en el archivo. Solicitar expediente completo." },
-                    { icon: "⚖️", title: "Validar Unidades de Medida", body: "Diferencias de cantidad pueden deberse a conversiones UMC/UMT. Verificar si el 551 reporta en unidades distintas al Layout (piezas vs. lotes, kg vs. pzas)." },
-                    { icon: "🔄", title: "Conciliación Parcial", body: "Para ARNES ELÉCTRICO y productos similares con múltiples registros en 551, hacer conciliación ítem por ítem comparando valor unitario (ValorDolares / CantidadUMComercial) como criterio discriminador." },
+                    { icon: "", title: "Verificar Fracción Arancelaria", body: "Muchos casos sin match ocurren porque el mismo producto tiene múltiples fracciones (ej: 85322999 vs 85414004 para CAPACITORES). Agregar FraccionImpo como criterio de agrupación resolvería estos casos." },
+                    { icon: "", title: "Revisar Pedimentos Pendientes", body: "Si la suma del Layout supera la cantidad del 551, es posible que parte del inventario provenga de pedimentos anteriores no incluidos en el archivo. Solicitar expediente completo." },
+                    { icon: "️", title: "Validar Unidades de Medida", body: "Diferencias de cantidad pueden deberse a conversiones UMC/UMT. Verificar si el 551 reporta en unidades distintas al Layout (piezas vs. lotes, kg vs. pzas)." },
+                    { icon: "", title: "Conciliación Parcial", body: "Para ARNES ELCTRICO y productos similares con múltiples registros en 551, hacer conciliación ítem por ítem comparando valor unitario (ValorDolares / CantidadUMComercial) como criterio discriminador." },
                   ].map((r) => (
                     <div key={r.title} style={{
                       background: "#0f172a", border: "1px solid #1e293b",
@@ -4463,3 +5269,6 @@ export default function App() {
     </div>
   );
 }
+
+
+
