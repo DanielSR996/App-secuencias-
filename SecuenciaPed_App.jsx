@@ -4652,9 +4652,477 @@ function App2020() {
   );
 }
 
+function stripAccents(s) {
+  return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function normalizeDescText(s) {
+  return stripAccents(String(s || ""))
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normSimpleText(s) {
+  return stripAccents(String(s || ""))
+    .toUpperCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normCodeText(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/[\s.\-_/]/g, "")
+    .trim();
+}
+
+function descTokens(s) {
+  const stop = new Set(["de", "la", "el", "los", "las", "y", "o", "para", "con", "sin", "del", "al", "the", "and"]);
+  const syn = {
+    balastra: "balasto",
+    balasto: "balasto",
+    ballast: "balasto",
+    tablilla: "tablilla",
+    tarjeta: "tablilla",
+    modulo: "modulo",
+    mod: "modulo",
+    lampara: "lampara",
+    lamparas: "lampara",
+    foco: "lampara",
+    focos: "lampara",
+    led: "led",
+    driver: "driver",
+    resistencia: "resistencia",
+    capacitor: "capacitor",
+    capacitores: "capacitor",
+    circuito: "circuito",
+    integrado: "integrado",
+    monolitico: "monolitico",
+    monolitica: "monolitico",
+  };
+  return normalizeDescText(s)
+    .split(" ")
+    .filter((t) => t && !stop.has(t))
+    .map((t) => syn[t] || t);
+}
+
+function tokenSignature(s) {
+  return [...new Set(descTokens(s))].sort().join("|");
+}
+
+function compareDescriptions(a, b) {
+  const na = normalizeDescText(a);
+  const nb = normalizeDescText(b);
+  if (!na && !nb) return { status: "empty", score: 1 };
+  if (!na || !nb) return { status: "red", score: 0 };
+  if (na === nb) return { status: "green", score: 1 };
+
+  const ta = [...new Set(descTokens(a))];
+  const tb = [...new Set(descTokens(b))];
+  if (!ta.length || !tb.length) return { status: "red", score: 0 };
+
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let inter = 0;
+  for (const t of setA) if (setB.has(t)) inter++;
+  const union = new Set([...ta, ...tb]).size || 1;
+  const jaccard = inter / union;
+  const covA = inter / setA.size;
+  const covB = inter / setB.size;
+
+  if (jaccard >= 0.95 || (covA === 1 && covB === 1)) return { status: "green", score: jaccard };
+  if (jaccard >= 0.45 || covA >= 0.7 || covB >= 0.7 || na.includes(nb) || nb.includes(na)) {
+    return { status: "yellow", score: jaccard };
+  }
+  return { status: "red", score: jaccard };
+}
+
+function paintCellWithColor(cell, rgb) {
+  const prev = cell?.s || {};
+  return {
+    ...prev,
+    fill: {
+      patternType: "solid",
+      fgColor: { rgb },
+      bgColor: { rgb },
+    },
+  };
+}
+
+function AppDescripcion() {
+  const [phaseDesc, setPhaseDesc] = useState("upload");
+  const [isDraggingDesc, setIsDraggingDesc] = useState(false);
+  const [resultsDesc, setResultsDesc] = useState(null);
+  const [outputWbDesc, setOutputWbDesc] = useState(null);
+  const [fileNameDesc, setFileNameDesc] = useState("");
+  const [errorDesc, setErrorDesc] = useState(null);
+  const [progressDesc, setProgressDesc] = useState(0);
+  const [filterPedDesc, setFilterPedDesc] = useState("TODOS");
+
+  const processDescripcion = useCallback(async (file) => {
+    setErrorDesc(null);
+    setFileNameDesc(file.name);
+    setPhaseDesc("processing");
+    setProgressDesc(0);
+
+    try {
+      const buf = await file.arrayBuffer();
+      setProgressDesc(20);
+      const newWb = XLSX.read(buf, { type: "array", cellStyles: true });
+
+      const stats = { green: 0, yellow: 0, red: 0, purple: 0, empty: 0, total: 0 };
+      const statsExtra = {
+        paisOk: 0, paisBad: 0,
+        fracOk: 0, fracBad: 0,
+        nicoOk: 0, nicoBad: 0,
+      };
+      const sheetsTouched = [];
+      const previewRows = [];
+      const pedimentosSet = new Set();
+
+      for (const sheetName of newWb.SheetNames) {
+        const ws = newWb.Sheets[sheetName];
+        const ref = ws["!ref"];
+        if (!ref) continue;
+        const range = XLSX.utils.decode_range(ref);
+        const pedHeaderAliases = ["pedimento", "ped", "numero de pedimento", "num pedimento"];
+        let pedCol = 0; // fallback: columna A
+        const headerRow = [];
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const addr = XLSX.utils.encode_cell({ r: 0, c });
+          headerRow[c] = normalizeDescText(String(ws[addr]?.v ?? ""));
+        }
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const h = headerRow[c] || "";
+          if (pedHeaderAliases.some((a) => h.includes(a))) {
+            pedCol = c;
+            break;
+          }
+        }
+
+        const pairs = [];
+        let lastPed = "";
+        for (let r = 1; r <= range.e.r; r++) {
+          const addrJ = XLSX.utils.encode_cell({ r, c: 9 });  // J
+          const addrK = XLSX.utils.encode_cell({ r, c: 10 }); // K
+          const addrM = XLSX.utils.encode_cell({ r, c: 12 }); // M
+          const addrN = XLSX.utils.encode_cell({ r, c: 13 }); // N
+          const addrP = XLSX.utils.encode_cell({ r, c: 15 }); // P
+          const addrQ = XLSX.utils.encode_cell({ r, c: 16 }); // Q
+          const addrS = XLSX.utils.encode_cell({ r, c: 18 }); // S
+          const addrT = XLSX.utils.encode_cell({ r, c: 19 }); // T
+          const addrPed = XLSX.utils.encode_cell({ r, c: pedCol });
+          const vJ = String(ws[addrJ]?.v ?? "").trim();
+          const vK = String(ws[addrK]?.v ?? "").trim();
+          const vM = String(ws[addrM]?.v ?? "").trim();
+          const vN = String(ws[addrN]?.v ?? "").trim();
+          const vP = String(ws[addrP]?.v ?? "").trim();
+          const vQ = String(ws[addrQ]?.v ?? "").trim();
+          const vS = String(ws[addrS]?.v ?? "").trim();
+          const vT = String(ws[addrT]?.v ?? "").trim();
+          const pedRaw = String(ws[addrPed]?.v ?? "").trim();
+          const ped = pedRaw || lastPed || "SIN_PEDIMENTO";
+          if (pedRaw) lastPed = pedRaw;
+          if (!vJ && !vK && !vM && !vN && !vP && !vQ && !vS && !vT) continue;
+          pairs.push({
+            r, ped,
+            addrJ, addrK, addrM, addrN, addrP, addrQ, addrS, addrT,
+            vJ, vK, vM, vN, vP, vQ, vS, vT,
+            sigJ: tokenSignature(vJ), sigK: tokenSignature(vK),
+            classif: null,
+          });
+        }
+        if (!pairs.length) continue;
+
+        for (const p of pairs) {
+          p.classif = compareDescriptions(p.vJ, p.vK).status;
+          p.revueltaWith = null;
+        }
+
+        // Morado: descripciones "revueltas" entre filas contiguas
+        for (let i = 0; i < pairs.length - 1; i++) {
+          const a = pairs[i];
+          const b = pairs[i + 1];
+          if (a.ped !== b.ped) continue; // No mezclar pedimentos
+          if (!a.sigJ || !a.sigK || !b.sigJ || !b.sigK) continue;
+          const swap = a.sigJ === b.sigK && b.sigJ === a.sigK;
+          if (swap && a.sigJ !== a.sigK && b.sigJ !== b.sigK) {
+            a.classif = "purple";
+            b.classif = "purple";
+            a.revueltaWith = { sheetName, ped: b.ped, rowExcel: b.r + 1 };
+            b.revueltaWith = { sheetName, ped: a.ped, rowExcel: a.r + 1 };
+          }
+        }
+
+        for (const p of pairs) {
+          stats.total++;
+          const rgb =
+            p.classif === "green" ? "FF22C55E" :
+            p.classif === "yellow" ? "FFFACC15" :
+            p.classif === "purple" ? "FF9333EA" :
+            p.classif === "empty" ? "FF94A3B8" :
+            "FFEF4444";
+
+          if (p.classif === "green") stats.green++;
+          else if (p.classif === "yellow") stats.yellow++;
+          else if (p.classif === "purple") stats.purple++;
+          else if (p.classif === "empty") stats.empty++;
+          else stats.red++;
+
+          ws[p.addrJ] = ws[p.addrJ] || { t: "s", v: p.vJ || "" };
+          ws[p.addrK] = ws[p.addrK] || { t: "s", v: p.vK || "" };
+          ws[p.addrJ].s = paintCellWithColor(ws[p.addrJ], rgb);
+          ws[p.addrK].s = paintCellWithColor(ws[p.addrK], rgb);
+
+          const paisOK = normSimpleText(p.vM) === normSimpleText(p.vN);
+          const fracOK = normCodeText(p.vP) === normCodeText(p.vQ);
+          const nicoOK = normCodeText(p.vS) === normCodeText(p.vT);
+          statsExtra[paisOK ? "paisOk" : "paisBad"]++;
+          statsExtra[fracOK ? "fracOk" : "fracBad"]++;
+          statsExtra[nicoOK ? "nicoOk" : "nicoBad"]++;
+
+          const rgbOk = "FF22C55E";
+          const rgbBad = "FFEF4444";
+          ws[p.addrM] = ws[p.addrM] || { t: "s", v: p.vM || "" };
+          ws[p.addrN] = ws[p.addrN] || { t: "s", v: p.vN || "" };
+          ws[p.addrP] = ws[p.addrP] || { t: "s", v: p.vP || "" };
+          ws[p.addrQ] = ws[p.addrQ] || { t: "s", v: p.vQ || "" };
+          ws[p.addrS] = ws[p.addrS] || { t: "s", v: p.vS || "" };
+          ws[p.addrT] = ws[p.addrT] || { t: "s", v: p.vT || "" };
+          ws[p.addrM].s = paintCellWithColor(ws[p.addrM], paisOK ? rgbOk : rgbBad);
+          ws[p.addrN].s = paintCellWithColor(ws[p.addrN], paisOK ? rgbOk : rgbBad);
+          ws[p.addrP].s = paintCellWithColor(ws[p.addrP], fracOK ? rgbOk : rgbBad);
+          ws[p.addrQ].s = paintCellWithColor(ws[p.addrQ], fracOK ? rgbOk : rgbBad);
+          ws[p.addrS].s = paintCellWithColor(ws[p.addrS], nicoOK ? rgbOk : rgbBad);
+          ws[p.addrT].s = paintCellWithColor(ws[p.addrT], nicoOK ? rgbOk : rgbBad);
+
+          if (p.ped && p.ped !== "SIN_PEDIMENTO") pedimentosSet.add(p.ped);
+          if (previewRows.length < 5000) {
+            previewRows.push({
+              sheetName,
+              rowExcel: p.r + 1,
+              pedimento: p.ped || "SIN_PEDIMENTO",
+              descJ: p.vJ || "",
+              descK: p.vK || "",
+              classif: p.classif || "red",
+              paisL: p.vM || "",
+              paisR: p.vN || "",
+              paisOK,
+              fracL: p.vP || "",
+              fracR: p.vQ || "",
+              fracOK,
+              nicoL: p.vS || "",
+              nicoR: p.vT || "",
+              nicoOK,
+              revueltaWith: p.revueltaWith || null,
+            });
+          }
+        }
+
+        sheetsTouched.push({ sheetName, rows: pairs.length });
+      }
+
+      if (!sheetsTouched.length) {
+        throw new Error("No se detectaron descripciones en columnas J y K. Verifica el formato del archivo.");
+      }
+
+      setProgressDesc(100);
+      setOutputWbDesc(newWb);
+      const pedimentos = [...pedimentosSet].sort();
+      setResultsDesc({ stats, statsExtra, sheetsTouched, previewRows, pedimentos, pedCount: pedimentos.length });
+      setFilterPedDesc("TODOS");
+      setTimeout(() => setPhaseDesc("results"), 350);
+    } catch (e) {
+      setErrorDesc(e.message);
+      setPhaseDesc("upload");
+    }
+  }, []);
+
+  const onFileDesc = useCallback((file) => {
+    if (!file?.name?.match(/\.(xlsx|xls)$/i)) {
+      setErrorDesc("Solo archivos Excel (.xlsx / .xls)");
+      return;
+    }
+    processDescripcion(file);
+  }, [processDescripcion]);
+
+  const downloadDesc = () => {
+    if (!outputWbDesc) return;
+    XLSX.writeFile(outputWbDesc, fileNameDesc.replace(/\.xlsx?$/i, "") + "_Comparacion_Descripciones.xlsx");
+  };
+
+  const resetDesc = () => {
+    setPhaseDesc("upload");
+    setResultsDesc(null);
+    setOutputWbDesc(null);
+    setErrorDesc(null);
+    setProgressDesc(0);
+    setFilterPedDesc("TODOS");
+  };
+
+  return (
+    <div>
+      {phaseDesc === "results" && (
+        <div style={{ display:"flex", gap:8, marginBottom:24 }}>
+          <button onClick={resetDesc} style={{ background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"8px 16px",cursor:"pointer",borderRadius:4,fontSize:13 }}>← Nuevo archivo</button>
+          <button onClick={downloadDesc} style={{ background:"#a855f7",border:"none",color:"#0f172a",padding:"8px 20px",cursor:"pointer",borderRadius:4,fontSize:13,fontWeight:800 }}>⬇ Descargar Excel comparado</button>
+        </div>
+      )}
+
+      {phaseDesc === "upload" && (
+        <div style={{ animation: "fadeUp 0.4s ease" }}>
+          <div style={{ textAlign: "center", marginBottom: 40 }}>
+            <div style={{ display:"inline-block", background:"rgba(168,85,247,0.12)", border:"1px solid rgba(168,85,247,0.4)", color:"#c084fc", padding:"4px 14px", borderRadius:20, fontSize:11, letterSpacing:"0.12em", fontFamily:"DM Mono, monospace", marginBottom:20 }}>
+              COMPARADOR DE DESCRIPCIONES · J vs K
+            </div>
+            <h1 style={{ fontSize: 36, fontWeight: 900, margin: "0 0 12px", letterSpacing: "-0.02em", lineHeight: 1.1 }}>
+              Comparación inteligente de <span style={{ color: "#a855f7" }}>descripciones</span>
+            </h1>
+            <p style={{ color:"#64748b", fontSize:15, maxWidth:700, margin:"0 auto" }}>
+              Se colorean columnas J y K respetando formato del archivo: verde (igual), amarillo (sinónimos/orden distinto), rojo (no relacionadas) y morado (revueltas entre filas).
+            </p>
+          </div>
+
+          {errorDesc && (
+            <div style={{ background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.35)", borderRadius:4, padding:"12px 16px", marginBottom:20, color:"#fca5a5", fontSize:13 }}>
+              ⚠ {errorDesc}
+            </div>
+          )}
+
+          <UploadZone onFile={onFileDesc} isDragging={isDraggingDesc} setIsDragging={setIsDraggingDesc} />
+        </div>
+      )}
+
+      {phaseDesc === "processing" && (
+        <div style={{ textAlign:"center", padding:"80px 0", animation:"fadeUp 0.3s ease" }}>
+          <div style={{ width:60, height:60, border:"3px solid #1e293b", borderTop:"3px solid #a855f7", borderRadius:"50%", margin:"0 auto 32px", animation:"spin 0.8s linear infinite" }} />
+          <div style={{ fontSize:20, fontWeight:800, marginBottom:8 }}>Analizando descripciones J/K</div>
+          <div style={{ color:"#475569", fontSize:13, marginBottom:24 }}>{fileNameDesc}</div>
+          <div style={{ maxWidth:400, margin:"0 auto" }}>
+            <div style={{ background:"#1e293b", borderRadius:2, height:4, overflow:"hidden" }}>
+              <div style={{ height:"100%", background:"#a855f7", borderRadius:2, width:`${progressDesc}%`, transition:"width 0.4s ease" }} />
+            </div>
+            <div style={{ color:"#475569", fontSize:12, marginTop:8, fontFamily:"DM Mono, monospace" }}>{progressDesc}%</div>
+          </div>
+        </div>
+      )}
+
+      {phaseDesc === "results" && resultsDesc && (
+        <div style={{ animation:"fadeUp 0.5s ease" }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(160px, 1fr))", gap:12, marginBottom:20 }}>
+            <StatCard label="Filas comparadas" value={resultsDesc.stats.total} sub="Con datos en J/K" accent="#a855f7" />
+            <StatCard label="Pedimentos detectados" value={resultsDesc.pedCount || 0} sub="Procesados por separado" accent="#38bdf8" />
+            <StatCard label="Exactas" value={resultsDesc.stats.green} sub="Verde" accent="#22c55e" />
+            <StatCard label="Similares" value={resultsDesc.stats.yellow} sub="Amarillo" accent="#facc15" />
+            <StatCard label="Revueltas" value={resultsDesc.stats.purple} sub="Morado" accent="#9333ea" />
+            <StatCard label="No relacionadas" value={resultsDesc.stats.red} sub="Rojo" accent="#ef4444" />
+            <StatCard label="País OK" value={resultsDesc.statsExtra?.paisOk ?? 0} sub="M/N en verde" accent="#22c55e" />
+            <StatCard label="Fracción OK" value={resultsDesc.statsExtra?.fracOk ?? 0} sub="P/Q en verde" accent="#22c55e" />
+            <StatCard label="NICO OK" value={resultsDesc.statsExtra?.nicoOk ?? 0} sub="S/T en verde" accent="#22c55e" />
+          </div>
+
+          <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:"14px 16px", color:"#94a3b8", fontSize:12 }}>
+            Hojas evaluadas: {resultsDesc.sheetsTouched.map(s => `${s.sheetName} (${s.rows})`).join(" · ")}
+          </div>
+
+          <div style={{ marginTop: 12, background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:"12px 14px", color:"#94a3b8", fontSize:12 }}>
+            Pedimentos en archivo: {resultsDesc.pedCount || 0}
+            {(resultsDesc.pedimentos || []).length > 0 && (
+              <span> · {resultsDesc.pedimentos.join(" · ")}</span>
+            )}
+          </div>
+
+          {(() => {
+            const rows = resultsDesc.previewRows || [];
+            const pedList = ["TODOS", ...(resultsDesc.pedimentos || [])];
+            const filtered = filterPedDesc === "TODOS" ? rows : rows.filter(r => r.pedimento === filterPedDesc);
+            const tone = (c) => c === "green" ? "#22c55e" : c === "yellow" ? "#facc15" : c === "purple" ? "#a855f7" : c === "empty" ? "#94a3b8" : "#ef4444";
+            const bgTone = (c) => c === "green" ? "rgba(34,197,94,0.18)" : c === "yellow" ? "rgba(250,204,21,0.22)" : c === "purple" ? "rgba(168,85,247,0.2)" : c === "empty" ? "rgba(148,163,184,0.14)" : "rgba(239,68,68,0.16)";
+            const label = (c) => c === "green" ? "Exacta" : c === "yellow" ? "Similar" : c === "purple" ? "Revueltas" : c === "empty" ? "Vacía" : "No relacionada";
+            return (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10, flexWrap:"wrap" }}>
+                  <div style={{ color:"#94a3b8", fontSize:12, fontWeight:700, letterSpacing:"0.08em" }}>VISTA PREVIA</div>
+                  <div style={{ flex:1 }} />
+                  <select
+                    value={filterPedDesc}
+                    onChange={(e) => setFilterPedDesc(e.target.value)}
+                    style={{ background:"#0f172a",color:"#f8fafc",border:"1px solid #334155",borderRadius:4,padding:"5px 10px",fontSize:12,cursor:"pointer" }}
+                  >
+                    {pedList.map(p => <option key={p} value={p}>{p === "TODOS" ? "Todos los pedimentos" : p}</option>)}
+                  </select>
+                </div>
+
+                <div style={{ overflowX:"auto", borderRadius:6, border:"1px solid #1e293b", maxHeight:420, overflowY:"auto" }}>
+                  <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, fontFamily:"DM Mono, monospace" }}>
+                    <thead>
+                      <tr style={{ background:"#0f172a", position:"sticky", top:0, zIndex:2 }}>
+                        {["Hoja", "Fila", "Pedimento", "Descripción J", "Descripción K", "Clasificación", "País M/N", "Fracción P/Q", "NICO S/T", "Detalle revuelta"].map(h => (
+                          <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:"#64748b", fontWeight:700, borderBottom:"1px solid #1e293b", whiteSpace:"nowrap", fontSize:11 }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map((r, i) => (
+                        <tr key={`${r.sheetName}-${r.rowExcel}-${i}`} style={{ borderBottom:"1px solid rgba(30,41,59,0.8)" }}>
+                          <td style={{ padding:"6px 10px", color:"#93c5fd", whiteSpace:"nowrap" }}>{r.sheetName}</td>
+                          <td style={{ padding:"6px 10px", color:"#94a3b8" }}>{r.rowExcel}</td>
+                          <td style={{ padding:"6px 10px", color:"#cbd5e1", whiteSpace:"nowrap" }}>{r.pedimento}</td>
+                          <td style={{ padding:"6px 10px", color:"#e2e8f0", maxWidth:320, whiteSpace:"pre-wrap", wordBreak:"break-word", background:bgTone(r.classif) }}>{r.descJ}</td>
+                          <td style={{ padding:"6px 10px", color:"#e2e8f0", maxWidth:320, whiteSpace:"pre-wrap", wordBreak:"break-word", background:bgTone(r.classif) }}>{r.descK}</td>
+                          <td style={{ padding:"6px 10px" }}>
+                            <span style={{ background: tone(r.classif) + "22", color: tone(r.classif), padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
+                              {label(r.classif)}
+                            </span>
+                          </td>
+                          <td style={{ padding:"6px 10px", minWidth:180 }}>
+                            <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.paisL} ↔ {r.paisR}</div>
+                            <span style={{ background:(r.paisOK ? "#22c55e" : "#ef4444") + "22", color:r.paisOK ? "#22c55e" : "#ef4444", padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
+                              {r.paisOK ? "Coincide" : "No coincide"}
+                            </span>
+                          </td>
+                          <td style={{ padding:"6px 10px", minWidth:180 }}>
+                            <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.fracL} ↔ {r.fracR}</div>
+                            <span style={{ background:(r.fracOK ? "#22c55e" : "#ef4444") + "22", color:r.fracOK ? "#22c55e" : "#ef4444", padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
+                              {r.fracOK ? "Coincide" : "No coincide"}
+                            </span>
+                          </td>
+                          <td style={{ padding:"6px 10px", minWidth:180 }}>
+                            <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.nicoL} ↔ {r.nicoR}</div>
+                            <span style={{ background:(r.nicoOK ? "#22c55e" : "#ef4444") + "22", color:r.nicoOK ? "#22c55e" : "#ef4444", padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
+                              {r.nicoOK ? "Coincide" : "No coincide"}
+                            </span>
+                          </td>
+                          <td style={{ padding:"6px 10px", color:r.classif==="purple" ? "#d8b4fe" : "#64748b", fontSize:11, minWidth:210, maxWidth:260, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                            {r.classif === "purple" && r.revueltaWith
+                              ? `Revueltas con fila ${r.revueltaWith.rowExcel} (${r.revueltaWith.sheetName} · ${r.revueltaWith.ped})`
+                              : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filtered.length === 0 && (
+                    <div style={{ padding:"24px", textAlign:"center", color:"#475569", fontSize:12 }}>Sin filas para el filtro seleccionado</div>
+                  )}
+                </div>
+                <div style={{ marginTop:8, color:"#475569", fontSize:11 }}>
+                  {filtered.length} filas en vista previa{rows.length >= 5000 ? " (limitada a 5000 para rendimiento)" : ""}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
 //  MAIN APP 
 export default function App() {
-  const [activeTab, setActiveTab] = useState("551"); // "551" | "2020"
+  const [activeTab, setActiveTab] = useState("551"); // "551" | "2020" | "desc"
   const [phase, setPhase] = useState("upload"); // upload | processing | results
   const [isDragging, setIsDragging] = useState(false);
   const [results, setResults] = useState(null);
@@ -4781,9 +5249,9 @@ export default function App() {
           </div>
           {/* Tab selector */}
           <div style={{ display:"flex", gap:4, marginLeft:24, background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:4 }}>
-            {[{ id:"551", label:"Módulo 551" }, { id:"2020", label:"Módulo DS" }].map(t => (
+            {[{ id:"551", label:"Módulo 551" }, { id:"2020", label:"Módulo DS" }, { id:"desc", label:"Comparar descripciones" }].map(t => (
               <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
-                background: activeTab===t.id ? (t.id==="2020"?"#22c55e":"#f59e0b") : "transparent",
+                background: activeTab===t.id ? (t.id==="2020"?"#22c55e":(t.id==="desc"?"#a855f7":"#f59e0b")) : "transparent",
                 border:"none", color: activeTab===t.id ? "#0f172a" : "#64748b",
                 padding:"6px 16px", cursor:"pointer", borderRadius:4,
                 fontSize:12, fontWeight:700, fontFamily:"Syne, sans-serif",
@@ -4826,6 +5294,7 @@ export default function App() {
 
         {/* MDULO DS */}
         {activeTab === "2020" && <App2020 />}
+        {activeTab === "desc" && <AppDescripcion />}
 
         {/* MDULO 551  original */}
         {activeTab === "551" && <>
