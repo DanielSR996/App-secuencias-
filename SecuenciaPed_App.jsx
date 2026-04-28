@@ -4760,6 +4760,7 @@ function AppDescripcion() {
   const [errorDesc, setErrorDesc] = useState(null);
   const [progressDesc, setProgressDesc] = useState(0);
   const [filterPedDesc, setFilterPedDesc] = useState("TODOS");
+  const [copiedMsgDesc, setCopiedMsgDesc] = useState("");
 
   const processDescripcion = useCallback(async (file) => {
     setErrorDesc(null);
@@ -4960,6 +4961,59 @@ function AppDescripcion() {
     setErrorDesc(null);
     setProgressDesc(0);
     setFilterPedDesc("TODOS");
+    setCopiedMsgDesc("");
+  };
+
+  const getPreviewRowsFiltered = () => {
+    const rows = resultsDesc?.previewRows || [];
+    return filterPedDesc === "TODOS" ? rows : rows.filter((r) => r.pedimento === filterPedDesc);
+  };
+
+  const copyDescColorMap = async () => {
+    const rows = getPreviewRowsFiltered();
+    const asLabel = (c) => c === "green" ? "VERDE" : c === "yellow" ? "AMARILLO" : c === "purple" ? "MORADO" : c === "empty" ? "VACIA" : "ROJO";
+    const txt = rows.map((r) => asLabel(r.classif)).join("\n");
+    await navigator.clipboard.writeText(txt);
+    setCopiedMsgDesc("Mapa de colores copiado (1 columna). Pega en Excel.");
+    setTimeout(() => setCopiedMsgDesc(""), 3000);
+  };
+
+  const copyDescColorsForJK = async () => {
+    const rows = getPreviewRowsFiltered();
+    const asLabel = (c) => c === "green" ? "VERDE" : c === "yellow" ? "AMARILLO" : c === "purple" ? "MORADO" : c === "empty" ? "VACIA" : "ROJO";
+    const htmlRows = rows.map((r) => {
+      const bg =
+        r.classif === "green" ? "#22c55e" :
+        r.classif === "yellow" ? "#facc15" :
+        r.classif === "purple" ? "#a855f7" :
+        r.classif === "empty" ? "#94a3b8" :
+        "#ef4444";
+      const fg = (r.classif === "yellow") ? "#111827" : "#f8fafc";
+      const v = asLabel(r.classif);
+      return `<tr><td style="background:${bg};color:${fg};font-weight:700">${v}</td><td style="background:${bg};color:${fg};font-weight:700">${v}</td></tr>`;
+    }).join("");
+    const html = `<table><tbody>${htmlRows}</tbody></table>`;
+    const plain = rows.map((r) => {
+      const v = asLabel(r.classif);
+      return `${v}\t${v}`;
+    }).join("\n");
+    try {
+      if (window.ClipboardItem) {
+        const item = new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([plain], { type: "text/plain" }),
+        });
+        await navigator.clipboard.write([item]);
+      } else {
+        await navigator.clipboard.writeText(plain);
+      }
+      setCopiedMsgDesc("Colores J/K copiados (2 columnas). Pega en Excel sobre el rango destino.");
+      setTimeout(() => setCopiedMsgDesc(""), 3200);
+    } catch {
+      await navigator.clipboard.writeText(plain);
+      setCopiedMsgDesc("Copiado en texto (J/K). Si no respeta color, usa el Excel generado.");
+      setTimeout(() => setCopiedMsgDesc(""), 3200);
+    }
   };
 
   return (
@@ -5031,6 +5085,18 @@ function AppDescripcion() {
             Pedimentos en archivo: {resultsDesc.pedCount || 0}
             {(resultsDesc.pedimentos || []).length > 0 && (
               <span> · {resultsDesc.pedimentos.join(" · ")}</span>
+            )}
+          </div>
+
+          <div style={{ marginTop: 10, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+            <button onClick={copyDescColorMap} style={{ background:"#1d4ed8", border:"none", color:"#dbeafe", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
+              📋 Copiar mapa de colores (1 col)
+            </button>
+            <button onClick={copyDescColorsForJK} style={{ background:"#7c3aed", border:"none", color:"#ede9fe", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
+              🎨 Copiar colores para J/K (2 col)
+            </button>
+            {copiedMsgDesc && (
+              <span style={{ color:"#86efac", fontSize:12 }}>{copiedMsgDesc}</span>
             )}
           </div>
 
