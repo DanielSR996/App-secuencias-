@@ -4713,11 +4713,17 @@ function tokenSignature(s) {
 }
 
 function compareDescriptions(a, b) {
+  const rawA = String(a || "").replace(/\s+/g, " ").trim();
+  const rawB = String(b || "").replace(/\s+/g, " ").trim();
+  const rawCmpA = stripAccents(rawA).toUpperCase();
+  const rawCmpB = stripAccents(rawB).toUpperCase();
+  if (!rawCmpA && !rawCmpB) return { status: "empty", score: 1 };
+  if (!rawCmpA || !rawCmpB) return { status: "red", score: 0 };
+  // VERDE solo si el texto es el mismo (permitiendo diferencias de espacios).
+  if (rawCmpA === rawCmpB) return { status: "green", score: 1 };
+
   const na = normalizeDescText(a);
   const nb = normalizeDescText(b);
-  if (!na && !nb) return { status: "empty", score: 1 };
-  if (!na || !nb) return { status: "red", score: 0 };
-  if (na === nb) return { status: "green", score: 1 };
 
   const ta = [...new Set(descTokens(a))];
   const tb = [...new Set(descTokens(b))];
@@ -4840,6 +4846,7 @@ function AppDescripcion() {
         for (const p of pairs) {
           p.classif = compareDescriptions(p.vJ, p.vK).status;
           p.revueltaWith = null;
+          p.classifReason = "";
         }
 
         // Morado: descripciones "revueltas" entre filas contiguas
@@ -4854,6 +4861,8 @@ function AppDescripcion() {
             b.classif = "purple";
             a.revueltaWith = { sheetName, ped: b.ped, rowExcel: b.r + 1 };
             b.revueltaWith = { sheetName, ped: a.ped, rowExcel: a.r + 1 };
+            a.classifReason = `Cruce detectado con fila ${b.r + 1}: J actual coincide con K de la otra fila y K actual coincide con J de la otra fila (mismo pedimento).`;
+            b.classifReason = `Cruce detectado con fila ${a.r + 1}: J actual coincide con K de la otra fila y K actual coincide con J de la otra fila (mismo pedimento).`;
           }
         }
 
@@ -4917,6 +4926,7 @@ function AppDescripcion() {
               nicoL: p.vS || "",
               nicoR: p.vT || "",
               nicoOK,
+              classifReason: p.classifReason || "",
               revueltaWith: p.revueltaWith || null,
             });
           }
@@ -4978,10 +4988,10 @@ function AppDescripcion() {
         r.classif === "purple" ? "#a855f7" :
         r.classif === "empty" ? "#94a3b8" :
         "#ef4444";
-      const fg = (r.classif === "yellow") ? "#111827" : "#f8fafc";
       const vJ = String(r.descJ ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const vK = String(r.descK ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      return `<tr><td style="background:${bg};color:${fg}">${vJ}</td><td style="background:${bg};color:${fg}">${vK}</td></tr>`;
+      // Solo color de fondo + contenido original; sin estilos de fuente/tamaño.
+      return `<tr><td style="background:${bg}">${vJ}</td><td style="background:${bg}">${vK}</td></tr>`;
     }).join("");
     const html = `<table><tbody>${htmlRows}</tbody></table>`;
     const plain = rows.map((r) => {
@@ -4997,12 +5007,45 @@ function AppDescripcion() {
       } else {
         await navigator.clipboard.writeText(plain);
       }
-      setCopiedMsgDesc("J/K copiados con sus valores originales y color. Pega en Excel sobre el rango destino.");
+      setCopiedMsgDesc("J/K copiados con valores originales y fondo de color (sin forzar fuente/tamaño).");
       setTimeout(() => setCopiedMsgDesc(""), 3200);
     } catch {
       await navigator.clipboard.writeText(plain);
       setCopiedMsgDesc("J/K copiados en texto. Si no respeta color, usa el Excel generado.");
       setTimeout(() => setCopiedMsgDesc(""), 3200);
+    }
+  };
+
+  const copyOnlyDescColorsForJK = async () => {
+    const rows = getPreviewRowsFiltered();
+    const htmlRows = rows.map((r) => {
+      const bg =
+        r.classif === "green" ? "#22c55e" :
+        r.classif === "yellow" ? "#facc15" :
+        r.classif === "purple" ? "#a855f7" :
+        r.classif === "empty" ? "#94a3b8" :
+        "#ef4444";
+      // Solo fondo de celda; sin estilos de fuente para evitar cambios visuales.
+      return `<tr><td style="background:${bg}">&nbsp;</td><td style="background:${bg}">&nbsp;</td></tr>`;
+    }).join("");
+    const html = `<table><tbody>${htmlRows}</tbody></table>`;
+    const plain = rows.map(() => `\t`).join("\n");
+    try {
+      if (window.ClipboardItem) {
+        const item = new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([plain], { type: "text/plain" }),
+        });
+        await navigator.clipboard.write([item]);
+      } else {
+        await navigator.clipboard.writeText(plain);
+      }
+      setCopiedMsgDesc("Solo colores copiados. En Excel pega con 'Pegado especial -> Formatos'.");
+      setTimeout(() => setCopiedMsgDesc(""), 3800);
+    } catch {
+      await navigator.clipboard.writeText(plain);
+      setCopiedMsgDesc("No se pudo copiar formato enriquecido. Usa el Excel generado para conservar colores.");
+      setTimeout(() => setCopiedMsgDesc(""), 3800);
     }
   };
 
@@ -5082,6 +5125,9 @@ function AppDescripcion() {
             <button onClick={copyDescColorsForJK} style={{ background:"#7c3aed", border:"none", color:"#ede9fe", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
               🎨 Copiar J/K con color (2 col)
             </button>
+            <button onClick={copyOnlyDescColorsForJK} style={{ background:"#334155", border:"none", color:"#e2e8f0", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
+              🧩 Copiar solo colores J/K
+            </button>
             {copiedMsgDesc && (
               <span style={{ color:"#86efac", fontSize:12 }}>{copiedMsgDesc}</span>
             )}
@@ -5112,7 +5158,7 @@ function AppDescripcion() {
                   <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, fontFamily:"DM Mono, monospace" }}>
                     <thead>
                       <tr style={{ background:"#0f172a", position:"sticky", top:0, zIndex:2 }}>
-                        {["Hoja", "Fila", "Pedimento", "Descripción J", "Descripción K", "Clasificación", "País M/N", "Fracción P/Q", "NICO S/T", "Detalle revuelta"].map(h => (
+                        {["Hoja", "Fila", "Pedimento", "Descripción J", "Descripción K", "Clasificación", "Motivo descripción", "País M/N", "Fracción P/Q", "NICO S/T", "Detalle revuelta"].map(h => (
                           <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:"#64748b", fontWeight:700, borderBottom:"1px solid #1e293b", whiteSpace:"nowrap", fontSize:11 }}>{h}</th>
                         ))}
                       </tr>
@@ -5129,6 +5175,11 @@ function AppDescripcion() {
                             <span style={{ background: tone(r.classif) + "22", color: tone(r.classif), padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
                               {label(r.classif)}
                             </span>
+                          </td>
+                          <td style={{ padding:"6px 10px", color:r.classif==="purple" ? "#d8b4fe" : "#94a3b8", fontSize:11, minWidth:260, maxWidth:360, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>
+                            {r.classif === "purple"
+                              ? (r.classifReason || "Cruce entre descripciones del mismo pedimento.")
+                              : "—"}
                           </td>
                           <td style={{ padding:"6px 10px", minWidth:180 }}>
                             <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.paisL} ↔ {r.paisR}</div>
