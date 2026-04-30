@@ -4757,6 +4757,13 @@ function paintCellWithColor(cell, rgb) {
   };
 }
 
+function colToIndex(col) {
+  let n = 0;
+  const s = String(col || "").toUpperCase().trim();
+  for (let i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
+  return Math.max(0, n - 1);
+}
+
 function AppDescripcion() {
   const [phaseDesc, setPhaseDesc] = useState("upload");
   const [isDraggingDesc, setIsDraggingDesc] = useState(false);
@@ -4784,6 +4791,7 @@ function AppDescripcion() {
         paisOk: 0, paisBad: 0,
         fracOk: 0, fracBad: 0,
         nicoOk: 0, nicoBad: 0,
+        cantOk: 0, cantBad: 0,
       };
       const sheetsTouched = [];
       const previewRows = [];
@@ -4794,8 +4802,8 @@ function AppDescripcion() {
         const ref = ws["!ref"];
         if (!ref) continue;
         const range = XLSX.utils.decode_range(ref);
-        const pedHeaderAliases = ["pedimento", "ped", "numero de pedimento", "num pedimento"];
-        let pedCol = 0; // fallback: columna A
+        const pedHeaderAliases = ["pedimento sin año", "pedimento"];
+        let pedCol = colToIndex("EE"); // fallback nuevo formato
         const headerRow = [];
         for (let c = range.s.c; c <= range.e.c; c++) {
           const addr = XLSX.utils.encode_cell({ r: 0, c });
@@ -4803,23 +4811,28 @@ function AppDescripcion() {
         }
         for (let c = range.s.c; c <= range.e.c; c++) {
           const h = headerRow[c] || "";
-          if (pedHeaderAliases.some((a) => h.includes(a))) {
+          if (h === "pedimento sin ano" || h.includes("pedimento sin ano")) {
             pedCol = c;
             break;
+          }
+          if (pedHeaderAliases.some((a) => h.includes(a))) {
+            pedCol = c;
           }
         }
 
         const pairs = [];
         let lastPed = "";
         for (let r = 1; r <= range.e.r; r++) {
-          const addrJ = XLSX.utils.encode_cell({ r, c: 9 });  // J
-          const addrK = XLSX.utils.encode_cell({ r, c: 10 }); // K
-          const addrM = XLSX.utils.encode_cell({ r, c: 12 }); // M
-          const addrN = XLSX.utils.encode_cell({ r, c: 13 }); // N
-          const addrP = XLSX.utils.encode_cell({ r, c: 15 }); // P
-          const addrQ = XLSX.utils.encode_cell({ r, c: 16 }); // Q
-          const addrS = XLSX.utils.encode_cell({ r, c: 18 }); // S
-          const addrT = XLSX.utils.encode_cell({ r, c: 19 }); // T
+          const addrJ = XLSX.utils.encode_cell({ r, c: colToIndex("EN") }); // Descripción
+          const addrK = XLSX.utils.encode_cell({ r, c: colToIndex("EO") }); // Descripción 551
+          const addrM = XLSX.utils.encode_cell({ r, c: colToIndex("EQ") }); // País
+          const addrN = XLSX.utils.encode_cell({ r, c: colToIndex("ER") }); // País 551
+          const addrP = XLSX.utils.encode_cell({ r, c: colToIndex("ET") }); // Fracción
+          const addrQ = XLSX.utils.encode_cell({ r, c: colToIndex("EU") }); // Fracción 551
+          const addrS = XLSX.utils.encode_cell({ r, c: colToIndex("EW") }); // NICO
+          const addrT = XLSX.utils.encode_cell({ r, c: colToIndex("EX") }); // NICO 551
+          const addrCantL = XLSX.utils.encode_cell({ r, c: colToIndex("EZ") }); // Cant
+          const addrCantR = XLSX.utils.encode_cell({ r, c: colToIndex("FA") }); // Cant 551
           const addrPed = XLSX.utils.encode_cell({ r, c: pedCol });
           const vJ = String(ws[addrJ]?.v ?? "").trim();
           const vK = String(ws[addrK]?.v ?? "").trim();
@@ -4829,14 +4842,16 @@ function AppDescripcion() {
           const vQ = String(ws[addrQ]?.v ?? "").trim();
           const vS = String(ws[addrS]?.v ?? "").trim();
           const vT = String(ws[addrT]?.v ?? "").trim();
+          const vCantL = String(ws[addrCantL]?.v ?? "").trim();
+          const vCantR = String(ws[addrCantR]?.v ?? "").trim();
           const pedRaw = String(ws[addrPed]?.v ?? "").trim();
           const ped = pedRaw || lastPed || "SIN_PEDIMENTO";
           if (pedRaw) lastPed = pedRaw;
-          if (!vJ && !vK && !vM && !vN && !vP && !vQ && !vS && !vT) continue;
+          if (!vJ && !vK && !vM && !vN && !vP && !vQ && !vS && !vT && !vCantL && !vCantR) continue;
           pairs.push({
             r, ped,
-            addrJ, addrK, addrM, addrN, addrP, addrQ, addrS, addrT,
-            vJ, vK, vM, vN, vP, vQ, vS, vT,
+            addrJ, addrK, addrM, addrN, addrP, addrQ, addrS, addrT, addrCantL, addrCantR,
+            vJ, vK, vM, vN, vP, vQ, vS, vT, vCantL, vCantR,
             sigJ: tokenSignature(vJ), sigK: tokenSignature(vK),
             classif: null,
           });
@@ -4855,14 +4870,21 @@ function AppDescripcion() {
           const b = pairs[i + 1];
           if (a.ped !== b.ped) continue; // No mezclar pedimentos
           if (!a.sigJ || !a.sigK || !b.sigJ || !b.sigK) continue;
+          const cAL = parseFloat(String(a.vCantL).replace(/,/g, "")) || 0;
+          const cAR = parseFloat(String(a.vCantR).replace(/,/g, "")) || 0;
+          const cBL = parseFloat(String(b.vCantL).replace(/,/g, "")) || 0;
+          const cBR = parseFloat(String(b.vCantR).replace(/,/g, "")) || 0;
+          const qtyOkA = Math.abs(cAL - cAR) <= 0.0001;
+          const qtyOkB = Math.abs(cBL - cBR) <= 0.0001;
+          if (!(qtyOkA && qtyOkB)) continue; // Morado solo si también coincide cantidad.
           const swap = a.sigJ === b.sigK && b.sigJ === a.sigK;
           if (swap && a.sigJ !== a.sigK && b.sigJ !== b.sigK) {
             a.classif = "purple";
             b.classif = "purple";
             a.revueltaWith = { sheetName, ped: b.ped, rowExcel: b.r + 1 };
             b.revueltaWith = { sheetName, ped: a.ped, rowExcel: a.r + 1 };
-            a.classifReason = `Cruce detectado con fila ${b.r + 1}: J actual coincide con K de la otra fila y K actual coincide con J de la otra fila (mismo pedimento).`;
-            b.classifReason = `Cruce detectado con fila ${a.r + 1}: J actual coincide con K de la otra fila y K actual coincide con J de la otra fila (mismo pedimento).`;
+            a.classifReason = `Cruce detectado con fila ${b.r + 1}: descripción cruzada entre EN/EO y cantidad coincide en EZ/FA para ambas filas (mismo pedimento).`;
+            b.classifReason = `Cruce detectado con fila ${a.r + 1}: descripción cruzada entre EN/EO y cantidad coincide en EZ/FA para ambas filas (mismo pedimento).`;
           }
         }
 
@@ -4901,12 +4923,20 @@ function AppDescripcion() {
           ws[p.addrQ] = ws[p.addrQ] || { t: "s", v: p.vQ || "" };
           ws[p.addrS] = ws[p.addrS] || { t: "s", v: p.vS || "" };
           ws[p.addrT] = ws[p.addrT] || { t: "s", v: p.vT || "" };
+          ws[p.addrCantL] = ws[p.addrCantL] || { t: "s", v: p.vCantL || "" };
+          ws[p.addrCantR] = ws[p.addrCantR] || { t: "s", v: p.vCantR || "" };
           ws[p.addrM].s = paintCellWithColor(ws[p.addrM], paisOK ? rgbOk : rgbBad);
           ws[p.addrN].s = paintCellWithColor(ws[p.addrN], paisOK ? rgbOk : rgbBad);
           ws[p.addrP].s = paintCellWithColor(ws[p.addrP], fracOK ? rgbOk : rgbBad);
           ws[p.addrQ].s = paintCellWithColor(ws[p.addrQ], fracOK ? rgbOk : rgbBad);
           ws[p.addrS].s = paintCellWithColor(ws[p.addrS], nicoOK ? rgbOk : rgbBad);
           ws[p.addrT].s = paintCellWithColor(ws[p.addrT], nicoOK ? rgbOk : rgbBad);
+          const cantL = parseFloat(String(p.vCantL).replace(/,/g, "")) || 0;
+          const cantR = parseFloat(String(p.vCantR).replace(/,/g, "")) || 0;
+          const cantOK = Math.abs(cantL - cantR) <= 0.0001;
+          statsExtra[cantOK ? "cantOk" : "cantBad"]++;
+          ws[p.addrCantL].s = paintCellWithColor(ws[p.addrCantL], cantOK ? rgbOk : rgbBad);
+          ws[p.addrCantR].s = paintCellWithColor(ws[p.addrCantR], cantOK ? rgbOk : rgbBad);
 
           if (p.ped && p.ped !== "SIN_PEDIMENTO") pedimentosSet.add(p.ped);
           if (previewRows.length < 5000) {
@@ -4926,6 +4956,9 @@ function AppDescripcion() {
               nicoL: p.vS || "",
               nicoR: p.vT || "",
               nicoOK,
+              cantL: p.vCantL || "",
+              cantR: p.vCantR || "",
+              cantOK,
               classifReason: p.classifReason || "",
               revueltaWith: p.revueltaWith || null,
             });
@@ -5099,15 +5132,16 @@ function AppDescripcion() {
       {phaseDesc === "results" && resultsDesc && (
         <div style={{ animation:"fadeUp 0.5s ease" }}>
           <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(160px, 1fr))", gap:12, marginBottom:20 }}>
-            <StatCard label="Filas comparadas" value={resultsDesc.stats.total} sub="Con datos en J/K" accent="#a855f7" />
+            <StatCard label="Filas comparadas" value={resultsDesc.stats.total} sub="Con datos en EN/EO" accent="#a855f7" />
             <StatCard label="Pedimentos detectados" value={resultsDesc.pedCount || 0} sub="Procesados por separado" accent="#38bdf8" />
             <StatCard label="Exactas" value={resultsDesc.stats.green} sub="Verde" accent="#22c55e" />
             <StatCard label="Similares" value={resultsDesc.stats.yellow} sub="Amarillo" accent="#facc15" />
             <StatCard label="Revueltas" value={resultsDesc.stats.purple} sub="Morado" accent="#9333ea" />
             <StatCard label="No relacionadas" value={resultsDesc.stats.red} sub="Rojo" accent="#ef4444" />
             <StatCard label="País OK" value={resultsDesc.statsExtra?.paisOk ?? 0} sub="M/N en verde" accent="#22c55e" />
-            <StatCard label="Fracción OK" value={resultsDesc.statsExtra?.fracOk ?? 0} sub="P/Q en verde" accent="#22c55e" />
-            <StatCard label="NICO OK" value={resultsDesc.statsExtra?.nicoOk ?? 0} sub="S/T en verde" accent="#22c55e" />
+            <StatCard label="Fracción OK" value={resultsDesc.statsExtra?.fracOk ?? 0} sub="ET/EU en verde" accent="#22c55e" />
+            <StatCard label="NICO OK" value={resultsDesc.statsExtra?.nicoOk ?? 0} sub="EW/EX en verde" accent="#22c55e" />
+            <StatCard label="Cantidad OK" value={resultsDesc.statsExtra?.cantOk ?? 0} sub="EZ/FA en verde" accent="#22c55e" />
           </div>
 
           <div style={{ background:"#0f172a", border:"1px solid #1e293b", borderRadius:6, padding:"14px 16px", color:"#94a3b8", fontSize:12 }}>
@@ -5123,10 +5157,10 @@ function AppDescripcion() {
 
           <div style={{ marginTop: 10, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
             <button onClick={copyDescColorsForJK} style={{ background:"#7c3aed", border:"none", color:"#ede9fe", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
-              🎨 Copiar J/K con color (2 col)
+              🎨 Copiar EN/EO con color (2 col)
             </button>
             <button onClick={copyOnlyDescColorsForJK} style={{ background:"#334155", border:"none", color:"#e2e8f0", padding:"6px 12px", cursor:"pointer", borderRadius:4, fontSize:12, fontWeight:700 }}>
-              🧩 Copiar solo colores J/K
+              🧩 Copiar solo colores EN/EO
             </button>
             {copiedMsgDesc && (
               <span style={{ color:"#86efac", fontSize:12 }}>{copiedMsgDesc}</span>
@@ -5158,7 +5192,7 @@ function AppDescripcion() {
                   <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12, fontFamily:"DM Mono, monospace" }}>
                     <thead>
                       <tr style={{ background:"#0f172a", position:"sticky", top:0, zIndex:2 }}>
-                        {["Hoja", "Fila", "Pedimento", "Descripción J", "Descripción K", "Clasificación", "Motivo descripción", "País M/N", "Fracción P/Q", "NICO S/T", "Detalle revuelta"].map(h => (
+                        {["Hoja", "Fila", "Pedimento", "Descripción EN", "Descripción EO", "Clasificación", "Motivo descripción", "Cantidad EZ/FA", "País EQ/ER", "Fracción ET/EU", "NICO EW/EX", "Detalle revuelta"].map(h => (
                           <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:"#64748b", fontWeight:700, borderBottom:"1px solid #1e293b", whiteSpace:"nowrap", fontSize:11 }}>{h}</th>
                         ))}
                       </tr>
@@ -5180,6 +5214,12 @@ function AppDescripcion() {
                             {r.classif === "purple"
                               ? (r.classifReason || "Cruce entre descripciones del mismo pedimento.")
                               : "—"}
+                          </td>
+                          <td style={{ padding:"6px 10px", minWidth:180 }}>
+                            <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.cantL} ↔ {r.cantR}</div>
+                            <span style={{ background:(r.cantOK ? "#22c55e" : "#ef4444") + "22", color:r.cantOK ? "#22c55e" : "#ef4444", padding:"2px 7px", borderRadius:3, fontSize:10, fontWeight:700 }}>
+                              {r.cantOK ? "Coincide" : "No coincide"}
+                            </span>
                           </td>
                           <td style={{ padding:"6px 10px", minWidth:180 }}>
                             <div style={{ color:"#cbd5e1", marginBottom:2 }}>{r.paisL} ↔ {r.paisR}</div>
